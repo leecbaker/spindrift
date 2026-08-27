@@ -163,18 +163,31 @@ pub(in crate::layout) fn text_for_measured_items(items: &[MeasuredInlineItem]) -
         .collect()
 }
 
+#[cfg(test)]
 pub(in crate::layout) fn inline_break_opportunities_for_runs(
     runs: &[InlineParagraphRun],
     boundary_style: &ComputedStyle,
 ) -> Vec<InlineBreakOpportunity> {
+    inline_break_opportunities_for_runs_with_font_system(runs, boundary_style, None)
+}
+
+/// Build graph opportunities while reusing exact source-only ICU results from
+/// the document font system when one is available.
+pub(in crate::layout) fn inline_break_opportunities_for_runs_with_font_system(
+    runs: &[InlineParagraphRun],
+    boundary_style: &ComputedStyle,
+    font_system: Option<&mut FontSystem>,
+) -> Vec<InlineBreakOpportunity> {
     let mut opportunities = Vec::new();
     let mut scratch = InlineBreakScratch::default();
+    let mut font_system = font_system;
     for (run_index, run) in runs.iter().enumerate() {
         append_inline_break_opportunities_inside_run(
             run_index,
             run,
             &mut opportunities,
             &mut scratch,
+            font_system.as_deref_mut(),
         );
     }
     append_inline_break_opportunities_across_transparent_edges(
@@ -321,6 +334,7 @@ fn append_inline_break_opportunities_inside_run(
     run: &InlineParagraphRun,
     output: &mut Vec<InlineBreakOpportunity>,
     scratch: &mut InlineBreakScratch,
+    font_system: Option<&mut FontSystem>,
 ) {
     let InlineLineItem::Fragment(fragment) = &run.item else {
         return;
@@ -336,7 +350,15 @@ fn append_inline_break_opportunities_inside_run(
     // UAX #14 wrap lets it incorrectly compete with normal opportunities.
     // <https://drafts.csswg.org/css-text-3/#overflow-wrap-property>
     let line_break_policy = TextBreakPolicy::from(fragment.style()).without_overflow_wrap();
-    collect_measured_break_opportunities(text, line_break_policy, &mut scratch.break_positions);
+    if let Some(font_system) = font_system {
+        font_system.collect_cached_measured_break_opportunities(
+            text,
+            line_break_policy,
+            &mut scratch.break_positions,
+        );
+    } else {
+        collect_measured_break_opportunities(text, line_break_policy, &mut scratch.break_positions);
+    }
     scratch.break_positions.retain(|position| {
         *position > 0
             && *position < text.len()

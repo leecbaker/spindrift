@@ -96,36 +96,6 @@ pub(in crate::layout) fn inline_atom_logical_block_end_margin(
     inline_atom_margin_for_side(atom, block_end_side(containing_style.writing_mode))
 }
 
-/// Return the block-start margin by which a baseline-participating atom moves
-/// its containing line's paint anchor.
-///
-/// An ordinary atomic inline contributes its margin box to the line's
-/// baseline metrics, but its captured content is replayed from the border-box
-/// origin. Keeping that conversion at the atom alone leaves the line anchor
-/// one margin too far toward block-end. Line-relative `vertical-align` values
-/// instead align their margin boxes directly to the resolved line box, and an
-/// `inline-table` exports a table-box baseline whose captured wrapper already
-/// owns this margin. Neither participates in this anchor adjustment:
-/// <https://drafts.csswg.org/css-inline-3/#line-layout>
-/// <https://www.w3.org/TR/CSS22/tables.html#table-display>
-pub(in crate::layout) fn inline_atom_line_anchor_block_start_margin(
-    atom: &InlineAtom,
-    containing_style: &ComputedStyle,
-) -> f32 {
-    if atom
-        .style()
-        .vertical_align
-        .clone()
-        .has_line_relative_baseline_shift()
-        || atom.exports_from_table_box()
-        || matches!(atom.content(), InlineAtomContent::InlineEdge(_))
-    {
-        0.0
-    } else {
-        inline_atom_logical_block_start_margin(atom, containing_style)
-    }
-}
-
 pub(in crate::layout) fn inline_atom_logical_border_inline_size(
     atom: &InlineAtom,
     containing_style: &ComputedStyle,
@@ -164,7 +134,9 @@ pub(in crate::layout) fn inline_atom_logical_margin_box_baseline_offset(
     let border_box_block_size = inline_atom_logical_border_block_size(atom, containing_style);
     atom.resolve_baseline_coordinates(
         border_box_block_size,
+        inline_atom_logical_block_size(atom, containing_style),
         inline_atom_logical_block_start_margin(atom, containing_style),
+        inline_atom_logical_block_end_margin(atom, containing_style),
         containing_style,
     )
     .margin_box
@@ -174,9 +146,8 @@ pub(in crate::layout) fn inline_atom_logical_margin_box_baseline_offset(
 ///
 /// The line-layout baseline contribution for an `inline-table` includes the
 /// wrapper's margin box, while its captured fragment begins at the table box.
-/// Placement therefore uses the separate replay coordinate returned by the
-/// atomic-baseline boundary. Ordinary atomic inlines replay from their border
-/// box and use their margin-box-relative placement coordinate.
+/// The atomic-baseline boundary likewise converts every ordinary atom's
+/// margin-box line coordinate back to its border-box coordinate before paint.
 /// <https://www.w3.org/TR/CSS22/tables.html#table-display>
 pub(in crate::layout) fn inline_atom_logical_content_placement_baseline_offset(
     atom: &InlineAtom,
@@ -185,7 +156,9 @@ pub(in crate::layout) fn inline_atom_logical_content_placement_baseline_offset(
     let border_box_block_size = inline_atom_logical_border_block_size(atom, containing_style);
     atom.resolve_baseline_coordinates(
         border_box_block_size,
+        inline_atom_logical_block_size(atom, containing_style),
         inline_atom_logical_block_start_margin(atom, containing_style),
+        inline_atom_logical_block_end_margin(atom, containing_style),
         containing_style,
     )
     .paint_placement
@@ -263,6 +236,70 @@ mod tests {
                 60.0,
                 "{writing_mode:?} must expose TCY's measured one-em square to parent layout"
             );
+        }
+    }
+
+    #[test]
+    fn atomic_margin_box_baseline_and_paint_placement_are_per_atom_in_all_axes() {
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+        ] {
+            for block_start_margin in [16.0, -8.0] {
+                for block_end_margin in [5.0, -3.0] {
+                    let mut style = ComputedStyle::initial();
+                    style.writing_mode = writing_mode;
+                    match block_start_side(writing_mode) {
+                        PhysicalSide::Top => style.margin.top = block_start_margin,
+                        PhysicalSide::Right => style.margin.right = block_start_margin,
+                        PhysicalSide::Bottom => style.margin.bottom = block_start_margin,
+                        PhysicalSide::Left => style.margin.left = block_start_margin,
+                    }
+                    match block_end_side(writing_mode) {
+                        PhysicalSide::Top => style.margin.top = block_end_margin,
+                        PhysicalSide::Right => style.margin.right = block_end_margin,
+                        PhysicalSide::Bottom => style.margin.bottom = block_end_margin,
+                        PhysicalSide::Left => style.margin.left = block_end_margin,
+                    }
+                    let size = match writing_mode {
+                        WritingMode::HorizontalTb => {
+                            InlineSize::new(20.0, 40.0 + block_start_margin + block_end_margin)
+                        }
+                        WritingMode::VerticalRl | WritingMode::VerticalLr => {
+                            InlineSize::new(40.0 + block_start_margin + block_end_margin, 20.0)
+                        }
+                        WritingMode::SidewaysRl | WritingMode::SidewaysLr => unreachable!(),
+                    };
+                    let atom = InlineAtom::new(
+                        InlineAtomContent::Canvas,
+                        style.clone(),
+                        None,
+                        size,
+                        24.0,
+                        0.0,
+                        None,
+                        None,
+                    );
+
+                    // CSS Inline Layout synthesizes a replaced atomic inline's
+                    // alphabetic baseline at its line-under margin edge. Paint
+                    // then crosses that atom's block-end margin independently
+                    // of siblings.
+                    // <https://drafts.csswg.org/css-inline-3/#synthesize-baselines>
+                    assert_eq!(
+                        inline_atom_logical_margin_box_baseline_offset(&atom, &style).points(),
+                        40.0 + block_start_margin + block_end_margin,
+                        "{writing_mode:?}, margins {block_start_margin}/{block_end_margin}"
+                    );
+                    assert_eq!(
+                        inline_atom_logical_content_placement_baseline_offset(&atom, &style)
+                            .points(),
+                        40.0 + block_end_margin,
+                        "{writing_mode:?}, margins {block_start_margin}/{block_end_margin}"
+                    );
+                }
+            }
         }
     }
 }

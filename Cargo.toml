@@ -63,7 +63,10 @@ parse-srcset = "0.1.1"
 subsetter = { version = "0.2.6", default-features = false, features = ["variable-fonts"] }
 markup5ever_rcdom = "0.39.0"
 miniz_oxide = "0.8.9"
-parley = "0.11"
+# Keep Parley's internal word and line segmentation aware of scripts that use
+# dictionary breaking. Quire's own ICU-derived graph remains the CSS break
+# opportunity authority.
+parley = { version = "0.11", features = ["complex-scripts"] }
 pdf-writer = "0.15"
 png = "0.18.1"
 precomputed-hash = "0.1.1"
@@ -73,6 +76,10 @@ selectors = "0.40"
 taffy = "0.13"
 thiserror = "2"
 tiny-skia-path = "0.12"
+# SVG effect surfaces are composed directly from Quire's retained paint scene,
+# beginning with text-shadow blur. This intentionally avoids usvg's optional
+# renderer: Quire owns the shaped text scene and semantic fallback.
+tiny-skia = "0.12"
 # `sync` is supported on every Quire target. Runtime and filesystem support
 # are native-only; browser-Wasm currently compiles the library but does not
 # provide a resource-loading backend.
@@ -80,7 +87,9 @@ tokio = { version = "1.52", default-features = false, features = ["sync"] }
 ttf-parser = "0.25"
 unicode-bidi = "0.3.18"
 url = "2"
-usvg = { version = "0.48", default-features = false }
+# Quire's pinned usvg fork retains normalized SVG text without calling its
+# font database/layout stage. Quire alone selects and shapes document fonts.
+usvg = { path = "third_party/usvg", version = "=0.48.1", default-features = false, features = ["text"] }
 wuff = { version = "0.2.8", default-features = false, features = ["z", "brotli"] }
 kamadak-exif = "0.6.1"
 

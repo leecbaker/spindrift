@@ -450,17 +450,18 @@ pub(in crate::layout) fn measured_item_is_transparent_mixed_inline_edge(
     )
 }
 
-/// Split UBA visual ranges at transparent inline-edge boundaries.
+/// Split UBA visual ranges at inline-edge boundaries.
 ///
 /// CSS Writing Modes applies bidi reordering to inline text, while CSS 2.2
 /// keeps non-replaced inline box start/end margin, padding, and border at the
 /// inline box's own edges. CSS Text `text-autospace` similarly creates a
-/// non-text spacing boundary. Quire models both as transparent atoms so they
-/// do not become UAX #9 object replacements, then reinserts them around visual
-/// text slices. A single UBA visual run can still contain multiple sibling
-/// inline boxes or autospace boundaries, so split at each owned zero-width
-/// edge before reinsertion; `box-decoration-break: slice` then leaves start
-/// and end decoration ownership on the adjacent generated inline box fragment.
+/// non-text spacing boundary. Plain edges have an empty UAX #9 range and are
+/// reinserted around visual text slices. A decorated shaping edge instead owns
+/// a virtual U+200C range: split on both sides of that range so its real edge
+/// atom is emitted exactly where UAX #9 placed the joining boundary, without
+/// turning it into an object replacement. `box-decoration-break: slice` then
+/// leaves start and end decoration ownership on the adjacent generated inline
+/// box fragment.
 /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo>,
 /// <https://www.w3.org/TR/CSS22/visuren.html#inline-boxes>, and
 /// <https://www.w3.org/TR/css-break-3/#break-decoration>.
@@ -473,15 +474,29 @@ pub(in crate::layout) fn split_mixed_inline_visual_ranges_at_transparent_inline_
         return visual_ranges;
     }
 
-    let mut edge_boundaries = ranged_items
-        .iter()
-        .filter(|ranged| {
-            ranged.range.start == ranged.range.end
-                && measured_item_is_transparent_mixed_inline_edge(&ranged.item)
-                && text.is_char_boundary(ranged.range.start)
-        })
-        .map(|ranged| ranged.range.start)
-        .collect::<Vec<_>>();
+    let mut edge_boundaries = Vec::new();
+    let mut bidi_owned_edge_ranges = Vec::new();
+    for ranged in ranged_items {
+        if !text.is_char_boundary(ranged.range.start) || !text.is_char_boundary(ranged.range.end) {
+            continue;
+        }
+        if ranged.range.start == ranged.range.end
+            && measured_item_is_transparent_mixed_inline_edge(&ranged.item)
+        {
+            edge_boundaries.push(ranged.range.start);
+            continue;
+        }
+        if matches!(
+            &ranged.item.item,
+            InlineLineItem::Atom(atom) if inline_atom_is_logical_shaping_boundary(atom)
+        ) {
+            // The nonempty range is the virtual U+200C added to the bidi
+            // stream. It owns the physical box edge, even though the control
+            // itself has no paint or extraction representation.
+            edge_boundaries.extend([ranged.range.start, ranged.range.end]);
+            bidi_owned_edge_ranges.push(ranged.range.clone());
+        }
+    }
     edge_boundaries.sort_unstable();
     edge_boundaries.dedup();
 
@@ -491,20 +506,34 @@ pub(in crate::layout) fn split_mixed_inline_visual_ranges_at_transparent_inline_
 
     let mut split_ranges = Vec::with_capacity(visual_ranges.len());
     for visual_range in visual_ranges {
+        let mut partitions = Vec::new();
         let mut start = visual_range.range.start;
         for boundary in edge_boundaries.iter().cloned().filter(|boundary| {
             visual_range.range.start < *boundary && *boundary < visual_range.range.end
         }) {
-            split_ranges.push(BidiVisualRange {
+            partitions.push(BidiVisualRange {
                 range: start..boundary,
                 direction: visual_range.direction,
             });
             start = boundary;
         }
-        split_ranges.push(BidiVisualRange {
+        partitions.push(BidiVisualRange {
             range: start..visual_range.range.end,
             direction: visual_range.direction,
         });
+        // Ranges arrive in visual-run order but their byte intervals remain
+        // logical. Once an RTL run is partitioned, emit its slices from the
+        // logical end so independent text fragments and an owned virtual
+        // joining boundary retain their UAX #9 visual order.
+        if matches!(visual_range.direction, ResolvedBidiDirection::Rtl)
+            && bidi_owned_edge_ranges.iter().any(|edge_range| {
+                visual_range.range.start <= edge_range.start
+                    && edge_range.end <= visual_range.range.end
+            })
+        {
+            partitions.reverse();
+        }
+        split_ranges.extend(partitions);
     }
     split_ranges
 }

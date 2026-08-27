@@ -687,12 +687,32 @@ impl<'a> LayoutBuilder<'a> {
                         }));
                         continue;
                     }
+                    if child_style.float == Float::Footnote {
+                        // Footnote bodies are detached from the principal
+                        // inline stream. Their call remains at the source
+                        // position and is the only in-flow representation of
+                        // this element.
+                        // <https://www.w3.org/TR/css-gcpm-3/#footnotes>
+                        self.push_generated_pseudo_items(
+                            child_element,
+                            &child_style,
+                            child_style.footnote_call_style.as_deref(),
+                            inherited_link.clone(),
+                            placement.baseline_shift(),
+                            placement.visual_offset,
+                            GeneratedPseudoCounterMode::Commit,
+                            output,
+                        );
+                        self.capture_suppressed_named_strings_after(child_element.id);
+                        continue;
+                    }
                     if child_style.float != Float::None {
                         output.push(InlineItem::Float(Box::new(InlineFloat::new(
                             child_element.clone(),
                             child_signature,
                             child_style,
                             false,
+                            None,
                             active_positioning_containing_block
                                 .map(BorrowedInlinePositioningContainingBlockSource::into_owned)
                                 .or_else(|| {
@@ -1196,6 +1216,9 @@ impl<'a> LayoutBuilder<'a> {
                     signature.clone(),
                     style.clone(),
                     style.content.is_generated(),
+                    child
+                        .element_core()
+                        .and_then(|core| generated_pseudo_counter_source(&core.source)),
                     active_float_containing_block
                         .map(BorrowedInlinePositioningContainingBlockSource::into_owned),
                 ))));
@@ -1278,6 +1301,7 @@ impl<'a> LayoutBuilder<'a> {
                             box_.core.signature.clone(),
                             (*box_.core.style).clone(),
                             box_.core.style.content.is_generated(),
+                            generated_pseudo_counter_source(&box_.core.source),
                             active_float_containing_block
                                 .map(BorrowedInlinePositioningContainingBlockSource::into_owned),
                         ))));
@@ -1565,6 +1589,7 @@ impl<'a> LayoutBuilder<'a> {
                             box_.core.signature.clone(),
                             (*box_.core.style).clone(),
                             box_.core.style.content.is_generated(),
+                            generated_pseudo_counter_source(&box_.core.source),
                             active_float_containing_block
                                 .map(BorrowedInlinePositioningContainingBlockSource::into_owned),
                         ))));
@@ -1666,6 +1691,7 @@ impl<'a> LayoutBuilder<'a> {
                             box_.core.signature.clone(),
                             (*box_.core.style).clone(),
                             box_.core.style.content.is_generated(),
+                            generated_pseudo_counter_source(&box_.core.source),
                             active_float_containing_block
                                 .map(BorrowedInlinePositioningContainingBlockSource::into_owned),
                         ))));
@@ -3051,7 +3077,18 @@ impl<'a> LayoutBuilder<'a> {
                 )),
             }
         };
-        let atom_size = geometry.margin_box_inline_size(placeholder_style);
+        let mut atom_size = geometry.margin_box_inline_size(placeholder_style);
+        if !placeholder_style.writing_mode.has_vertical_lines() {
+            // Inline-axis margins reserve advance, but block-axis margins of
+            // an inline-level hypothetical box do not enlarge the line box
+            // that selects its static-position rectangle. The positioned
+            // box applies those margins when resolving its own block offset.
+            // <https://www.w3.org/TR/CSS22/visudet.html#line-height>
+            // <https://www.w3.org/TR/css-position-3/#staticpos-rect>
+            atom_size.height =
+                (atom_size.height - placeholder_style.margin.top - placeholder_style.margin.bottom)
+                    .max(0.0);
+        }
         let line_baseline_offset = if placeholder_style.display.is_atomic_inline()
             || placeholder_style.abspos_static_source.is_atomic_inline()
         {
@@ -3970,6 +4007,18 @@ pub(in crate::layout) fn annotate_line_break_element_breaks_with_clear(
 fn generated_content_originating_clear(source: &box_tree::BoxSource<'_>) -> Option<Clear> {
     match source {
         box_tree::BoxSource::GeneratedPseudo(pseudo) => Some(pseudo.originating_clear),
+        box_tree::BoxSource::Principal => None,
+    }
+}
+
+/// Keep a generated float's tree-abiding pseudo identity through inline
+/// collection so its replay uses the matching counter scope.
+/// <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+fn generated_pseudo_counter_source(
+    source: &box_tree::BoxSource<'_>,
+) -> Option<box_tree::CounterEventSource> {
+    match source {
+        box_tree::BoxSource::GeneratedPseudo(pseudo) => Some(pseudo.kind.counter_event_source()),
         box_tree::BoxSource::Principal => None,
     }
 }

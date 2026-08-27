@@ -102,6 +102,27 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    /// Retain a page lower bound after a call was pushed forward by the
+    /// footnote area that its source page would otherwise need to reserve.
+    ///
+    /// This makes the pagination constraint monotonic: a retry may move a
+    /// call later when a newly discovered body consumes page space, but it
+    /// may not move that call back into the page whose capacity it already
+    /// exceeded. The final pass still reserves and paints the body only on
+    /// the call's committed destination page.
+    /// <https://www.w3.org/TR/css-gcpm-3/#footnotes>
+    pub(in crate::layout) fn constrain_footnote_calls_to_observed_pages(
+        &mut self,
+        measurements: &[FootnoteMeasurement],
+    ) {
+        for measurement in measurements {
+            self.footnote_call_minimum_page_indices
+                .entry(measurement.element)
+                .and_modify(|page_index| *page_index = (*page_index).max(measurement.page_index))
+                .or_insert(measurement.page_index);
+        }
+    }
+
     fn measure_footnote_height(
         &mut self,
         footnote: &box_tree::FootnoteBox<'a>,

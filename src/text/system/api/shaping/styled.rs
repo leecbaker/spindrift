@@ -39,6 +39,7 @@ struct StyledShapingSpan<'span, 'source> {
 /// [`ShapedGlyphRun`] provenance.
 struct MappedStyledShapingText<'span, 'source> {
     text: String,
+    authored_text: String,
     ranges: Vec<(Range<usize>, &'span SelectedFaceStyleView<'source>)>,
     metric_ranges: Vec<(Range<usize>, &'source ComputedStyle)>,
     shaping_contexts: ShapingContextMap,
@@ -700,7 +701,7 @@ impl FontSystem {
                 // different position for every glyph.
                 // <https://learn.microsoft.com/en-us/typography/opentype/spec/vorg>
                 // <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>
-                let vertical_origin = face
+                let glyph_vertical_origin = face
                     .glyph_y_origin(glyph_id)
                     .map(f32::from)
                     .or_else(|| {
@@ -710,9 +711,16 @@ impl FontSystem {
                                 f32::from(bounds.y_max) + f32::from(top_side_bearing)
                             })
                     })
-                    .map(|origin| origin * scale)
-                    .unwrap_or(vertical_advance);
-                glyph.rendered.y_offset -= vertical_origin;
+                    .map(|origin| origin * scale);
+                // Only an OpenType-provided glyph-specific origin alters the
+                // horizontal shaping baseline. When neither VORG nor a
+                // vertical side bearing is available, the synthesized
+                // vertical advance determines the CSS typographic-unit
+                // origin; translating the glyph by that same advance would
+                // apply the unit placement twice.
+                if let Some(vertical_origin) = glyph_vertical_origin {
+                    glyph.rendered.y_offset -= vertical_origin;
+                }
                 let extra_spacing =
                     (glyph.rendered.x_advance - glyph.rendered.nominal_x_advance).max(0.0);
                 glyph.rendered.nominal_x_advance = vertical_advance;
@@ -793,6 +801,7 @@ impl FontSystem {
         let resolved_spans = self.resolved_styled_text_spans(spans);
         let Some(MappedStyledShapingText {
             text,
+            authored_text,
             ranges,
             metric_ranges,
             shaping_contexts,
@@ -1001,6 +1010,12 @@ impl FontSystem {
                     Cow::Borrowed(_) => run_text_without_synthetic,
                     Cow::Owned(text) => text,
                 };
+                let authored_run_text = styled_authored_text_for_internal_range(
+                    run_range.clone(),
+                    &source_positions,
+                    &authored_text,
+                )
+                .unwrap_or(run_text.as_ref());
                 if run.font_size() <= 0.01 {
                     continue;
                 }
@@ -1015,7 +1030,7 @@ impl FontSystem {
                     dropped_default_ignorable_runs.push(SourceOnlyRun {
                         visual_position: ShaperVisualInlinePosition::from_parley(x_offset),
                         shaper_advance: ShaperInlineAdvance::from_parley(run.advance()),
-                        text: run_text.clone().into(),
+                        text: authored_run_text.into(),
                     });
                     continue;
                 }
@@ -1139,12 +1154,16 @@ impl FontSystem {
                         .unwrap_or(run_style)
                         .authored();
                     let cluster_palette = cluster.first_style().brush.clone();
-                    let source_range =
-                        styled_cluster_source_range(cluster_range.clone(), &source_positions);
-                    if range_is_synthetic_only(cluster_range.clone(), &shaping_contexts) {
-                        continue;
-                    }
                     let raw_cluster_text = text.get(cluster_range.clone()).unwrap_or_default();
+                    let source_range = if raw_cluster_text.chars().all(character_is_join_control) {
+                        styled_join_control_cluster_source_range(
+                            cluster_range.clone(),
+                            &source_positions,
+                            &authored_text,
+                        )
+                    } else {
+                        styled_cluster_source_range(cluster_range.clone(), &source_positions)
+                    };
                     let cluster_text_without_synthetic = text_without_synthetic_join_controls(
                         &text,
                         cluster_range.clone(),
@@ -1156,6 +1175,17 @@ impl FontSystem {
                         raw_cluster_text,
                         cleaned_cluster_text.as_ref(),
                     );
+                    // A visible contextual glyph may be clustered with an
+                    // authored or virtual join control. Emit the adjacent
+                    // authored typographic unit as its Unicode payload; the
+                    // control itself remains source text only.
+                    let contextual_source_text = default_ignorable_only
+                        .then(|| {
+                            source_range
+                                .as_ref()
+                                .and_then(|range| authored_text.get(range.clone()))
+                        })
+                        .flatten();
                     if default_ignorable_only
                         && !default_ignorable_cluster_has_shaping_glyph(
                             &face,
@@ -1183,7 +1213,7 @@ impl FontSystem {
                         let Ok(glyph_id) = u16::try_from(glyph.id) else {
                             continue;
                         };
-                        let unicode = if first_cluster_glyph {
+                        let candidate_unicode = if first_cluster_glyph {
                             if default_ignorable_only {
                                 String::new()
                             } else {
@@ -1195,30 +1225,24 @@ impl FontSystem {
                         if glyph_is_join_control_artifact(
                             &face,
                             glyph_id,
-                            &unicode,
+                            &candidate_unicode,
                             raw_cluster_text,
                         ) {
-                            first_cluster_glyph = false;
                             continue;
                         }
                         if glyph_is_non_painting_shaping_artifact(
                             &face,
                             glyph_id,
                             glyph.advance,
-                            &unicode,
+                            &candidate_unicode,
                         ) {
-                            first_cluster_glyph = false;
                             continue;
                         }
-                        if unicode.is_empty()
-                            && !shaping_contexts.is_empty()
-                            && face
-                                .glyph_index('\u{0640}')
-                                .is_some_and(|nominal| nominal.0 == glyph_id)
-                        {
-                            first_cluster_glyph = false;
-                            continue;
-                        }
+                        let unicode = if first_cluster_glyph && default_ignorable_only {
+                            contextual_source_text.unwrap_or_default().to_owned()
+                        } else {
+                            candidate_unicode
+                        };
                         let emitted_glyph_id = if matches!(
                             run_style.authored().text_layout_policy(),
                             TextLayoutPolicy::Vertical(_)
@@ -1350,8 +1374,8 @@ impl FontSystem {
                         .iter()
                         .map(|glyph| glyph.unicode.as_str())
                         .collect::<String>();
-                    if grouped_glyph_text != run_text {
-                        rendered_runs[rendered_run_start].text = run_text.into();
+                    if grouped_glyph_text != authored_run_text {
+                        rendered_runs[rendered_run_start].text = authored_run_text.into();
                     }
                 }
             }
@@ -1508,7 +1532,7 @@ impl FontSystem {
                 && shaping_spans.get(index - 1).is_some_and(|previous| {
                     matches!(
                         previous.shaping_style.boundary_effect(span.shaping_style),
-                        InlineBoundaryEffect::PaintOnly | InlineBoundaryEffect::ShapingInputChange
+                        InlineBoundaryEffect::ShapingInputChange
                     ) && span_boundary_needs_join_control(&previous.text, &span.text)
                 })
             {
@@ -1518,7 +1542,7 @@ impl FontSystem {
             if shaping_spans.get(index + 1).is_some_and(|next| {
                 matches!(
                     next.shaping_style.boundary_effect(span.shaping_style),
-                    InlineBoundaryEffect::PaintOnly | InlineBoundaryEffect::ShapingInputChange
+                    InlineBoundaryEffect::ShapingInputChange
                 ) && span_boundary_needs_join_control(&span.text, &next.text)
             }) {
                 push_synthetic_join_control(&mut text, &mut shaping_contexts);
@@ -1529,7 +1553,6 @@ impl FontSystem {
         if text.is_empty() || ranges.is_empty() {
             return None;
         }
-        push_edge_join_context(&mut text, &mut ranges, &mut shaping_contexts);
         shaping_contexts.add_authored_join_controls(&text);
         debug_assert!(ranges.iter().all(|(range, _)| {
             range.start < range.end
@@ -1541,6 +1564,7 @@ impl FontSystem {
             styled_text_source_positions(&text, &authored_text, &shaping_contexts);
         Some(MappedStyledShapingText {
             text,
+            authored_text,
             ranges,
             metric_ranges,
             shaping_contexts,
@@ -1792,6 +1816,15 @@ fn styled_text_source_positions(
     }
 }
 
+fn styled_authored_text_for_internal_range<'a>(
+    internal: Range<usize>,
+    positions: &[StyledTextSourcePosition],
+    authored_text: &'a str,
+) -> Option<&'a str> {
+    let authored = styled_cluster_source_range(internal, positions)?;
+    authored_text.get(authored)
+}
+
 fn styled_cluster_source_range(
     cluster: Range<usize>,
     positions: &[StyledTextSourcePosition],
@@ -1813,11 +1846,49 @@ fn styled_cluster_source_range(
         .map(|(start, end)| start..end)
 }
 
+/// Attribute a control-only Parley cluster to the typographic unit whose
+/// contextual form it carries.
+///
+/// HarfBuzz is permitted to associate an Arabic/N'Ko/Mongolian glyph with the
+/// following U+200C/U+200D cluster rather than the preceding letter. The
+/// control has no layout ownership of its own; for source slicing it belongs
+/// to the preceding authored typographic unit, or to the following unit at a
+/// stream start. This is input-range provenance, not a glyph-ID heuristic, so
+/// it remains valid after OpenType substitution.
+/// <https://drafts.csswg.org/css-text-3/#boundary-shaping>
+fn styled_join_control_cluster_source_range(
+    cluster: Range<usize>,
+    positions: &[StyledTextSourcePosition],
+    authored_text: &str,
+) -> Option<Range<usize>> {
+    positions
+        .iter()
+        .rev()
+        .filter(|position| {
+            authored_text
+                .get(position.authored.clone())
+                .is_some_and(|text| !text.chars().all(character_is_join_control))
+        })
+        .find(|position| position.internal.end <= cluster.start)
+        .or_else(|| {
+            positions
+                .iter()
+                .filter(|position| {
+                    authored_text
+                        .get(position.authored.clone())
+                        .is_some_and(|text| !text.chars().all(character_is_join_control))
+                })
+                .find(|position| cluster.end <= position.internal.start)
+        })
+        .map(|position| position.authored.clone())
+}
+
 mod tests {
     #[cfg(test)]
     use super::{
         InlineBoundaryEffect, SelectedFaceStyleView, ShapingContextMap,
-        styled_cluster_source_range, styled_text_source_positions,
+        styled_cluster_source_range, styled_join_control_cluster_source_range,
+        styled_text_source_positions,
     };
     #[cfg(test)]
     use crate::CssColor;
@@ -1869,5 +1940,31 @@ mod tests {
         assert_eq!(styled_cluster_source_range(5..7, &positions), Some(2..4),);
         assert_eq!(styled_cluster_source_range(9..13, &positions), Some(4..8),);
         assert_eq!(styled_cluster_source_range(2..5, &positions), None,);
+    }
+
+    #[test]
+    fn join_control_cluster_borrows_the_preceding_authored_unit() {
+        let positions = styled_text_source_positions(
+            "ع\u{200d}\u{200d}ع\u{200d}\u{200d}ع",
+            "ع\u{200d}\u{200d}ع\u{200d}\u{200d}ع",
+            &ShapingContextMap::default(),
+        );
+
+        assert_eq!(
+            styled_join_control_cluster_source_range(
+                13..16,
+                &positions,
+                "ع\u{200d}\u{200d}ع\u{200d}\u{200d}ع"
+            ),
+            Some(8..10)
+        );
+        assert_eq!(
+            styled_join_control_cluster_source_range(
+                5..8,
+                &positions,
+                "ع\u{200d}\u{200d}ع\u{200d}\u{200d}ع"
+            ),
+            Some(0..2)
+        );
     }
 }

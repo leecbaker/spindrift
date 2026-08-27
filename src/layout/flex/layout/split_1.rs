@@ -322,6 +322,10 @@ pub(in crate::layout::flex) struct SplitFlexItemPaintContext {
     /// border box, which may be narrower than its relative/ink overflow.
     pub(in crate::layout::flex) fragment_content_clip: PaintClip,
     pub(in crate::layout::flex) source_item_top: PageTopBlockPosition,
+    /// The committed visible physical source extent. The detached source
+    /// canvas is tall enough for this range without changing the item's
+    /// frozen used border box or percentage basis.
+    pub(in crate::layout::flex) source_height: PhysicalContentHeight,
     /// Committed source range and item-local ordinal for this replay. This is
     /// produced by the materialized flex fragment plan, rather than guessed
     /// from a page-sized source offset during painting.
@@ -352,11 +356,6 @@ impl SplitFlexItemPaintContext {
     /// itself, so this is intentionally not a general box-model conversion.
     pub(in crate::layout::flex) fn available_width_for_replay(&self) -> PhysicalContentWidth {
         PhysicalContentWidth::new(content_box_pt(self.item_width.points()))
-    }
-
-    /// See [`Self::available_width_for_replay`].
-    pub(in crate::layout::flex) fn available_height_for_replay(&self) -> PhysicalContentHeight {
-        PhysicalContentHeight::new(content_box_pt(self.item_height.points()))
     }
 }
 

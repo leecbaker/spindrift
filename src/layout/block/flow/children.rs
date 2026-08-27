@@ -47,9 +47,8 @@ impl<'a> LayoutBuilder<'a> {
             start_margin_arrangement,
             starts_at_page_top,
             laid_out_column_children,
-            use_box_inline_items,
+            traversal_mode,
             run_in_inline_items_laid_out,
-            use_ordered_mixed_flow,
             has_preceding_inline_flow_content,
             preceding_inline_local_cutoff,
             preceding_inline_clamp_block_advance,
@@ -80,9 +79,11 @@ impl<'a> LayoutBuilder<'a> {
         self.definite_block_size_stack
             .push(descendant_percentage_height_basis);
 
-        let traversal_outcome = if laid_out_column_children || use_box_inline_items {
+        let traversal_outcome = if laid_out_column_children
+            || matches!(traversal_mode, ChildTraversalMode::InlineSequence)
+        {
             ChildFlowTraversalOutcome::default()
-        } else if use_ordered_mixed_flow {
+        } else if matches!(traversal_mode, ChildTraversalMode::OrderedMixed) {
             ChildFlowTraversalOutcome {
                 pending_end_margin_collapse: self.layout_ordered_mixed_flow_children(
                     element,
@@ -100,6 +101,25 @@ impl<'a> LayoutBuilder<'a> {
                 adjoining_margin_set_boundary: BlockMarginCollapseBoundary::Adjoining,
                 rendered_legend: None,
             }
+        } else if matches!(traversal_mode, ChildTraversalMode::DirectFloatChildren) {
+            // Formatting-tree anonymous inline wrappers must not turn source
+            // whitespace next to a direct float into a parent line box. This
+            // mode deliberately replays the direct children, where collapsed
+            // whitespace is discarded before the float is placed.
+            self.layout_dom_flow_children(
+                fragmentainer_kind,
+                element,
+                style,
+                stylesheets,
+                can_collapse_start_margin,
+                can_collapse_end_margin,
+                applied_start_margin,
+                start_margin_arrangement,
+                starts_at_page_top,
+                has_preceding_inline_flow_content,
+                preceding_inline_clamp_block_advance,
+                &mut traversal_state,
+            )
         } else if let Some(child_boxes) = child_boxes {
             self.layout_formatting_box_flow_children(
                 fragmentainer_kind,
@@ -178,6 +198,77 @@ mod tests {
 
         assert!(text.contains("first"));
         assert!(!text.contains("second"), "clamped text={text:?}");
+    }
+
+    #[tokio::test]
+    async fn generated_and_direct_float_children_keep_tree_source_order() {
+        let document = Html::from_string(
+            "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 } \
+             .parent { width: 60pt; background: yellow } \
+             .parent::before { content: ''; display: block; float: left; width: 20pt; height: 20pt; background: blue } \
+             .direct { float: left; clear: left; width: 20pt; height: 20pt; background: green } \
+             .parent::after { content: ''; display: block; clear: both; width: 60pt; height: 10pt; background: red }</style>\
+             <div class=\"parent\"><div class=\"direct\"></div></div>",
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let blue = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+            .expect("generated ::before float should paint");
+        let green = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+            .expect("direct float should paint");
+        let red = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+            .expect("generated ::after clear box should paint");
+
+        assert!(
+            green.y() + green.height() <= blue.y() + 0.01,
+            "the direct float must clear the preceding generated float: blue={blue:?}, green={green:?}"
+        );
+        assert!(
+            red.y() + red.height() <= green.y() + 0.01,
+            "the generated clear box must follow both floats: green={green:?}, red={red:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_float_only_children_do_not_create_a_parent_inline_strut() {
+        let document = Html::from_string(
+            "<style>@page { size: 120pt 120pt; margin: 10pt } \
+             body { margin: 0 } .parent { width: 80pt; font: 10pt/20pt sans-serif } \
+             .float { display: inline-block; float: left; width: 20pt; height: 10pt; margin-top: 5pt; background: green } \
+             .text { clear: both; margin-top: 20pt } .text .float { background: blue }</style>\
+             <div class=\"parent\">\n  <span class=\"float\">float</span>\n</div>\
+             <div class=\"parent text\">prefix<span class=\"float\">float</span></div>",
+        )
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let green = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+            .expect("direct float should paint");
+        assert!(
+            (green.y() + green.height() - 105.0).abs() < 0.01,
+            "a whitespace-only parent must place its float at content-start plus its own 5pt margin, not after a 20pt inline strut: green={green:?}"
+        );
+        assert!(
+            page.lines().iter().any(|line| line.text.contains("prefix")),
+            "real sibling inline content must still select the inline float-marker path"
+        );
     }
 
     #[tokio::test]

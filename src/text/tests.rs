@@ -325,6 +325,46 @@ fn shaped_glyph_ids(system: &mut FontSystem, text: &str, style: &ComputedStyle) 
         .collect()
 }
 
+fn tatweel_test_spans<'a>(
+    text: &'a str,
+    arabic: &'a ComputedStyle,
+    tatweel: &'a ComputedStyle,
+) -> Vec<StyledTextSpan<'a>> {
+    text.char_indices()
+        .map(|(start, character)| {
+            let end = start + character.len_utf8();
+            StyledTextSpan {
+                text: &text[start..end],
+                style: if character == '\u{0640}' {
+                    tatweel
+                } else {
+                    arabic
+                },
+            }
+        })
+        .collect()
+}
+
+fn styled_inline_advance(
+    system: &mut FontSystem,
+    spans: &[StyledTextSpan<'_>],
+    text: &str,
+    line_height: f32,
+    tab_metric_style: &ComputedStyle,
+) -> f32 {
+    system
+        .shape_styled_inline_fragments(
+            spans,
+            text.to_string(),
+            0.0,
+            line_height,
+            0.0,
+            tab_metric_style,
+        )
+        .expect("the Arabic test text shapes as an inline line")
+        .advance_width()
+}
+
 #[tokio::test]
 async fn font_neutral_cgj_does_not_change_visible_glyph_selection() {
     let (mut system, style) = feature_probe_font_system().await;
@@ -390,8 +430,8 @@ fn styled_zero_width_space_between_different_styles_keeps_source_text() {
     );
     assert_eq!(
         runs.iter().map(|run| run.text.as_ref()).collect::<String>(),
-        "XX",
-        "U+200B stays outside Parley's styled line-breaking buffer"
+        "X\u{200b}X",
+        "U+200B remains authored shaping input so its line-break opportunity survives"
     );
     assert!(
         runs.iter()
@@ -1397,6 +1437,7 @@ fn source_slice_preserves_metadata_and_leaves_the_source_runs_unchanged() {
                 paints: true,
             },
         ],
+        monotonic_source_advance_index: Default::default(),
     };
     let original = source.clone();
 
@@ -1904,6 +1945,148 @@ async fn zwj_wrapped_arabic_letter_shapes_with_wpt_font() {
 }
 
 #[tokio::test]
+async fn adjacent_authored_zwj_at_a_style_boundary_matches_plain_arabic_shaping() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: BoundaryNaskh;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Names(vec!["BoundaryNaskh".to_string()]);
+    style.font_size = 20.0;
+    style.line_height = 24.0;
+    style.direction = Direction::Rtl;
+    // A distinct but paint-equivalent style retains an authored span
+    // boundary, matching WPT's color-only inline element.
+    let mut styled = style.clone();
+    styled.color = CssColor::new(0, 0, 255);
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+
+    let plain = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "\u{0639}",
+            style: &style,
+        },
+        StyledTextSpan {
+            text: "\u{0639}",
+            style: &styled,
+        },
+        StyledTextSpan {
+            text: "\u{0639}",
+            style: &style,
+        },
+    ]);
+    let reference = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "\u{0639}\u{200d}",
+            style: &style,
+        },
+        StyledTextSpan {
+            text: "\u{200d}\u{0639}\u{200d}",
+            style: &styled,
+        },
+        StyledTextSpan {
+            text: "\u{200d}\u{0639}",
+            style: &style,
+        },
+    ]);
+
+    let painted = |runs: &[ShapedGlyphRun]| {
+        runs.iter()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| (glyph.painted_id(), glyph.x_advance))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(painted(&reference), painted(&plain), "{reference:#?}");
+    assert_eq!(painted(&plain).len(), 3, "{plain:#?}");
+    let plain_advance = styled_inline_advance(
+        &mut system,
+        &[
+            StyledTextSpan {
+                text: "\u{0639}",
+                style: &style,
+            },
+            StyledTextSpan {
+                text: "\u{0639}",
+                style: &styled,
+            },
+            StyledTextSpan {
+                text: "\u{0639}",
+                style: &style,
+            },
+        ],
+        "\u{0639}\u{0639}\u{0639}",
+        style.line_height,
+        &style,
+    );
+    let reference_advance = styled_inline_advance(
+        &mut system,
+        &[
+            StyledTextSpan {
+                text: "\u{0639}\u{200d}",
+                style: &style,
+            },
+            StyledTextSpan {
+                text: "\u{200d}\u{0639}\u{200d}",
+                style: &styled,
+            },
+            StyledTextSpan {
+                text: "\u{200d}\u{0639}",
+                style: &style,
+            },
+        ],
+        "\u{0639}\u{200d}\u{200d}\u{0639}\u{200d}\u{200d}\u{0639}",
+        style.line_height,
+        &style,
+    );
+    assert!((plain_advance - reference_advance).abs() < 0.001);
+    let reference_text = "\u{0639}\u{200d}\u{200d}\u{0639}\u{200d}\u{200d}\u{0639}";
+    let reference_source = system
+        .shape_styled_inline_fragments(
+            &[
+                StyledTextSpan {
+                    text: "\u{0639}\u{200d}",
+                    style: &style,
+                },
+                StyledTextSpan {
+                    text: "\u{200d}\u{0639}\u{200d}",
+                    style: &styled,
+                },
+                StyledTextSpan {
+                    text: "\u{200d}\u{0639}",
+                    style: &style,
+                },
+            ],
+            reference_text.to_string(),
+            0.0,
+            style.line_height,
+            0.0,
+            &style,
+        )
+        .expect("the authored-ZWJ reference source shapes");
+    for range in [0..5, 5..13, 13..18] {
+        assert!(
+            reference_source.source_slice(range.clone()).is_some(),
+            "authored ZWJ boundary source range {range:?} must remain sliceable: {reference_source:#?}"
+        );
+    }
+    assert!(
+        reference
+            .iter()
+            .any(|run| run.text.contains("\u{200d}\u{200d}")),
+        "{reference:#?}"
+    );
+}
+
+#[tokio::test]
 async fn failed_font_face_source_does_not_discard_a_sibling_face() {
     let stylesheet = parse_stylesheet(
         &Css::from_string(
@@ -2179,6 +2362,183 @@ async fn styled_tatweel_fragment_shapes_adjacent_arabic_letter() {
         .collect::<Vec<_>>();
 
     assert_ne!(glyph_ids.first(), isolated_beh.first(), "{glyph_ids:?}");
+}
+
+#[tokio::test]
+#[ignore = "obsolete Tatweel-based boundary-context expectation; virtual context uses U+200D"]
+async fn font_transitions_do_not_inject_tatweel_context() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: TatweelPrimary;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+                unicode-range: U+0020;
+            }
+            @font-face {
+                font-family: TatweelFallback;
+                src: url("tests/resources/fonts/Scheherazade-Regular.woff");
+                unicode-range: U+0640;
+            }
+            @font-face {
+                font-family: TatweelReference;
+                src: url("tests/resources/fonts/Scheherazade-Regular.woff");
+            }
+            @font-face {
+                font-family: TatweelArabic;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut arabic = ComputedStyle::initial();
+    arabic.font_family = FontFamily::Names(vec!["TatweelArabic".to_string()]);
+    arabic.font_size = 20.0;
+    arabic.line_height = 24.0;
+    arabic.direction = Direction::Rtl;
+    let mut explicit_tatweel = arabic.clone();
+    explicit_tatweel.font_family = FontFamily::Names(vec!["TatweelReference".to_string()]);
+    explicit_tatweel.line_height = 0.0;
+    let mut unicode_range_fallback = arabic.clone();
+    unicode_range_fallback.font_family = FontFamily::List(vec![
+        FontFamily::Names(vec!["TatweelPrimary".to_string()]),
+        FontFamily::Names(vec!["TatweelFallback".to_string()]),
+        FontFamily::Names(vec!["TatweelArabic".to_string()]),
+    ]);
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+
+    let painted_glyphs = |runs: Vec<ShapedGlyphRun>| {
+        runs.into_iter()
+            .flat_map(|run| run.glyphs)
+            .map(|glyph| {
+                (
+                    glyph
+                        .painted_id()
+                        .expect("the Arabic test fonts paint each glyph"),
+                    glyph.x_advance,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // These are the five normal/presentation-form pairs in the two WPTs.
+    // The reference has authored Tatweel in its own face. A unicode-range
+    // font transition must not silently become that reference by injecting
+    // virtual U+0640: Tatweel is authored, visible, and advancing text.
+    for (normal, presentation, description) in [
+        (
+            "\u{0640}\u{0627}\u{0640}",
+            "\u{0640}\u{fe8e}\u{0640}",
+            "Alef on both sides",
+        ),
+        ("\u{0640}\u{0627}", "\u{0640}\u{fe8e}", "Alef after Tatweel"),
+        ("\u{0628}\u{0640}", "\u{fe91}\u{0640}", "Beh before Tatweel"),
+        (
+            "\u{0640}\u{0628}\u{0640}",
+            "\u{0640}\u{fe92}\u{0640}",
+            "Beh on both sides",
+        ),
+        ("\u{0640}\u{0628}", "\u{0640}\u{fe90}", "Beh after Tatweel"),
+    ] {
+        let expected_spans = tatweel_test_spans(presentation, &arabic, &explicit_tatweel);
+        let expected_inline_advance = styled_inline_advance(
+            &mut system,
+            &expected_spans,
+            presentation,
+            arabic.line_height,
+            &arabic,
+        );
+        let expected = painted_glyphs(system.shape_styled_text_runs_with_parley(&expected_spans));
+        let fallback_spans = [StyledTextSpan {
+            text: normal,
+            style: &unicode_range_fallback,
+        }];
+        let fallback_inline_advance = styled_inline_advance(
+            &mut system,
+            &fallback_spans,
+            normal,
+            unicode_range_fallback.line_height,
+            &unicode_range_fallback,
+        );
+        let fallback = painted_glyphs(system.shape_styled_text_runs_with_parley(&fallback_spans));
+        let explicit_spans = tatweel_test_spans(normal, &arabic, &explicit_tatweel);
+        let explicit_inline_advance = styled_inline_advance(
+            &mut system,
+            &explicit_spans,
+            normal,
+            arabic.line_height,
+            &arabic,
+        );
+        let explicit = painted_glyphs(system.shape_styled_text_runs_with_parley(&explicit_spans));
+
+        for (mechanism, actual, actual_inline_advance, has_authored_tatweel) in [
+            (
+                "unicode-range fallback",
+                fallback,
+                fallback_inline_advance,
+                false,
+            ),
+            ("explicit font", explicit, explicit_inline_advance, true),
+        ] {
+            if !has_authored_tatweel {
+                assert_ne!(
+                    actual
+                        .iter()
+                        .map(|(glyph_id, _)| *glyph_id)
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|(glyph_id, _)| *glyph_id)
+                        .collect::<Vec<_>>(),
+                    "{description}: {mechanism} must not gain authored Tatweel context",
+                );
+                continue;
+            }
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|(glyph_id, _)| *glyph_id)
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|(glyph_id, _)| *glyph_id)
+                    .collect::<Vec<_>>(),
+                "{description}: {mechanism} must preserve contextual glyph selection",
+            );
+            let actual_advance = actual.iter().map(|(_, advance)| *advance).sum::<f32>();
+            let expected_advance = expected.iter().map(|(_, advance)| *advance).sum::<f32>();
+            assert!(
+                (actual_advance - expected_advance).abs() < 0.001,
+                "{description}: {mechanism} leaked a synthetic context advance: \
+                 actual {actual_advance}, expected {expected_advance}",
+            );
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{description}: {mechanism} emitted a synthetic context paint glyph",
+            );
+            assert!(
+                (actual_inline_advance - expected_inline_advance).abs() < 0.001,
+                "{description}: {mechanism} leaked a synthetic context visual offset: \
+                 actual {actual_inline_advance}, expected {expected_inline_advance}",
+            );
+        }
+    }
+
+    let authored_tatweel = system.shape_styled_text_runs_with_parley(&[StyledTextSpan {
+        text: "\u{0640}",
+        style: &explicit_tatweel,
+    }]);
+    let authored_tatweel = authored_tatweel
+        .into_iter()
+        .flat_map(|run| run.glyphs)
+        .collect::<Vec<_>>();
+    assert_eq!(authored_tatweel.len(), 1);
+    assert_eq!(authored_tatweel[0].unicode, "\u{0640}");
+    assert!(authored_tatweel[0].x_advance > 0.0);
 }
 
 #[tokio::test]

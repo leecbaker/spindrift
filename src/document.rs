@@ -15,7 +15,7 @@ use paint::display_list::PagePaintTree;
 pub(crate) use paint::geometry::PaintStrokeWidth;
 use paint::geometry::{PaintPoint, PaintSize};
 use paint::images::RenderedImage;
-use paint::page::{OpaqueTextCoverage, PaintOperation};
+use paint::page::{OpaqueTextCoverage, PaintOperation, SvgTextOutline};
 use paint::paths::{RenderedGradient, RenderedPath, RenderedPathPaint};
 use paint::patterns::{RenderedGradientPattern, RenderedImagePattern, RenderedSvgPattern};
 use paint::shapes::{RenderedRect, RenderedRoundedRect, RenderedStroke};
@@ -1029,6 +1029,7 @@ pub(crate) struct Page {
     pub(crate) gradient_patterns: Vec<RenderedGradientPattern>,
     pub(crate) svg_patterns: Vec<RenderedSvgPattern>,
     pub(crate) opaque_text_coverages: Vec<OpaqueTextCoverage>,
+    pub(crate) svg_text_outlines: Vec<SvgTextOutline>,
     /// A committed CSS fragmentation slice that owns this page even when it
     /// has no visible paint primitives (for example, the trailing slice of a
     /// tall table row).
@@ -1054,6 +1055,7 @@ impl Page {
             gradient_patterns: Vec::new(),
             svg_patterns: Vec::new(),
             opaque_text_coverages: Vec::new(),
+            svg_text_outlines: Vec::new(),
             has_fragmentation_content: false,
             paint_tree: PagePaintTree::new(),
         }
@@ -1227,7 +1229,12 @@ fn collect_svg_scene_colors(scene: &crate::svg::SvgPaintGroup, colors: &mut Vec<
             crate::svg::SvgPaintItem::Group(group) | crate::svg::SvgPaintItem::NestedSvg(group) => {
                 collect_svg_scene_colors(group, colors)
             }
-            crate::svg::SvgPaintItem::RasterImage(_) => {}
+            crate::svg::SvgPaintItem::OutlinedText(outlined) => {
+                for path in &outlined.paths {
+                    collect_path_colors(path, colors);
+                }
+            }
+            crate::svg::SvgPaintItem::RasterImage(_) | crate::svg::SvgPaintItem::Text(_) => {}
         }
     }
 }

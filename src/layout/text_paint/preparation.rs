@@ -51,12 +51,10 @@ fn can_shape_inline_text_prep_spans_together<F: InlineFragmentAccess>(
     right: &InlineTextPrepSpan<'_, F>,
 ) -> bool {
     if inline_text_prep_span_is_join_control_only(left) {
-        return !inline_box_edge_breaks_shaping(right.fragment.style())
-            && !inline_bidi_isolation_boundary_breaks_shaping(left.fragment, right.fragment);
+        return !inline_bidi_isolation_boundary_breaks_shaping(left.fragment, right.fragment);
     }
     if inline_text_prep_span_is_join_control_only(right) {
-        return !inline_box_edge_breaks_shaping(left.fragment.style())
-            && !inline_bidi_isolation_boundary_breaks_shaping(left.fragment, right.fragment);
+        return !inline_bidi_isolation_boundary_breaks_shaping(left.fragment, right.fragment);
     }
     left.fragment.style().vertical_align == right.fragment.style().vertical_align
         && left.fragment.style().writing_mode == right.fragment.style().writing_mode
@@ -71,8 +69,6 @@ fn can_shape_inline_text_prep_spans_together<F: InlineFragmentAccess>(
             right.fragment.ancestor_inline_decorations(),
         )
         && left.fragment.resolved_bidi_direction() == right.fragment.resolved_bidi_direction()
-        && !inline_box_edge_breaks_shaping(left.fragment.style())
-        && !inline_box_edge_breaks_shaping(right.fragment.style())
         && !inline_bidi_isolation_boundary_breaks_shaping(left.fragment, right.fragment)
 }
 
@@ -229,6 +225,7 @@ fn compose_selected_source_shapes<F: InlineFragmentAccess>(
         baseline_adjustment: source.baseline_adjustment,
         typesetting_plan,
         runs: Vec::with_capacity(run_capacity),
+        monotonic_source_advance_index: Default::default(),
     };
     let mut width = 0.0;
     for span in group {
@@ -526,6 +523,7 @@ impl<'a> LayoutBuilder<'a> {
             baseline_adjustment,
             typesetting_plan,
             runs: shaped_runs,
+            monotonic_source_advance_index: Default::default(),
         };
         let metrics = self.inline_text_box_metrics(first.style(), first.baseline_shift());
         let y = self.cursor_y - metrics.line_baseline_offset + first.baseline_shift();
@@ -736,6 +734,7 @@ mod tests {
                 baseline_adjustment: 0.0,
                 typesetting_plan: TextTypesettingPlan::Horizontal,
                 runs: Vec::new(),
+                monotonic_source_advance_index: Default::default(),
             }),
         })
     }

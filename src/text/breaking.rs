@@ -22,6 +22,8 @@ pub(crate) struct TextBreakPolicy {
     auto_phrase_language: Option<AutoPhraseLanguage>,
 }
 
+const MEASURED_BREAK_OPPORTUNITY_CACHE_CAPACITY: usize = 128;
+
 impl From<&ComputedStyle> for TextBreakPolicy {
     fn from(style: &ComputedStyle) -> Self {
         Self {
@@ -631,6 +633,45 @@ pub(crate) fn collect_measured_break_opportunities(
     breaks.push(text.len());
     breaks.sort_unstable();
     breaks.dedup();
+}
+
+impl FontSystem {
+    /// Copy ICU-derived source offsets from an exact bounded cache, or collect
+    /// them once for the given complete CSS break policy.
+    ///
+    /// The graph still applies fragment boundaries, discretionary effects,
+    /// and CSS fallback stages itself. Caching only this source-only ICU pass
+    /// therefore cannot share line-edge state between distinct paragraphs.
+    pub(crate) fn collect_cached_measured_break_opportunities(
+        &mut self,
+        text: &str,
+        policy: TextBreakPolicy,
+        offsets: &mut Vec<usize>,
+    ) {
+        if let Some(entry) = self
+            .measured_break_opportunity_cache
+            .iter()
+            .rev()
+            .find(|entry| entry.text.as_ref() == text && entry.policy == policy)
+        {
+            offsets.clone_from(&entry.offsets);
+            return;
+        }
+        collect_measured_break_opportunities(text, policy, offsets);
+        if !text.is_empty() {
+            if self.measured_break_opportunity_cache.len()
+                == MEASURED_BREAK_OPPORTUNITY_CACHE_CAPACITY
+            {
+                self.measured_break_opportunity_cache.remove(0);
+            }
+            self.measured_break_opportunity_cache
+                .push(MeasuredBreakOpportunityCacheEntry {
+                    text: Rc::from(text),
+                    policy,
+                    offsets: offsets.clone(),
+                });
+        }
+    }
 }
 
 /// Collect ordinary UAX #14 candidates which `word-break:auto-phrase` holds

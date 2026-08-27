@@ -12,6 +12,10 @@ use crate::units::SemanticLengthExt;
 /// shaping without starting a second UAX #9 paragraph.
 const VISUAL_ORDER_GUARD_PREFIX: &str = "\u{202d}";
 const VISUAL_ORDER_GUARD_SUFFIX: &str = "\u{202c}";
+/// Keep source-shaping reuse bounded for documents with many unique long
+/// strings. The cache is an optimization only; eviction cannot affect layout.
+const UNTRACKED_INLINE_LINE_CACHE_CAPACITY: usize = 64;
+const UNTRACKED_STYLED_INLINE_LINE_CACHE_CAPACITY: usize = 32;
 
 /// Return the OpenType shaping direction selected by UAX #9 for a visual run.
 ///
@@ -123,12 +127,6 @@ impl FontSystem {
                 letter_spacing,
             );
         }
-        if text_needs_edge_join_context(text) {
-            return self.shape_styled_text_runs_with_parley_with_letter_spacing(
-                &[StyledTextSpan { text, style }],
-                letter_spacing,
-            );
-        }
         self.with_reusable_parley_layout(|this, layout| {
             let parley_style = this.shaping_style_for_selected_face(style);
             let feature_context = this.font_feature_context_for_style(style);
@@ -202,10 +200,28 @@ impl FontSystem {
         style: &ComputedStyle,
         line_height: f32,
     ) -> Option<ShapedInlineLine> {
-        self.shape_unwrapped_line_with_letter_spacing(
+        self.shape_text_request(TextShapingRequest::from_html_computed_style(
             text,
             style,
             line_height,
+        ))
+    }
+
+    /// Shape one source-neutral text request through Quire's document font
+    /// registry.
+    ///
+    /// This deliberately performs no HTML line-box construction. Callers
+    /// retain their own placement model around the returned glyph stream;
+    /// SVG therefore reaches the exact same face selection, fallback,
+    /// shaping, and PDF-subset identities as HTML.
+    pub(crate) fn shape_text_request(
+        &mut self,
+        request: TextShapingRequest<'_>,
+    ) -> Option<ShapedInlineLine> {
+        self.shape_unwrapped_line_with_letter_spacing(
+            request.text,
+            request.style,
+            request.line_height,
             ShapingLetterSpacing::Computed,
         )
     }
@@ -236,6 +252,7 @@ impl FontSystem {
             baseline_adjustment,
             typesetting_plan,
             runs,
+            monotonic_source_advance_index: Default::default(),
         };
         if shaped.runs.is_empty() {
             return None;
@@ -257,12 +274,53 @@ impl FontSystem {
         style: &ComputedStyle,
         line_height: f32,
     ) -> Option<ShapedInlineLine> {
-        self.shape_unwrapped_line_with_letter_spacing(
+        if let Some(entry) = self.untracked_inline_line_cache.iter().rev().find(|entry| {
+            entry.text.as_ref() == text
+                && entry.line_height_bits == line_height.to_bits()
+                && entry.style.as_ref() == style
+        }) {
+            return entry.shaped.clone();
+        }
+        let shaped = self.shape_unwrapped_line_with_letter_spacing(
             text,
             style,
             line_height,
             ShapingLetterSpacing::Suppressed,
-        )
+        );
+        if !text.is_empty() {
+            if self.untracked_inline_line_cache.len() == UNTRACKED_INLINE_LINE_CACHE_CAPACITY {
+                self.untracked_inline_line_cache.remove(0);
+            }
+            self.untracked_inline_line_cache
+                .push(UntrackedInlineLineCacheEntry {
+                    text: Rc::from(text),
+                    style: Rc::new(style.clone()),
+                    line_height_bits: line_height.to_bits(),
+                    shaped: shaped.clone(),
+                });
+        }
+        shaped
+    }
+
+    /// Shape a graph fragment with an exact immutable style identity.
+    ///
+    /// Collected words from one inline scope share the same `Rc` style. This
+    /// small cache therefore removes repeated shaping of recurring words
+    /// without guessing which subset of computed CSS affects a glyph stream.
+    pub(crate) fn shape_untracked_inline_line_with_style_identity(
+        &mut self,
+        text: &str,
+        style: &Rc<ComputedStyle>,
+        line_height: f32,
+    ) -> Option<ShapedInlineLine> {
+        if let Some(entry) = self.untracked_inline_line_cache.iter().rev().find(|entry| {
+            entry.text.as_ref() == text
+                && entry.line_height_bits == line_height.to_bits()
+                && (Rc::ptr_eq(&entry.style, style) || entry.style.as_ref() == style.as_ref())
+        }) {
+            return entry.shaped.clone();
+        }
+        self.shape_untracked_inline_line(text, style, line_height)
     }
 
     /// Shape a logical selected-line slice with its UAX #9 scope restored.
@@ -471,6 +529,7 @@ impl FontSystem {
                 baseline_adjustment,
                 typesetting_plan: TextTypesettingPlan::resolve(text, &visual_style),
                 runs,
+                monotonic_source_advance_index: Default::default(),
             }
         })
     }
@@ -545,6 +604,88 @@ impl FontSystem {
         )
     }
 
+    /// Shape a complete graph source stream using an exact ordered list of
+    /// immutable span styles as its cache key.
+    ///
+    /// The cache is intentionally narrower than the generic styled shaper:
+    /// graph construction owns `Rc<ComputedStyle>` for every source span and
+    /// can therefore prove that no shaping-affecting CSS input was guessed.
+    pub(crate) fn shape_untracked_styled_inline_fragments_with_style_identities(
+        &mut self,
+        spans: &[StyledTextSpan<'_>],
+        text_summary: String,
+        line_height: f32,
+        tab_metric_style: &ComputedStyle,
+        span_styles: &[Rc<ComputedStyle>],
+    ) -> Option<ShapedInlineLine> {
+        debug_assert_eq!(spans.len(), span_styles.len());
+        debug_assert!(
+            spans
+                .iter()
+                .zip(span_styles)
+                .all(|(span, style)| std::ptr::eq(span.style, style.as_ref()))
+        );
+        let uniform_style = span_styles.first().filter(|first| {
+            span_styles
+                .iter()
+                .all(|style| style.as_ref() == first.as_ref())
+        });
+        if let Some(entry) = self
+            .untracked_styled_inline_line_cache
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.text.as_ref() == text_summary
+                    && entry.line_height_bits == line_height.to_bits()
+                    && entry.tab_metric_style == *tab_metric_style
+                    && (entry
+                        .uniform_style
+                        .as_ref()
+                        .zip(uniform_style)
+                        .is_some_and(|(cached, style)| cached == style.as_ref())
+                        || (entry.uniform_style.is_none()
+                            && uniform_style.is_none()
+                            && entry.span_styles.len() == span_styles.len()
+                            && entry
+                                .span_styles
+                                .iter()
+                                .zip(span_styles)
+                                .all(|(cached, style)| Rc::ptr_eq(cached, style))))
+            })
+        {
+            return entry.shaped.clone();
+        }
+        let shaped = self.shape_untracked_styled_inline_fragments(
+            spans,
+            text_summary.clone(),
+            0.0,
+            line_height,
+            0.0,
+            tab_metric_style,
+        );
+        if !text_summary.is_empty() {
+            if self.untracked_styled_inline_line_cache.len()
+                == UNTRACKED_STYLED_INLINE_LINE_CACHE_CAPACITY
+            {
+                self.untracked_styled_inline_line_cache.remove(0);
+            }
+            self.untracked_styled_inline_line_cache
+                .push(UntrackedStyledInlineLineCacheEntry {
+                    text: text_summary.into(),
+                    uniform_style: uniform_style.map(|style| style.as_ref().clone()),
+                    span_styles: if uniform_style.is_none() {
+                        span_styles.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    line_height_bits: line_height.to_bits(),
+                    tab_metric_style: tab_metric_style.clone(),
+                    shaped: shaped.clone(),
+                });
+        }
+        shaped
+    }
+
     #[allow(clippy::too_many_arguments)] // Explicit shaping inputs preserve CSS line context.
     fn shape_styled_inline_fragments_with_letter_spacing(
         &mut self,
@@ -582,6 +723,7 @@ impl FontSystem {
             baseline_adjustment,
             typesetting_plan,
             runs,
+            monotonic_source_advance_index: Default::default(),
         })
     }
 

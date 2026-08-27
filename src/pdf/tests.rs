@@ -11,7 +11,10 @@ use super::{
     embedded_font_plans_with_profile_and_mode, quantized_pdf_font_size, same_embedded_font_program,
 };
 use crate::document::paint::display_list::PaintBand;
-use crate::document::paint::text::{RenderedGlyph, RenderedLine, RenderedTextRun};
+use crate::document::paint::text::{
+    OpaqueTextGlyphCoverage, RenderedGlyph, RenderedLine, RenderedTextRun,
+    split_rendered_line_for_opaque_text_coverage,
+};
 use crate::document::{
     CssFontVerticalMetrics, DocumentFont, DocumentFontData, DocumentFontVariationCoordinates,
     FontProgramKind, OpenTypeVerticalMetrics,
@@ -3589,6 +3592,92 @@ fn pdf_vector_path_glyph_is_invisible_but_retains_text_extraction() {
         rendered.contains(&format!("<{cid_a:04X}> <0041>")),
         "the invisible glyph must remain in the ToUnicode CMap: {rendered}"
     );
+}
+
+#[test]
+fn pdf_fully_covered_actual_text_run_is_invisible_and_retains_marked_content() {
+    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+    let glyph_a = face.glyph_index('A').unwrap().0;
+    let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
+    let coverage_rect = crate::document::paint::geometry::PaintRect::new(
+        crate::document::paint::geometry::PaintPoint::new(10.0, 30.0),
+        crate::document::paint::geometry::PaintSize::new(10.0, 10.0),
+    );
+    let coverage_path = crate::document::paint::paths::RenderedPath::new(
+        vec![
+            crate::document::paint::paths::RenderedPathCommand::move_to(
+                crate::document::paint::geometry::PaintPoint::new(10.0, 30.0),
+            ),
+            crate::document::paint::paths::RenderedPathCommand::line_to(
+                crate::document::paint::geometry::PaintPoint::new(20.0, 30.0),
+            ),
+            crate::document::paint::paths::RenderedPathCommand::line_to(
+                crate::document::paint::geometry::PaintPoint::new(20.0, 40.0),
+            ),
+            crate::document::paint::paths::RenderedPathCommand::line_to(
+                crate::document::paint::geometry::PaintPoint::new(10.0, 40.0),
+            ),
+            crate::document::paint::paths::RenderedPathCommand::Close,
+        ],
+        Some(CssColor::BLACK),
+        crate::document::paint::paths::RenderedPathFillRule::NonZero,
+        None,
+        crate::PaintStrokeWidth::ZERO,
+        None,
+    )
+    .with_opaque_coverage_rect(coverage_rect);
+    let line = RenderedLine::new(
+        "A".to_string(),
+        10.0,
+        40.0,
+        12.0,
+        Some(0),
+        CssColor::BLACK,
+        vec![RenderedTextRun {
+            text: Rc::from("A"),
+            actual_text: Some(Rc::from("A\u{2060}")),
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
+            font_size: 12.0,
+            font_id: Some(0),
+            font_palette: crate::css::FontPalette::Normal,
+            glyphs: Some(vec![test_rendered_glyph(glyph_a, "A")].into()),
+            glyph_source_ranges: None,
+        }],
+    );
+    let segments = split_rendered_line_for_opaque_text_coverage(
+        line,
+        vec![OpaqueTextGlyphCoverage {
+            run_index: 0,
+            glyph_index: 0,
+            path: coverage_path,
+        }],
+    );
+    let mut page = Page::new(120.0, 80.0);
+    page.push_text_paint_segments_in_band(PaintBand::InFlowBlock, segments);
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: vec![font],
+        bookmarks: Vec::new(),
+        image_store: Box::default(),
+    };
+
+    let pdf = document
+        .write_pdf_bytes(&PdfOptions {
+            compression: PdfCompression::Uncompressed,
+            ..PdfOptions::default()
+        })
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("3 Tr"), "{rendered}");
+    assert!(rendered.contains("0 Tr"), "{rendered}");
+    assert!(rendered.contains("/ActualText"), "{rendered}");
+    assert!(rendered.contains("<FEFF00412060>"), "{rendered}");
+    assert!(rendered.contains("10 30 10 10 re\nf"), "{rendered}");
 }
 
 #[test]

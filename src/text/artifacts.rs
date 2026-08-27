@@ -4,7 +4,16 @@
 //! consumers that retain its results. Every optional glyph source range indexes
 //! the authored text held by the durable shaped line.
 
+use std::cell::RefCell;
+
 use super::*;
+
+/// Logical cluster endpoints and their cumulative advances for a shaped run
+/// whose source and visual order are provably identical.
+#[derive(Debug, Clone)]
+pub(crate) struct MonotonicSourceAdvanceIndex {
+    ends: Vec<(usize, f32)>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ShapedGlyphRun {
@@ -35,7 +44,7 @@ pub(crate) struct ShapedGlyphRun {
 /// <https://www.w3.org/TR/css-text-3/#text-processing-order>,
 /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-linebox>, and
 /// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm>.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct ShapedInlineLine {
     pub(crate) text: Rc<str>,
     pub(crate) width: f32,
@@ -45,6 +54,23 @@ pub(crate) struct ShapedInlineLine {
     pub(crate) baseline_adjustment: f32,
     pub(crate) typesetting_plan: TextTypesettingPlan,
     pub(crate) runs: Vec<ShapedInlineRun>,
+    /// Memoized only for source-provenance line fitting. This cache is not
+    /// part of a shaped line's visual artifact identity.
+    pub(crate) monotonic_source_advance_index:
+        Rc<RefCell<Option<Option<MonotonicSourceAdvanceIndex>>>>,
+}
+
+impl PartialEq for ShapedInlineLine {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.width == other.width
+            && self.offset == other.offset
+            && self.aligned_by_parley == other.aligned_by_parley
+            && self.line_height == other.line_height
+            && self.baseline_adjustment == other.baseline_adjustment
+            && self.typesetting_plan == other.typesetting_plan
+            && self.runs == other.runs
+    }
 }
 
 impl ShapedInlineLine {
@@ -208,6 +234,7 @@ impl ShapedInlineLine {
             baseline_adjustment: self.baseline_adjustment,
             typesetting_plan: self.typesetting_plan.source_slice(range)?,
             runs,
+            monotonic_source_advance_index: Default::default(),
         };
         selected.width = selected.advance_width();
         Some(selected)
@@ -275,6 +302,77 @@ impl ShapedInlineLine {
         }
 
         Some(right_edge? - left_edge?)
+    }
+
+    /// Return source-prefix advances for cluster-aligned offsets in logical
+    /// order without repeatedly walking the shaped glyph sequence.
+    ///
+    /// This intentionally accepts only left-to-right visual runs whose glyph
+    /// clusters cover the authored source contiguously. Consecutive fallback
+    /// font runs are valid when their visual offsets continue that same
+    /// logical sequence. Glyph placement offsets do not change the
+    /// source-order pen advance, so ordinary GPOS kerning remains eligible.
+    /// Callers use [`Self::source_range_advance_width`] or conventional line
+    /// materialization when contextual shaping or bidi reordering makes a
+    /// prefix sum insufficient.
+    ///
+    /// <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+    #[cfg(test)]
+    pub(crate) fn monotonic_source_prefix_advances(&self, offsets: &[usize]) -> Option<Vec<f32>> {
+        offsets
+            .iter()
+            .map(|offset| self.monotonic_source_prefix_advance(*offset))
+            .collect()
+    }
+
+    /// Return one cluster-aligned advance from the cached monotonic source
+    /// index. Callers fitting a graph cursor use this scalar form to avoid
+    /// allocating a temporary vector for every graph boundary.
+    pub(crate) fn monotonic_source_prefix_advance(&self, offset: usize) -> Option<f32> {
+        if offset > self.text.len() || !self.text.is_char_boundary(offset) {
+            return None;
+        }
+        if self.monotonic_source_advance_index.borrow().is_none() {
+            let index = self.build_monotonic_source_advance_index();
+            *self.monotonic_source_advance_index.borrow_mut() = Some(index);
+        }
+        let cache = self.monotonic_source_advance_index.borrow();
+        let index = cache.as_ref()?.as_ref()?;
+        if offset == 0 {
+            return Some(0.0);
+        }
+        index
+            .ends
+            .binary_search_by_key(&offset, |(end, _)| *end)
+            .ok()
+            .map(|position| index.ends[position].1)
+    }
+
+    fn build_monotonic_source_advance_index(&self) -> Option<MonotonicSourceAdvanceIndex> {
+        let mut ends = Vec::new();
+        let mut previous_end = 0usize;
+        let mut prefix_advance = 0.0;
+        let mut expected_run_offset = 0.0;
+        for run in &self.runs {
+            if run.x_offset != expected_run_offset {
+                return None;
+            }
+            for glyph in &run.glyphs {
+                let range = glyph.source_range.as_ref()?;
+                if range.start != previous_end && range.start != range.end {
+                    return None;
+                }
+                prefix_advance += glyph.rendered.x_advance;
+                if ends.last().is_some_and(|(end, _)| *end == range.end) {
+                    ends.last_mut().expect("existing cluster end").1 = prefix_advance;
+                } else {
+                    ends.push((range.end, prefix_advance));
+                }
+                previous_end = range.end;
+            }
+            expected_run_offset = prefix_advance;
+        }
+        (previous_end == self.text.len()).then_some(MonotonicSourceAdvanceIndex { ends })
     }
 
     /// Return the visual inline span occupied by an authored source range.
@@ -667,6 +765,7 @@ mod tests {
                 shaped_run("A", 0.0, FontPalette::Index(0)),
                 shaped_run("B", 6.0, FontPalette::Index(1)),
             ],
+            monotonic_source_advance_index: Default::default(),
         };
 
         let rendered = line.rendered_runs();
@@ -689,6 +788,7 @@ mod tests {
             baseline_adjustment: 0.0,
             typesetting_plan: TextTypesettingPlan::Horizontal,
             runs: vec![ligature_slice, shaped_run("X", 6.0, FontPalette::Normal)],
+            monotonic_source_advance_index: Default::default(),
         };
 
         let rendered = line.rendered_runs();

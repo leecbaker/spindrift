@@ -1,6 +1,6 @@
 # CSS Floats Parity
 
-Last updated: 2026-08-15
+Last updated: 2026-08-25
 
 CSS 2.2 is the conformance target for float placement, exclusion, and
 clearance. WeasyPrint is used as a compatibility reference for paged-output
@@ -137,6 +137,22 @@ behavior where the specs leave implementation details ambiguous.
   visible suffix content on that completed line, the placement is rolled back
   so the marker defers with the suffix to the next line. Prefix text keeps its
   original position.
+- A flow block whose direct source is only collapsible whitespace and direct
+  floats takes a dedicated direct-float traversal, so text inside the float
+  cannot manufacture an anonymous parent line before placement. Direct floats
+  remain out of normal flow rather than being reclassified as block
+  boundaries; their shared float transaction preserves placement, paint
+  capture, and clearance. Floats encountered in a real inline run remain
+  zero-width inline markers. Tree-abiding
+  `::before`/`::after` float boxes keep their pseudo counter source through
+  either replay path, so generated and DOM floats execute once in source
+  order. This covers the float-based reference documents for
+  `flexbox_flow-row-wrap.html`, `flexbox_generated.html`,
+  `flexbox_item-float.html`, `flexbox_item-top-float.html`,
+  `flexbox_item-vertical-align.html`, `flexbox_rtl-direction.html`,
+  `flexbox_visibility-collapse-line-wrapping.html`,
+  `flexbox_visibility-collapse.html`, `flexbox_wrap-long.html`,
+  `flexbox_wrap-reverse.html`, and `flexbox_wrap.html`.
 - Equal-width line break candidates advance over zero-width inline float
   markers, so an inline-block prefix does not force a following fitting
   right float onto the next line.
@@ -145,9 +161,12 @@ behavior where the specs leave implementation details ambiguous.
   The transaction preserves the selected source range and real break metadata,
   line slab, physical placement floor, and committed exclusion. A right float
   that cannot fit after its prefix uses the earliest legal later float row
-  without splitting or soft-wrapping the source line. This covers the current
-  `float-nowrap-1.html` and `float-nowrap-hyphen-rewind-1.html` cases; broader
-  fragmented and nested inline-float replay remains listed in
+  without splitting or soft-wrapping the source line. A soft wrap immediately
+  before such a continuation remains outside that range, preventing marker
+  lookahead from splitting the continuation or absorbing its prefix. This
+  covers the current `float-nowrap-1.html`, `float-nowrap-7.html`,
+  `float-nowrap-9.html`, and `float-nowrap-hyphen-rewind-1.html` cases;
+  broader fragmented and nested inline-float replay remains listed in
   `SPEC_DIVERGENCES.md`.
   Collapsible whitespace looks through those zero-width out-of-flow markers,
   so adjacent spaces collapse as if the float were not part of the inline

@@ -1,9 +1,9 @@
 use super::*;
 
-pub(in crate::layout) struct TextShadowPaintPass {
+pub(crate) struct TextShadowPaintPass {
     /// Blur-sample displacement in bottom-left page paint space.
-    pub(in crate::layout) offset: PaintDisplacement,
-    pub(in crate::layout) color: CssColor,
+    pub(crate) offset: PaintDisplacement,
+    pub(crate) color: CssColor,
 }
 
 /// Build vector replay passes for a CSS `text-shadow`.
@@ -13,7 +13,7 @@ pub(in crate::layout) struct TextShadowPaintPass {
 /// so blurred shadows are approximated by bounded translucent vector replays
 /// while zero-blur shadows remain crisp single-pass text:
 /// <https://www.w3.org/TR/css-text-decor-3/#text-shadow-property>.
-pub(in crate::layout) fn text_shadow_paint_passes(
+pub(crate) fn text_shadow_paint_passes(
     shadow: crate::css::TextShadow,
     color: CssColor,
 ) -> Vec<TextShadowPaintPass> {
@@ -49,7 +49,7 @@ pub(in crate::layout) fn text_shadow_paint_passes(
         .collect()
 }
 
-pub(in crate::layout) fn color_with_alpha_factor(color: CssColor, factor: f32) -> CssColor {
+pub(crate) fn color_with_alpha_factor(color: CssColor, factor: f32) -> CssColor {
     color.with_alpha((color.alpha() * factor).clamp(0.0, 1.0))
 }
 

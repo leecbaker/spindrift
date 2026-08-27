@@ -14,21 +14,26 @@ use cssparser::{
     StyleSheetParser, Token,
 };
 
-use crate::css::{self, CssColor};
+use crate::css::{
+    self, BaselineMetric, ComputedStyle, CssColor, FontFamily, FontKerning, FontStyle,
+    FontVariantCaps, FontVariationSetting, FontVariationSettings, FontWeight, FontWidth,
+};
 use crate::document::PaintStrokeWidth;
 use crate::document::paint::effects::PaintBlendMode;
 use crate::document::paint::geometry::{
-    PaintClip, PaintPoint, PaintRect, PaintSize, PaintTransform,
+    PaintClip, PaintPoint, PaintRect, PaintSize, PaintTransform, PaintTranslation,
 };
 use crate::document::paint::images::RenderedImage;
 use crate::document::paint::paths::{
     RenderedGradient, RenderedGradientKind, RenderedGradientStop, RenderedPath, RenderedPathClip,
-    RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathPaint,
-    RenderedSvgPathPattern,
+    RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathLineCap,
+    RenderedPathLineJoin, RenderedPathPaint, RenderedPathPaintOrder, RenderedPathStrokeStyle,
+    RenderedSvgPathPattern, paint_rect_path_commands,
 };
 use crate::document::paint::patterns::RenderedImageSourceRect;
 use crate::dom::{Element, ElementId, NodeKind};
 use crate::resource::ExternalSvgUseResolver;
+use crate::text::{FontSystem, TextShapingRequest};
 use crate::units::{LayoutLength, LayoutSize, SemanticLengthExt, layout_pt};
 
 const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
@@ -36,6 +41,10 @@ const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 const SVG_IMAGE_ROOT_MARKER_ATTRIBUTE: &str = "data-quire-svg-root";
+/// Private source marker retained by Quire's `usvg` adapter. It identifies
+/// the host-CSS typography record for a normalized text span; it is never an
+/// SVG author-visible identifier or a paint input.
+const SVG_TEXT_TYPOGRAPHY_KEY_ATTRIBUTE: &str = "data-quire-text-typography-key";
 
 /// Resource-processing policy for SVG image documents.
 ///
@@ -185,6 +194,18 @@ pub(crate) type SvgElementRect = euclid::Rect<f32, SvgElementUserSpace>;
 pub(crate) type SvgElementTransform =
     euclid::Transform2D<f32, SvgElementUserSpace, SvgElementUserSpace>;
 
+/// An SVG text-positioning point in the element's current user coordinate
+/// system. SVG's `x` and `y` attributes, and text-path samples, use this
+/// top-left-origin space rather than PDF glyph coordinates.
+/// <https://www.w3.org/TR/SVG2/text.html#TextLayoutAlgorithm>
+type SvgTextPosition = SvgElementPoint;
+
+/// An SVG text-positioning displacement in the element's current user
+/// coordinate system. SVG's `dx` and `dy` lists must cross this explicit
+/// boundary before becoming shaped-glyph offsets in `TextRunSpace`.
+/// <https://www.w3.org/TR/SVG2/text.html#TextData>
+type SvgTextUserDisplacement = euclid::Vector2D<f32, SvgElementUserSpace>;
+
 /// The reference rectangles from which CSS `transform-box` selects one local
 /// SVG coordinate system. All conversion into a selected reference rectangle
 /// goes through [`Self::select`].
@@ -258,6 +279,202 @@ type SvgSourceToPaintTransform =
 /// <https://www.w3.org/TR/SVG2/painting.html#SpecifyingPaint>.
 #[derive(Debug, Clone, Copy)]
 struct SvgGeometryToPaintTransform(PaintTransform);
+
+/// The geometric-mean scale used to shape SVG text before its residual affine
+/// transform is retained in the PDF text matrix. Keeping it distinct from a
+/// viewport or element scale prevents SVG user-coordinate lengths from being
+/// passed to the font system unscaled.
+#[derive(Debug, Clone, Copy)]
+struct SvgFontScale(f32);
+
+impl SvgFontScale {
+    fn from_position_transform(transform: SvgTextUserToPaintTransform) -> Option<Self> {
+        let transform = transform.0;
+        let determinant = transform.a() * transform.d() - transform.b() * transform.c();
+        let scale = determinant.abs().sqrt();
+        (scale.is_finite() && scale > 0.0001).then_some(Self(scale))
+    }
+
+    fn points(self) -> f32 {
+        self.0
+    }
+
+    fn scale_svg_length(self, length: f32) -> f32 {
+        length * self.0
+    }
+
+    fn unscale_text_length(self, length: f32) -> f32 {
+        length / self.0
+    }
+}
+
+/// Maps SVG text positions in the current element user space to page paint
+/// space. This is the same transform used for SVG geometry, so it retains the
+/// root viewport's top-left-origin coordinate system and all authored SVG
+/// transforms.
+#[derive(Debug, Clone, Copy)]
+struct SvgTextUserToPaintTransform(PaintTransform);
+
+impl SvgTextUserToPaintTransform {
+    fn from_usvg_transform(transform: usvg::Transform, viewport: ViewportTransform) -> Self {
+        Self(svg_path_transform(transform, viewport))
+    }
+
+    fn map_position(self, position: SvgTextPosition) -> PaintPoint {
+        self.0.apply_point(PaintPoint::new(position.x, position.y))
+    }
+
+    fn paint_transform(self) -> PaintTransform {
+        self.0
+    }
+
+    /// Convert a shaped font's y-up glyph coordinates into SVG's y-down text
+    /// coordinate convention before mapping them into the PDF page. SVG 2
+    /// requires both a y-down viewport and upright ordinary text.
+    /// <https://www.w3.org/TR/SVG2/coords.html#InitialCoordinateSystem>
+    fn glyph_to_paint(self) -> SvgGlyphToPaintTransform {
+        SvgGlyphToPaintTransform(PaintTransform::new(
+            self.0.a(),
+            self.0.b(),
+            -self.0.c(),
+            -self.0.d(),
+            0.0,
+            0.0,
+        ))
+    }
+}
+
+/// Maps shaped font glyph coordinates (`TextRunSpace`, whose y axis points
+/// upward like PDF text space) to page paint space. It is deliberately not
+/// interchangeable with [`SvgGeometryToPaintTransform`]: geometry consumes
+/// SVG y-down coordinates, while glyphs first require the local reflection
+/// that keeps normal SVG text upright.
+#[derive(Debug, Clone, Copy)]
+struct SvgGlyphToPaintTransform(PaintTransform);
+
+impl SvgGlyphToPaintTransform {
+    fn normalized_paint_transform(self, font_scale: SvgFontScale) -> PaintTransform {
+        PaintTransform::new(
+            self.0.a() / font_scale.points(),
+            self.0.b() / font_scale.points(),
+            self.0.c() / font_scale.points(),
+            self.0.d() / font_scale.points(),
+            0.0,
+            0.0,
+        )
+    }
+
+    fn text_matrix(
+        self,
+        font_scale: SvgFontScale,
+    ) -> Option<crate::document::paint::text::RenderedTextMatrix> {
+        let transform = self.normalized_paint_transform(font_scale);
+        crate::document::paint::text::RenderedTextMatrix::from_pdf_linear_components([
+            transform.a(),
+            transform.b(),
+            transform.c(),
+            transform.d(),
+        ])
+    }
+
+    fn map_text_run_point(
+        self,
+        font_scale: SvgFontScale,
+        point: crate::document::paint::text::TextRunPoint,
+    ) -> crate::document::paint::text::TextRunPoint {
+        let mapped = self
+            .normalized_paint_transform(font_scale)
+            .apply_point(PaintPoint::new(point.x, point.y));
+        crate::document::paint::text::TextRunPoint::new(mapped.x, mapped.y)
+    }
+
+    fn compose_text_matrix(
+        self,
+        font_scale: SvgFontScale,
+        local: crate::document::paint::text::RenderedTextMatrix,
+    ) -> crate::document::paint::text::RenderedTextMatrix {
+        local.transformed_by(self.normalized_paint_transform(font_scale))
+    }
+}
+
+/// The complete coordinate boundary for one normalized SVG text element.
+///
+/// SVG user-coordinate positions and shaped glyph coordinates intentionally
+/// take different routes through this record. That makes it impossible for a
+/// caller to accidentally install the root SVG y reflection as a PDF glyph
+/// matrix.
+#[derive(Debug, Clone, Copy)]
+struct SvgTextCoordinateTransform {
+    position_to_paint: SvgTextUserToPaintTransform,
+    glyph_to_paint: SvgGlyphToPaintTransform,
+    font_scale: SvgFontScale,
+}
+
+impl SvgTextCoordinateTransform {
+    fn new(transform: usvg::Transform, viewport: ViewportTransform) -> Option<Self> {
+        let position_to_paint =
+            SvgTextUserToPaintTransform::from_usvg_transform(transform, viewport);
+        let font_scale = SvgFontScale::from_position_transform(position_to_paint)?;
+        let glyph_to_paint = position_to_paint.glyph_to_paint();
+        Some(Self {
+            position_to_paint,
+            glyph_to_paint,
+            font_scale,
+        })
+    }
+
+    fn map_position(self, position: SvgTextPosition) -> PaintPoint {
+        self.position_to_paint.map_position(position)
+    }
+
+    fn paint_transform(self) -> PaintTransform {
+        self.position_to_paint.paint_transform()
+    }
+
+    fn font_scale(self) -> SvgFontScale {
+        self.font_scale
+    }
+
+    fn text_matrix(self) -> Option<crate::document::paint::text::RenderedTextMatrix> {
+        self.glyph_to_paint.text_matrix(self.font_scale)
+    }
+
+    /// SVG `dx`/`dy` values are y-down user-coordinate offsets. A shaped
+    /// glyph run instead uses y-up text space, so only this conversion flips
+    /// the local y component before the run's writing-mode matrix is applied.
+    fn text_run_displacement(
+        self,
+        displacement: SvgTextUserDisplacement,
+    ) -> crate::document::paint::text::TextRunDisplacement {
+        crate::document::paint::text::TextRunDisplacement::new(
+            self.font_scale.scale_svg_length(displacement.x),
+            -self.font_scale.scale_svg_length(displacement.y),
+        )
+    }
+
+    /// An SVG rotation is expressed in a y-down coordinate system. Conjugate
+    /// it through the glyph-local y reflection before applying PDF's y-up
+    /// text matrix.
+    fn glyph_rotation_degrees(self, svg_degrees: f32) -> f32 {
+        -svg_degrees
+    }
+
+    fn map_text_run_point(
+        self,
+        point: crate::document::paint::text::TextRunPoint,
+    ) -> crate::document::paint::text::TextRunPoint {
+        self.glyph_to_paint
+            .map_text_run_point(self.font_scale, point)
+    }
+
+    fn compose_text_matrix(
+        self,
+        local: crate::document::paint::text::RenderedTextMatrix,
+    ) -> crate::document::paint::text::RenderedTextMatrix {
+        self.glyph_to_paint
+            .compose_text_matrix(self.font_scale, local)
+    }
+}
 
 /// Maps a normalized SVG paint server into page paint space.
 ///
@@ -354,6 +571,32 @@ pub(crate) struct SvgPresentationOverride {
     pub(crate) fill: Option<String>,
     pub(crate) stroke: Option<String>,
     pub(crate) stroke_width: Option<String>,
+    /// Cascaded CSS text shadows serialized in SVG user units. This narrow
+    /// bridge lets retained SVG text use the document CSS cascade even though
+    /// `usvg` receives a standalone serialized subtree.
+    pub(crate) text_shadow: Option<String>,
+    pub(crate) font_family: Option<String>,
+    pub(crate) font_size: Option<String>,
+    pub(crate) font_weight: Option<String>,
+    pub(crate) font_style: Option<String>,
+    pub(crate) font_stretch: Option<String>,
+    /// Cascaded `font-variation-settings` serialized as SVG/CSS axis pairs.
+    /// The retained SVG adapter maps the normalized pairs directly to the
+    /// shared document-font request.
+    pub(crate) font_variation_settings: Option<String>,
+    pub(crate) font_kerning: Option<String>,
+    /// Resolved host-CSS spacing in SVG/CSS pixels. These are forwarded as
+    /// used values so SVG and HTML submit the same shaping request.
+    pub(crate) letter_spacing: Option<String>,
+    pub(crate) word_spacing: Option<String>,
+    pub(crate) writing_mode: Option<String>,
+    pub(crate) text_orientation: Option<String>,
+    pub(crate) direction: Option<String>,
+    pub(crate) unicode_bidi: Option<String>,
+    /// Key for the typed host-CSS typography side table. The serializer emits
+    /// this as a private attribute and the retained-text parser copies it onto
+    /// each normalized `TextSpan`.
+    pub(crate) text_typography_key: Option<SvgTextTypographyKey>,
     pub(crate) flood_color: Option<SvgFilterColorOverride>,
     pub(crate) lighting_color: Option<SvgFilterColorOverride>,
     /// A forced solid color replaces this element's unsupported filter result.
@@ -373,6 +616,36 @@ impl From<css::SvgFilterColor> for SvgFilterColorOverride {
         Self {
             color: color.color,
             current_color_dependent: color.current_color_dependent,
+        }
+    }
+}
+
+impl SvgPresentationOverride {
+    /// Whether this bridge owns a declaration that would otherwise survive in
+    /// an SVG element's inline `style` attribute with higher cascade
+    /// specificity than the serialized presentation attribute.
+    fn owns_style_property(&self, name: &str) -> bool {
+        match name {
+            "fill" => self.fill.is_some(),
+            "stroke" => self.stroke.is_some(),
+            "stroke-width" => self.stroke_width.is_some(),
+            "text-shadow" => self.text_shadow.is_some(),
+            "font-family" => self.font_family.is_some(),
+            "font-size" => self.font_size.is_some(),
+            "font-weight" => self.font_weight.is_some(),
+            "font-style" => self.font_style.is_some(),
+            "font-stretch" => self.font_stretch.is_some(),
+            "font-variation-settings" => self.font_variation_settings.is_some(),
+            "font-kerning" => self.font_kerning.is_some(),
+            "letter-spacing" => self.letter_spacing.is_some(),
+            "word-spacing" => self.word_spacing.is_some(),
+            "writing-mode" => self.writing_mode.is_some(),
+            "text-orientation" => self.text_orientation.is_some(),
+            "direction" => self.direction.is_some(),
+            "unicode-bidi" => self.unicode_bidi.is_some(),
+            "flood-color" => self.flood_color.is_some(),
+            "lighting-color" => self.lighting_color.is_some(),
+            _ => false,
         }
     }
 }
@@ -419,12 +692,185 @@ pub(crate) enum SvgDisplayOverride {
     UseContents,
 }
 
-pub(crate) type SvgPresentationOverrides = HashMap<ElementId, SvgPresentationOverride>;
+/// Opaque key joining a source inline-SVG element to the shaping style selected
+/// by the host CSS cascade. The parser retains this only on normalized text
+/// spans, so SVG geometry never observes a host-layout identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SvgTextTypographyKey(u64);
+
+impl SvgTextTypographyKey {
+    fn as_attribute_value(self) -> String {
+        self.0.to_string()
+    }
+
+    fn from_usvg(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Font-system input selected by the host CSS cascade for an inline SVG text
+/// content element. SVG geometry remains in `usvg`; this record contains only
+/// values which affect Quire font selection, shaping, or glyph realization.
+///
+/// SVG 2 presentation attributes participate in the author cascade, while
+/// inherited CSS typography crosses the inline-SVG resource boundary before
+/// the shared document font system shapes the retained span:
+/// <https://www.w3.org/TR/SVG2/styling.html#PresentationAttributes>
+/// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm>
+#[derive(Debug, Clone)]
+pub(crate) struct SvgTextTypography {
+    font_family: FontFamily,
+    font_size_css_px: f32,
+    font_size_adjust: css::FontSizeAdjust,
+    font_weight: FontWeight,
+    font_style: FontStyle,
+    font_width: FontWidth,
+    font_language_override: css::FontLanguageOverride,
+    font_synthesis: css::FontSynthesis,
+    font_feature_settings: css::FontFeatureSettings,
+    font_variation_settings: FontVariationSettings,
+    font_kerning: FontKerning,
+    font_variant_ligatures: css::FontVariantLigatures,
+    font_variant_position: css::FontVariantPosition,
+    font_variant_caps: FontVariantCaps,
+    font_variant_numeric: css::FontVariantNumeric,
+    font_variant_alternates: css::FontVariantAlternates,
+    font_variant_east_asian: css::FontVariantEastAsian,
+    font_variant_emoji: css::FontVariantEmoji,
+    font_palette: css::FontPalette,
+    language: css::ContentLanguage,
+    direction: css::Direction,
+    unicode_bidi: css::UnicodeBidi,
+    writing_mode: css::WritingMode,
+    text_orientation: css::TextOrientation,
+    letter_spacing_css_px: f32,
+    word_spacing_css_px: f32,
+    text_shadow: Vec<css::TextShadow>,
+}
+
+impl SvgTextTypography {
+    pub(crate) fn from_computed_style(style: &ComputedStyle) -> Self {
+        Self {
+            font_family: style.font_family.clone(),
+            font_size_css_px: style.font_size / css::CSS_PX_TO_PT,
+            font_size_adjust: style.font_size_adjust,
+            font_weight: style.font_weight,
+            font_style: style.font_style,
+            font_width: style.font_width,
+            font_language_override: style.font_language_override,
+            font_synthesis: style.font_synthesis,
+            font_feature_settings: style.font_feature_settings.clone(),
+            font_variation_settings: style.font_variation_settings.clone(),
+            font_kerning: style.font_kerning,
+            font_variant_ligatures: style.font_variant_ligatures,
+            font_variant_position: style.font_variant_position,
+            font_variant_caps: style.font_variant_caps,
+            font_variant_numeric: style.font_variant_numeric.clone(),
+            font_variant_alternates: style.font_variant_alternates.clone(),
+            font_variant_east_asian: style.font_variant_east_asian.clone(),
+            font_variant_emoji: style.font_variant_emoji,
+            font_palette: style.font_palette.clone(),
+            language: style.language.clone(),
+            direction: style.direction,
+            unicode_bidi: style.unicode_bidi,
+            writing_mode: style.writing_mode,
+            text_orientation: style.text_orientation,
+            letter_spacing_css_px: style.used_letter_spacing().points() / css::CSS_PX_TO_PT,
+            word_spacing_css_px: style.used_word_spacing().points() / css::CSS_PX_TO_PT,
+            text_shadow: style.text_shadow.clone(),
+        }
+    }
+
+    fn computed_style_at_font_scale(&self, font_scale: SvgFontScale) -> ComputedStyle {
+        let mut style = ComputedStyle::initial();
+        style.font_family = self.font_family.clone();
+        style.font_size = self.font_size_css_px * font_scale.points();
+        style.deferred_font_size = css::DeferredFontSize::Absolute(style.font_size);
+        style.font_size_adjust = self.font_size_adjust;
+        style.font_weight = self.font_weight;
+        style.font_style = self.font_style;
+        style.font_width = self.font_width;
+        style.font_language_override = self.font_language_override;
+        style.font_synthesis = self.font_synthesis;
+        style.font_feature_settings = self.font_feature_settings.clone();
+        style.font_variation_settings = self.font_variation_settings.clone();
+        style.font_kerning = self.font_kerning;
+        style.font_variant_ligatures = self.font_variant_ligatures;
+        style.font_variant_position = self.font_variant_position;
+        style.font_variant_caps = self.font_variant_caps;
+        style.font_variant_numeric = self.font_variant_numeric.clone();
+        style.font_variant_alternates = self.font_variant_alternates.clone();
+        style.font_variant_east_asian = self.font_variant_east_asian.clone();
+        style.font_variant_emoji = self.font_variant_emoji;
+        style.font_palette = self.font_palette.clone();
+        style.language = self.language.clone();
+        style.direction = self.direction;
+        style.unicode_bidi = self.unicode_bidi;
+        style.writing_mode = self.writing_mode;
+        style.text_orientation = self.text_orientation;
+        style.letter_spacing = css::ComputedLengthPercentage::from_points(
+            self.letter_spacing_css_px * font_scale.points(),
+        );
+        style.word_spacing = css::ComputedLengthPercentage::from_points(
+            self.word_spacing_css_px * font_scale.points(),
+        );
+        style.text_shadow = self.text_shadow.clone();
+        style.line_height = style.font_size * 1.2;
+        style
+    }
+}
+
+/// Host CSS values plus the serialized presentation overrides required by the
+/// standalone SVG parser. The side table intentionally remains private to an
+/// inline SVG asset and is absent for external SVG image documents.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SvgPresentationOverrides {
+    presentation: HashMap<ElementId, SvgPresentationOverride>,
+    typography: HashMap<SvgTextTypographyKey, SvgTextTypography>,
+    next_typography_key: u64,
+}
+
+impl SvgPresentationOverrides {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert(&mut self, element: ElementId, override_values: SvgPresentationOverride) {
+        self.presentation.insert(element, override_values);
+    }
+
+    pub(crate) fn get(&self, element: &ElementId) -> Option<&SvgPresentationOverride> {
+        self.presentation.get(element)
+    }
+
+    pub(crate) fn record_typography(
+        &mut self,
+        typography: SvgTextTypography,
+    ) -> SvgTextTypographyKey {
+        let key = SvgTextTypographyKey(self.next_typography_key);
+        self.next_typography_key += 1;
+        self.typography.insert(key, typography);
+        key
+    }
+
+    fn typography(&self) -> HashMap<SvgTextTypographyKey, SvgTextTypography> {
+        self.typography.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn typography_for_key(
+        &self,
+        key: SvgTextTypographyKey,
+    ) -> Option<&SvgTextTypography> {
+        self.typography.get(&key)
+    }
+}
 
 /// A parsed inline SVG plus its intrinsic viewport size in Quire points.
 #[derive(Debug, Clone)]
 pub(crate) struct SvgAsset {
     tree: usvg::Tree,
+    text_typography: HashMap<SvgTextTypographyKey, SvgTextTypography>,
     filter_taint: SvgFilterTaintCatalog,
     viewport_background: Option<SvgViewportBackground>,
     intrinsic_size: LayoutSize,
@@ -685,6 +1131,7 @@ impl SvgAsset {
     /// boolean only controls whether the root viewport clips overflowing SVG
     /// strokes and paths.  CSS `overflow: visible` must not silently regain a
     /// replaced-image viewport clip.
+    #[cfg(test)]
     pub(crate) fn paint_inline_group(
         &self,
         destination: PaintRect,
@@ -695,6 +1142,44 @@ impl SvgAsset {
             destination,
             SvgSourceRect::new(SvgSourcePoint::new(0.0, 0.0), source_size),
             clip_viewport,
+        )
+    }
+
+    /// Materialize an inline SVG through the owning document's font system.
+    ///
+    /// SVG's text layout rules remain SVG-specific, but glyph selection,
+    /// shaping, document-font registration, and PDF subsetting are shared
+    /// with HTML.  Keeping this mutable dependency at the paint boundary is
+    /// what prevents an SVG image from silently creating a second font path.
+    pub(crate) fn paint_inline_group_with_font_system(
+        &self,
+        destination: PaintRect,
+        clip_viewport: bool,
+        font_system: &mut FontSystem,
+    ) -> SvgPaintGroup {
+        self.paint_group_for_source_rect_with_font_system(
+            destination,
+            SvgSourceRect::new(SvgSourcePoint::new(0.0, 0.0), self.source_viewport_size()),
+            clip_viewport,
+            font_system,
+        )
+    }
+
+    /// Font-aware counterpart of [`Self::paint_group_for_source_rect_with_viewport_clip`].
+    /// It retains CSS object-fit/view-box source selection while placing SVG
+    /// text through the document font registry.
+    pub(crate) fn paint_group_for_source_rect_with_font_system(
+        &self,
+        destination: PaintRect,
+        source: SvgSourceRect,
+        clip_viewport: bool,
+        font_system: &mut FontSystem,
+    ) -> SvgPaintGroup {
+        self.paint_group_for_source_rect_with_viewport_clip_and_font_system(
+            destination,
+            source,
+            clip_viewport,
+            Some(font_system),
         )
     }
 
@@ -712,6 +1197,21 @@ impl SvgAsset {
         source: SvgSourceRect,
         clip_viewport: bool,
     ) -> SvgPaintGroup {
+        self.paint_group_for_source_rect_with_viewport_clip_and_font_system(
+            destination,
+            source,
+            clip_viewport,
+            None,
+        )
+    }
+
+    fn paint_group_for_source_rect_with_viewport_clip_and_font_system(
+        &self,
+        destination: PaintRect,
+        source: SvgSourceRect,
+        clip_viewport: bool,
+        font_system: Option<&mut FontSystem>,
+    ) -> SvgPaintGroup {
         if destination.size.width <= 0.0
             || destination.size.height <= 0.0
             || source.size.width <= 0.0
@@ -720,12 +1220,15 @@ impl SvgAsset {
             return SvgPaintGroup::empty();
         }
         let viewport = ViewportTransform::new(destination, source, clip_viewport, false);
-        let mut group = collect_svg_group(
+        let mut font_system = font_system;
+        let mut group = collect_svg_group_with_font_system(
             self.tree.root(),
             viewport,
             &[],
             usvg::Transform::default(),
             &self.filter_taint,
+            &self.text_typography,
+            &mut font_system,
         );
         canonicalize_svg_paint_servers(&mut group);
         elide_redundant_svg_paints(&mut group);
@@ -790,10 +1293,24 @@ pub(crate) struct SvgPaintGroup {
     pub(crate) bounds: Option<PaintClip>,
 }
 
+/// SVG text lowered to outlines from Quire's already-shaped glyph stream.
+///
+/// The PDF writer wraps all paths in one `/ActualText` marked-content span so
+/// a complex SVG paint remains extractable without adding an invisible native
+/// text duplicate.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SvgOutlinedText {
+    pub(crate) paths: Vec<RenderedPath>,
+    pub(crate) actual_text: Rc<str>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SvgPaintItem {
     Path(Box<RenderedPath>),
     RasterImage(Box<RenderedImage>),
+    /// SVG text shaped and font-selected by the owning Quire document.
+    Text(Box<crate::document::paint::text::RenderedLine>),
+    OutlinedText(Box<SvgOutlinedText>),
     /// A separately normalized SVG document retained as a compositing scene.
     /// Keeping this distinct from an ordinary SVG group preserves the image
     /// resource boundary for future Static-policy cache resolution.
@@ -844,6 +1361,25 @@ impl SvgPaintGroup {
                 SvgPaintItem::RasterImage(image) => {
                     **image = image.as_ref().clone().with_intersected_clip(clip.clone());
                 }
+                // PDF text clipping is represented by the surrounding SVG
+                // group. A future text-path/outline fallback may attach a
+                // tighter clip to the individual item.
+                SvgPaintItem::Text(_) => {}
+                SvgPaintItem::OutlinedText(outlined) => {
+                    for path in &mut outlined.paths {
+                        if let Some(existing) = path.clip.take() {
+                            let mut combined = clip.clone();
+                            combined.additional_clips.push(RenderedPathClipPath::new(
+                                existing.commands,
+                                existing.fill_rule,
+                            ));
+                            combined.additional_clips.extend(existing.additional_clips);
+                            path.clip = Some(combined);
+                        } else {
+                            path.clip = Some(clip.clone());
+                        }
+                    }
+                }
             }
         }
         self
@@ -865,6 +1401,8 @@ impl SvgPaintGroup {
                     paths.extend(group.into_paths())
                 }
                 SvgPaintItem::RasterImage(_) => {}
+                SvgPaintItem::Text(_) => {}
+                SvgPaintItem::OutlinedText(outlined) => paths.extend(outlined.paths),
             }
         }
         paths
@@ -881,6 +1419,14 @@ impl SvgPaintGroup {
                     let nested = std::mem::replace(group, Box::new(SvgPaintGroup::empty()));
                     **group = nested.transformed(transform);
                 }
+                SvgPaintItem::Text(line) => {
+                    **line = line.as_ref().clone().transformed(transform);
+                }
+                SvgPaintItem::OutlinedText(outlined) => {
+                    for path in &mut outlined.paths {
+                        *path = path.clone().transformed(transform);
+                    }
+                }
             }
         }
         self
@@ -894,6 +1440,8 @@ impl SvgPaintGroup {
                     group.raster_images(images)
                 }
                 SvgPaintItem::Path(_) => {}
+                SvgPaintItem::Text(_) => {}
+                SvgPaintItem::OutlinedText(_) => {}
             }
         }
     }
@@ -930,6 +1478,17 @@ fn canonicalize_svg_paint_group(
             SvgPaintItem::Group(group) => canonicalize_svg_paint_group(group, servers),
             SvgPaintItem::NestedSvg(group) => canonicalize_svg_paint_group(group, servers),
             SvgPaintItem::RasterImage(_) => {}
+            SvgPaintItem::Text(_) => {}
+            SvgPaintItem::OutlinedText(outlined) => {
+                for path in &mut outlined.paths {
+                    for paint in [&mut path.fill_paint, &mut path.stroke_paint]
+                        .into_iter()
+                        .flatten()
+                    {
+                        canonicalize_svg_paint_server(paint, servers);
+                    }
+                }
+            }
         }
     }
 }
@@ -1035,6 +1594,16 @@ fn elide_redundant_svg_paints_in_group(
                 }
             }
             SvgPaintItem::RasterImage(_) => {
+                coverage.clear();
+                retained.push(item);
+            }
+            SvgPaintItem::Text(_) => {
+                // Text can have arbitrary alpha and glyph coverage. Never
+                // propagate an opaque path proof across it.
+                coverage.clear();
+                retained.push(item);
+            }
+            SvgPaintItem::OutlinedText(_) => {
                 coverage.clear();
                 retained.push(item);
             }
@@ -1157,7 +1726,10 @@ fn single_opaque_path(group: &SvgPaintGroup) -> Option<&RenderedPath> {
     match item {
         SvgPaintItem::Path(path) => Some(path),
         SvgPaintItem::Group(group) => single_opaque_path(group),
-        SvgPaintItem::NestedSvg(_) | SvgPaintItem::RasterImage(_) => None,
+        SvgPaintItem::NestedSvg(_)
+        | SvgPaintItem::RasterImage(_)
+        | SvgPaintItem::Text(_)
+        | SvgPaintItem::OutlinedText(_) => None,
     }
 }
 
@@ -1174,7 +1746,12 @@ fn simple_group_paths(group: &SvgPaintGroup) -> Option<Vec<&RenderedPath>> {
         match item {
             SvgPaintItem::Path(path) => paths.push(path.as_ref()),
             SvgPaintItem::Group(group) => paths.extend(simple_group_paths(group)?),
-            SvgPaintItem::NestedSvg(_) | SvgPaintItem::RasterImage(_) => return None,
+            SvgPaintItem::NestedSvg(_)
+            | SvgPaintItem::RasterImage(_)
+            | SvgPaintItem::Text(_)
+            | SvgPaintItem::OutlinedText(_) => {
+                return None;
+            }
         }
     }
     Some(paths)
@@ -1450,16 +2027,87 @@ fn collect_svg_group(
     image_transform: usvg::Transform,
     filter_taint: &SvgFilterTaintCatalog,
 ) -> SvgPaintGroup {
-    // SVG masks and filters alter the alpha/color result of every descendant.
-    // Until a PDF soft-mask/filter compositor exists, painting the unmodified
-    // children would be an incorrect substitute.
-    if group.mask().is_some() {
-        return SvgPaintGroup::empty();
+    let mut font_system = None;
+    let text_typography = HashMap::new();
+    collect_svg_group_with_font_system(
+        group,
+        viewport,
+        inherited_clips,
+        image_transform,
+        filter_taint,
+        &text_typography,
+        &mut font_system,
+    )
+}
+
+/// Convert an SVG group while threading the document-scoped font system only
+/// through the paint entry points that own one.
+fn collect_svg_group_with_font_system(
+    group: &usvg::Group,
+    viewport: ViewportTransform,
+    inherited_clips: &[RenderedPathClipPath],
+    image_transform: usvg::Transform,
+    filter_taint: &SvgFilterTaintCatalog,
+    text_typography: &HashMap<SvgTextTypographyKey, SvgTextTypography>,
+    font_system: &mut Option<&mut FontSystem>,
+) -> SvgPaintGroup {
+    let text_options = SvgTextCollectionOptions {
+        typography: text_typography,
+        force_outline_text: false,
+    };
+    collect_svg_group_with_options(
+        group,
+        viewport,
+        inherited_clips,
+        image_transform,
+        filter_taint,
+        text_options,
+        font_system,
+    )
+}
+
+/// The private text resources threaded through SVG scene recursion. Group
+/// geometry and effects are independent of this state; keeping it together
+/// prevents a nested SVG from accidentally pairing one asset's typography
+/// table with a different document font system.
+#[derive(Clone, Copy)]
+struct SvgTextCollectionOptions<'typography> {
+    typography: &'typography HashMap<SvgTextTypographyKey, SvgTextTypography>,
+    force_outline_text: bool,
+}
+
+impl SvgTextCollectionOptions<'_> {
+    fn with_forced_outlines(self, force_outline_text: bool) -> Self {
+        Self {
+            force_outline_text: self.force_outline_text || force_outline_text,
+            ..self
+        }
     }
+}
+
+/// Collect one normalized group, optionally forcing text into the exact glyph
+/// outlines selected by the owning document. Effects use that form because a
+/// filtered subtree is emitted as one raster image with `/ActualText`, not as
+/// a visual image plus a duplicate invisible text layer.
+fn collect_svg_group_with_options(
+    group: &usvg::Group,
+    viewport: ViewportTransform,
+    inherited_clips: &[RenderedPathClipPath],
+    image_transform: usvg::Transform,
+    filter_taint: &SvgFilterTaintCatalog,
+    text_options: SvgTextCollectionOptions<'_>,
+    font_system: &mut Option<&mut FontSystem>,
+) -> SvgPaintGroup {
+    let mask = group.mask();
     let image_transform = image_transform.post_concat(group.transform());
-    let filter_clip = match analyze_svg_filters(group.filters(), filter_taint) {
-        SvgFilterAnalysis::ExactSourceGraphic { filter_clip } => filter_clip,
-        SvgFilterAnalysis::RequiresRasterBackend => return SvgPaintGroup::empty(),
+    let raster_filter = svg_raster_filter_plan(group.filters());
+    let filter_clip = if raster_filter.is_some() {
+        None
+    } else {
+        match analyze_svg_filters(group.filters(), filter_taint) {
+            SvgFilterAnalysis::ExactSourceGraphic { filter_clip } => filter_clip,
+            SvgFilterAnalysis::RequiresRasterBackend => return SvgPaintGroup::empty(),
+        }
     };
     let mut clips = inherited_clips.to_vec();
     if let Some(clip_path) = group.clip_path() {
@@ -1479,8 +2127,15 @@ fn collect_svg_group(
     for node in group.children() {
         match node {
             usvg::Node::Group(child) => {
-                let child =
-                    collect_svg_group(child, viewport, &clips, image_transform, filter_taint);
+                let child = collect_svg_group_with_options(
+                    child,
+                    viewport,
+                    &clips,
+                    image_transform,
+                    filter_taint,
+                    text_options.with_forced_outlines(raster_filter.is_some() || mask.is_some()),
+                    font_system,
+                );
                 if !child.items.is_empty() {
                     rendered.items.push(SvgPaintItem::Group(Box::new(child)));
                 }
@@ -1491,12 +2146,43 @@ fn collect_svg_group(
                 }
             }
             usvg::Node::Image(image) => {
-                if let Some(item) = render_svg_image(image, image_transform, viewport, &clips) {
+                if let Some(item) =
+                    render_svg_image(image, image_transform, viewport, &clips, font_system)
+                {
                     rendered.items.push(item);
                 }
             }
-            usvg::Node::Text(_) => {}
+            usvg::Node::Text(text) => {
+                if let Some(font_system) = font_system.as_deref_mut() {
+                    rendered.items.extend(render_svg_text(
+                        text,
+                        viewport,
+                        text_options.typography,
+                        font_system,
+                        text_options.force_outline_text
+                            || raster_filter.is_some()
+                            || mask.is_some(),
+                    ));
+                }
+            }
         }
+    }
+    if let Some(mask) = mask {
+        let mut no_mask_fonts = None;
+        let mask_scene = collect_svg_group_with_options(
+            mask.root(),
+            viewport,
+            &clips,
+            image_transform,
+            filter_taint,
+            text_options.with_forced_outlines(true),
+            &mut no_mask_fonts,
+        );
+        return rasterize_svg_masked_group(rendered, mask_scene, mask.kind());
+    }
+    if let Some(filter) = raster_filter {
+        let filter_transform = svg_path_transform(image_transform, viewport);
+        return rasterize_svg_filtered_group(rendered, filter, filter_transform);
     }
     if let Some(filter_clip) = filter_clip {
         rendered = rendered.with_clip(svg_filter_clip_path(
@@ -1506,6 +2192,2065 @@ fn collect_svg_group(
     }
     rendered.recompute_bounds();
     rendered
+}
+
+/// Shape a normalized SVG text element through Quire's document font system.
+///
+/// `usvg` supplies SVG inheritance, chunks, paints, and element transforms,
+/// but its laid-out glyphs are intentionally ignored. This keeps SVG and HTML
+/// on the same font-selection, shaping, subsetting, and ToUnicode path.
+fn render_svg_text(
+    text: &usvg::Text,
+    viewport: ViewportTransform,
+    text_typography: &HashMap<SvgTextTypographyKey, SvgTextTypography>,
+    font_system: &mut FontSystem,
+    force_outline: bool,
+) -> Vec<SvgPaintItem> {
+    let Some(coordinates) = SvgTextCoordinateTransform::new(text.abs_transform(), viewport) else {
+        log::debug!("skipping non-invertible SVG text transform");
+        return Vec::new();
+    };
+    let Some(_) = coordinates.text_matrix() else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    let mut text_character_offset = 0;
+    for chunk in text.chunks() {
+        let text_flow = chunk.text_flow();
+        let chunk_character_count = chunk.text().chars().count();
+        let (Some(x), Some(y)) = (chunk.x(), chunk.y()) else {
+            text_character_offset += chunk_character_count;
+            continue;
+        };
+        let origin = coordinates.map_position(SvgTextPosition::new(x, y));
+        let mut lines = Vec::new();
+        let mut advance = 0.0;
+        for span in chunk.spans() {
+            if !span.is_visible() || span.start() >= span.end() {
+                continue;
+            }
+            let Some(source) = chunk.text().get(span.start()..span.end()) else {
+                continue;
+            };
+            let Some(paint) = svg_text_paint(
+                span,
+                coordinates.paint_transform(),
+                coordinates.font_scale(),
+            ) else {
+                continue;
+            };
+            let decorations = svg_text_decorations(
+                span,
+                coordinates.paint_transform(),
+                coordinates.font_scale(),
+            );
+            let style = span
+                .text_typography_key()
+                .map(SvgTextTypographyKey::from_usvg)
+                .and_then(|key| text_typography.get(&key))
+                .map(|typography| typography.computed_style_at_font_scale(coordinates.font_scale()))
+                .unwrap_or_else(|| {
+                    svg_text_style(
+                        span,
+                        text.writing_mode(),
+                        text.text_orientation(),
+                        text.direction(),
+                        text.unicode_bidi(),
+                        coordinates.font_scale().points(),
+                    )
+                });
+            let line_height = font_system.used_line_height(&style).points();
+            let Some(shaped) = font_system.shape_text_request(TextShapingRequest::new(
+                source,
+                &style,
+                line_height,
+            )) else {
+                continue;
+            };
+            let mut runs = crate::layout::text_paint::positioned_rendered_runs_for_writing_mode(
+                &shaped, &style,
+            );
+            let baseline_shift =
+                svg_text_baseline_shift(font_system, span, &style, coordinates.font_scale());
+            apply_svg_relative_positioning(
+                &mut runs,
+                source,
+                text.dx(),
+                text.dy(),
+                text_character_offset + chunk.text()[..span.start()].chars().count(),
+                coordinates,
+            );
+            let text_length = svg_text_length_adjustment(
+                span,
+                &mut runs,
+                shaped.width,
+                coordinates.font_scale(),
+                &style,
+            );
+            let vertical_inline_axis =
+                crate::layout::text_paint::VerticalInlineAxis::for_style(&style);
+            for run in &mut runs {
+                // `advance` is the already-resolved SVG pen position from
+                // preceding spans.  `lengthAdjust="spacingAndGlyphs"` only
+                // scales this span's own text space, not the preceding pen.
+                if let Some(axis) = vertical_inline_axis {
+                    run.y_offset += axis.advance_sign() * advance;
+                } else {
+                    run.x_offset += advance;
+                }
+                run.text_matrix = if vertical_inline_axis.is_some() && run.text_matrix.is_identity()
+                {
+                    // Upright vertical units carry their inline placement in
+                    // `y_offset`, not in a rotated text matrix. Scale both
+                    // the glyph's vertical geometry and its logical inline
+                    // origin for SVG `lengthAdjust="spacingAndGlyphs"`.
+                    run.y_offset *= text_length.inline_scale;
+                    run.text_matrix
+                        .scaled_block(text_length.inline_scale)
+                        .expect("validated SVG vertical text-length scale")
+                } else {
+                    run.text_matrix
+                        .scaled_inline(text_length.inline_scale)
+                        .expect("validated SVG text-length inline scale")
+                };
+                // SVG's text position denotes the selected baseline. The
+                // shared font system gives us the selected baseline-table
+                // metric in the same paint units as shaping. It is a
+                // block-axis adjustment, so it must not be scaled by
+                // `lengthAdjust="spacingAndGlyphs"`.
+                let Some(local_baseline_shift) = run
+                    .text_matrix
+                    .inverse_transform_local_displacement(baseline_shift)
+                else {
+                    continue;
+                };
+                run.x_offset += local_baseline_shift.x;
+                run.y_offset += local_baseline_shift.y;
+                run.text_matrix = coordinates.compose_text_matrix(run.text_matrix);
+                let positioned_offset = run.text_matrix.transform_local_point(
+                    crate::document::paint::text::TextRunPoint::new(run.x_offset, run.y_offset),
+                );
+                run.x_offset = positioned_offset.x;
+                run.y_offset = positioned_offset.y;
+            }
+            let color = match &paint {
+                SvgTextPaint::Native(color) => *color,
+                SvgTextPaint::Outline(SvgOutlinedTextPaint {
+                    fill: Some(RenderedPathPaint::Solid(color)),
+                    ..
+                }) => *color,
+                SvgTextPaint::Outline(_) => CssColor::BLACK,
+            };
+            lines.push((
+                crate::document::paint::text::RenderedLine::from_paint_origin(
+                    source.to_owned(),
+                    origin,
+                    style.font_size,
+                    shaped.first_font_id(),
+                    color,
+                    runs,
+                ),
+                paint,
+                text_character_offset + chunk.text()[..span.start()].chars().count(),
+                style,
+                decorations,
+                text_length.advance / text_length.inline_scale,
+            ));
+            advance += text_length.advance;
+        }
+        let anchor_offset = match chunk.anchor() {
+            usvg::TextAnchor::Start => 0.0,
+            usvg::TextAnchor::Middle => -advance * 0.5,
+            usvg::TextAnchor::End => -advance,
+        };
+        let anchor_translation = if let Some((_, _, _, style, _, _)) = lines.first() {
+            if let Some(axis) = crate::layout::text_paint::VerticalInlineAxis::for_style(style) {
+                coordinates.map_text_run_point(crate::document::paint::text::TextRunPoint::new(
+                    0.0,
+                    axis.advance_sign() * anchor_offset,
+                ))
+            } else {
+                coordinates.map_text_run_point(crate::document::paint::text::TextRunPoint::new(
+                    anchor_offset,
+                    0.0,
+                ))
+            }
+        } else {
+            coordinates.map_text_run_point(crate::document::paint::text::TextRunPoint::new(
+                anchor_offset,
+                0.0,
+            ))
+        };
+        for (mut line, paint, source_character_offset, style, decorations, local_advance) in lines {
+            if let usvg::TextFlow::Path(path) = &text_flow {
+                let paths = svg_text_path_outline_paths(
+                    font_system,
+                    &line,
+                    path,
+                    coordinates,
+                    x + path.start_offset()
+                        + coordinates.font_scale().unscale_text_length(anchor_offset),
+                    &paint,
+                );
+                if !paths.is_empty() {
+                    items.push(SvgPaintItem::OutlinedText(Box::new(SvgOutlinedText {
+                        paths,
+                        actual_text: Rc::from(line.text),
+                    })));
+                }
+                continue;
+            }
+            for run in &mut line.runs {
+                run.x_offset += anchor_translation.x;
+                run.y_offset += anchor_translation.y;
+            }
+            let rotate = svg_text_rotation_paths(
+                font_system,
+                &line,
+                line.text.as_ref(),
+                text.rotate(),
+                source_character_offset,
+                coordinates,
+                &paint,
+            );
+            let has_rotation = rotate.is_some();
+            let after_text_decorations = if has_rotation {
+                Vec::new()
+            } else {
+                items.extend(svg_text_decoration_paths(
+                    font_system,
+                    &line,
+                    &style,
+                    local_advance,
+                    &decorations,
+                    SvgTextDecorationPhase::BeforeText,
+                ));
+                items.extend(svg_text_shadow_paths(font_system, &line, &style, &paint));
+                svg_text_decoration_paths(
+                    font_system,
+                    &line,
+                    &style,
+                    local_advance,
+                    &decorations,
+                    SvgTextDecorationPhase::AfterText,
+                )
+            };
+            let forced_outline_paint = force_outline.then(|| paint.outline_paint());
+            match (paint, rotate) {
+                (_, Some(paths)) if !paths.is_empty() => {
+                    items.push(SvgPaintItem::OutlinedText(Box::new(SvgOutlinedText {
+                        paths,
+                        actual_text: Rc::from(line.text),
+                    })));
+                }
+                (SvgTextPaint::Native(_), _) if !force_outline => {
+                    items.push(SvgPaintItem::Text(Box::new(line)))
+                }
+                (SvgTextPaint::Native(_), _) => {
+                    let paths = svg_text_outline_paths(
+                        font_system,
+                        line.origin(),
+                        &line.runs,
+                        forced_outline_paint
+                            .as_ref()
+                            .expect("forced SVG effect text has outline paint"),
+                    );
+                    if !paths.is_empty() {
+                        items.push(SvgPaintItem::OutlinedText(Box::new(SvgOutlinedText {
+                            paths,
+                            actual_text: Rc::from(line.text),
+                        })));
+                    }
+                }
+                (SvgTextPaint::Outline(paint), _) => {
+                    let paths =
+                        svg_text_outline_paths(font_system, line.origin(), &line.runs, &paint);
+                    if !paths.is_empty() {
+                        items.push(SvgPaintItem::OutlinedText(Box::new(SvgOutlinedText {
+                            paths,
+                            actual_text: Rc::from(line.text),
+                        })));
+                    }
+                }
+            }
+            items.extend(after_text_decorations);
+        }
+        text_character_offset += chunk_character_count;
+    }
+    items
+}
+
+/// SVG decorations retain their own fill/stroke styles, independently from
+/// the decorated glyphs. Keeping them as path paint avoids another text run
+/// and lets gradients/strokes follow the same SVG paint-server lowering as
+/// complex text.
+#[derive(Debug, Clone, Default)]
+struct SvgTextDecorations {
+    underline: Option<SvgTextPaint>,
+    overline: Option<SvgTextPaint>,
+    line_through: Option<SvgTextPaint>,
+}
+
+#[derive(Clone, Copy)]
+enum SvgTextDecorationPhase {
+    BeforeText,
+    AfterText,
+}
+
+fn svg_text_decorations(
+    span: &usvg::TextSpan,
+    transform: PaintTransform,
+    font_scale: SvgFontScale,
+) -> SvgTextDecorations {
+    let paint = |decoration: Option<&usvg::TextDecorationStyle>| {
+        decoration.and_then(|decoration| {
+            svg_text_paint_from_sources(
+                decoration.fill(),
+                decoration.stroke(),
+                usvg::PaintOrder::FillAndStroke,
+                transform,
+                font_scale,
+            )
+        })
+    };
+    SvgTextDecorations {
+        underline: paint(span.decoration().underline()),
+        overline: paint(span.decoration().overline()),
+        line_through: paint(span.decoration().line_through()),
+    }
+}
+
+/// Realize SVG text decorations after text shaping, so their lengths,
+/// transforms, and font metrics all match the chosen document font. Upright
+/// vertical text uses the shared vertical inline axis: its decorations extend
+/// along the SVG user-space Y axis rather than accidentally inheriting the
+/// horizontal glyph rectangle. SVG's underline/overline paint before glyph
+/// ink; the line-through paints afterward.
+/// <https://www.w3.org/TR/SVG2/painting.html#TextDecorationProperties>
+fn svg_text_decoration_paths(
+    font_system: &mut FontSystem,
+    line: &crate::document::paint::text::RenderedLine,
+    style: &ComputedStyle,
+    local_advance: f32,
+    decorations: &SvgTextDecorations,
+    phase: SvgTextDecorationPhase,
+) -> Vec<SvgPaintItem> {
+    if !local_advance.is_finite() || local_advance <= 0.0 {
+        return Vec::new();
+    }
+    let Some(run) = line.runs.first() else {
+        return Vec::new();
+    };
+    let metrics = font_system.text_decoration_metrics(run.font_id, style);
+    let ascent = font_system
+        .baseline_offset_for_style(style, BaselineMetric::Alphabetic)
+        .points()
+        - font_system
+            .baseline_offset_for_style(style, BaselineMetric::TextTop)
+            .points();
+    let entries = match phase {
+        SvgTextDecorationPhase::BeforeText => [
+            (
+                decorations.underline.as_ref(),
+                metrics.underline_position,
+                metrics.underline_thickness,
+            ),
+            (
+                decorations.overline.as_ref(),
+                ascent - metrics.underline_thickness * 0.5,
+                metrics.underline_thickness,
+            ),
+            (None, 0.0, 0.0),
+        ],
+        SvgTextDecorationPhase::AfterText => [
+            (
+                decorations.line_through.as_ref(),
+                metrics.strikeout_position,
+                metrics.strikeout_thickness,
+            ),
+            (None, 0.0, 0.0),
+            (None, 0.0, 0.0),
+        ],
+    };
+    let [a, b, c, d] = run.text_matrix.pdf_components();
+    let transform = PaintTransform::new(
+        a,
+        b,
+        c,
+        d,
+        line.origin().x + run.x_offset,
+        line.origin().y + run.y_offset,
+    );
+    let upright_vertical = crate::layout::text_paint::VerticalInlineAxis::for_style(style)
+        .is_some()
+        && style.text_orientation == css::TextOrientation::Upright;
+    entries
+        .into_iter()
+        .filter_map(|(paint, center, thickness)| {
+            let paint = paint?.outline_paint();
+            if !center.is_finite() || !thickness.is_finite() || thickness <= 0.0 {
+                return None;
+            }
+            let rect = if upright_vertical {
+                // The horizontal font underline metric becomes a block-axis
+                // offset in upright vertical flow; the decoration's extent
+                // follows the logical inline (SVG Y) axis.
+                PaintRect::new(
+                    PaintPoint::new(center - thickness * 0.5, 0.0),
+                    PaintSize::new(thickness, local_advance),
+                )
+            } else {
+                PaintRect::new(
+                    PaintPoint::new(0.0, center - thickness * 0.5),
+                    PaintSize::new(local_advance, thickness),
+                )
+            };
+            paint.fill.as_ref().or(paint.stroke.as_ref())?;
+            Some(
+                RenderedPath::new(
+                    paint_rect_path_commands(rect),
+                    None,
+                    RenderedPathFillRule::NonZero,
+                    None,
+                    paint.stroke_width,
+                    None,
+                )
+                .with_paints(paint.fill, paint.stroke)
+                .with_stroke_style(paint.stroke_style)
+                .with_paint_order(paint.paint_order)
+                .with_transform(transform),
+            )
+        })
+        .map(|path| SvgPaintItem::Path(Box::new(path)))
+        .collect()
+}
+
+/// Paint SVG `text-shadow` using the existing CSS shadow sampling policy, but
+/// lower every replay to the already-shaped glyph outlines. A shadow must not
+/// introduce another selectable PDF text run: the source text item alone owns
+/// extraction, while the decorative shadow stays ordinary vector paint.
+/// <https://www.w3.org/TR/css-text-decor-4/#text-shadow-property>
+fn svg_text_shadow_paths(
+    font_system: &FontSystem,
+    line: &crate::document::paint::text::RenderedLine,
+    style: &ComputedStyle,
+    paint: &SvgTextPaint,
+) -> Vec<SvgPaintItem> {
+    let Some(reference_run) = line.runs.first() else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for shadow in style.text_shadow.iter().rev() {
+        let color = shadow.color.resolve(style.color);
+        if shadow.inset || !color.is_visible() {
+            continue;
+        }
+        // PDF has no portable text-shadow/blur operator.  Keep a zero-blur
+        // shadow as vector ink, but rasterize a blurred replay of the same
+        // Quire-shaped outlines.  In particular, do not emit a second PDF
+        // text run here: the unshadowed source below remains the one
+        // selectable/tagged representation of the SVG character data.
+        if shadow.blur_radius.length_points() > 0.0 {
+            let local_offset = reference_run.text_matrix.transform_local_point(
+                crate::document::paint::text::TextRunPoint::new(
+                    shadow.offset_x.length_points(),
+                    -shadow.offset_y.length_points(),
+                ),
+            );
+            let mut shadow_line = line.clone();
+            shadow_line.translate_origin(PaintTranslation::new(local_offset.x, local_offset.y));
+            let mut shadow_paint = paint.outline_paint();
+            if shadow_paint.fill.is_some() {
+                shadow_paint.fill = Some(RenderedPathPaint::Solid(color));
+            }
+            if shadow_paint.stroke.is_some() {
+                shadow_paint.stroke = Some(RenderedPathPaint::Solid(color));
+            }
+            let paths = svg_text_outline_paths(
+                font_system,
+                shadow_line.origin(),
+                &shadow_line.runs,
+                &shadow_paint,
+            );
+            if let Some(image) = rasterize_svg_solid_paths(
+                &paths,
+                // Match the established CSS shadow replay footprint: its
+                // outer samples reach 0.45 radii, while three Gaussian
+                // standard deviations reach the same visual extent. SVG
+                // filter `stdDeviation` remains a true standard deviation
+                // at the common rasterizer boundary below.
+                shadow.blur_radius.length_max_zero().points() * 0.15,
+            ) {
+                items.push(SvgPaintItem::RasterImage(Box::new(image)));
+            }
+            continue;
+        }
+        for pass in crate::layout::text_paint::text_shadow_paint_passes(shadow.clone(), color) {
+            let local_offset = reference_run.text_matrix.transform_local_point(
+                crate::document::paint::text::TextRunPoint::new(
+                    shadow.offset_x.length_points() + pass.offset.x,
+                    -shadow.offset_y.length_points() + pass.offset.y,
+                ),
+            );
+            let mut shadow_line = line.clone();
+            shadow_line.translate_origin(PaintTranslation::new(local_offset.x, local_offset.y));
+            let mut shadow_paint = paint.outline_paint();
+            if shadow_paint.fill.is_some() {
+                shadow_paint.fill = Some(RenderedPathPaint::Solid(pass.color));
+            }
+            if shadow_paint.stroke.is_some() {
+                shadow_paint.stroke = Some(RenderedPathPaint::Solid(pass.color));
+            }
+            let paths = svg_text_outline_paths(
+                font_system,
+                shadow_line.origin(),
+                &shadow_line.runs,
+                &shadow_paint,
+            );
+            items.extend(
+                paths
+                    .into_iter()
+                    .map(|path| SvgPaintItem::Path(Box::new(path))),
+            );
+        }
+    }
+    items
+}
+
+/// Maximum pixels allocated for one SVG paint effect surface.
+///
+/// Effects are intentionally a bounded fallback.  A pathological filter or
+/// blur must not turn a small SVG source into an unbounded PDF-generation
+/// allocation.  The eventual filter compositor shares this limit.
+const MAX_SVG_EFFECT_PIXELS: u64 = 16 * 1024 * 1024;
+/// Upper bounds work for one `feConvolveMatrix` primitive after the bounded
+/// surface allocation check above. A kernel is authored data, so its cost is
+/// not implied by the SVG viewport alone.
+const MAX_SVG_CONVOLVE_SAMPLES: u64 = 128 * 1024 * 1024;
+/// The retained filter graph may hold the two standard inputs plus this many
+/// authored `result` surfaces. Refuse graphs that exceed the bound instead of
+/// allowing SVG result names to allocate unbounded RGBA buffers.
+const MAX_SVG_NAMED_EFFECT_SURFACES: usize = 8;
+const SVG_EFFECT_RASTER_SCALE: f32 = 2.0;
+
+/// Rasterize solid SVG paths into an sRGB image, applying a separable Gaussian
+/// blur in premultiplied-alpha space when requested.
+///
+/// This is the common source-ink boundary for SVG effects.  It deliberately
+/// accepts retained Quire paths instead of SVG text: callers shape once with
+/// the document [`FontSystem`], convert the selected glyph IDs to outlines,
+/// and this compositor never consults a font database or reshapes Unicode.
+/// Gradients/patterns are left for the general paint-server compositor rather
+/// than being silently approximated as solid colors.
+fn rasterize_svg_solid_paths(paths: &[RenderedPath], blur_radius: f32) -> Option<RenderedImage> {
+    rasterize_svg_solid_paths_with_effect(paths, blur_radius, &[])
+}
+
+fn rasterize_svg_solid_paths_with_effect(
+    paths: &[RenderedPath],
+    blur_radius: f32,
+    pixel_effects: &[SvgRasterPixelEffect],
+) -> Option<RenderedImage> {
+    let mut bounds = svg_paths_bounds(paths)?;
+    let blur_radius = blur_radius.max(0.0);
+    let chained_blur_radius = pixel_effects
+        .iter()
+        .filter_map(|effect| match effect {
+            SvgRasterPixelEffect::GaussianBlur { std_deviation } => Some(*std_deviation),
+            SvgRasterPixelEffect::DropShadow { std_deviation, .. } => Some(*std_deviation),
+            SvgRasterPixelEffect::Offset { .. }
+            | SvgRasterPixelEffect::FloodInSourceAlpha { .. }
+            | SvgRasterPixelEffect::ColorMatrix { .. }
+            | SvgRasterPixelEffect::ComponentTransfer { .. }
+            | SvgRasterPixelEffect::Morphology { .. }
+            | SvgRasterPixelEffect::ConvolveMatrix { .. }
+            | SvgRasterPixelEffect::CompositeWithSourceGraphic { .. }
+            | SvgRasterPixelEffect::CompositeWithSourceAlpha { .. } => None,
+        })
+        .sum::<f32>()
+        .max(0.0);
+    let chained_offset_padding = pixel_effects
+        .iter()
+        .filter_map(|effect| match effect {
+            SvgRasterPixelEffect::Offset { dx, dy } => Some(dx.abs().max(dy.abs())),
+            SvgRasterPixelEffect::GaussianBlur { .. }
+            | SvgRasterPixelEffect::DropShadow { .. }
+            | SvgRasterPixelEffect::FloodInSourceAlpha { .. }
+            | SvgRasterPixelEffect::ColorMatrix { .. }
+            | SvgRasterPixelEffect::ComponentTransfer { .. }
+            | SvgRasterPixelEffect::Morphology { .. }
+            | SvgRasterPixelEffect::ConvolveMatrix { .. }
+            | SvgRasterPixelEffect::CompositeWithSourceGraphic { .. }
+            | SvgRasterPixelEffect::CompositeWithSourceAlpha { .. } => None,
+        })
+        .sum::<f32>();
+    let max_stroke = paths
+        .iter()
+        .map(|path| path.stroke_width.points())
+        .filter(|width| width.is_finite())
+        .fold(0.0_f32, f32::max);
+    let padding =
+        max_stroke * 0.5 + (blur_radius + chained_blur_radius) * 3.0 + chained_offset_padding + 1.0;
+    bounds = PaintRect::new(
+        PaintPoint::new(bounds.origin.x - padding, bounds.origin.y - padding),
+        PaintSize::new(
+            bounds.size.width + padding * 2.0,
+            bounds.size.height + padding * 2.0,
+        ),
+    );
+    if !bounds.size.width.is_finite()
+        || !bounds.size.height.is_finite()
+        || bounds.size.width <= 0.0
+        || bounds.size.height <= 0.0
+    {
+        return None;
+    }
+    let width = (bounds.size.width * SVG_EFFECT_RASTER_SCALE).ceil() as u64;
+    let height = (bounds.size.height * SVG_EFFECT_RASTER_SCALE).ceil() as u64;
+    if width == 0
+        || height == 0
+        || width > u32::MAX as u64
+        || height > u32::MAX as u64
+        || width.saturating_mul(height) > MAX_SVG_EFFECT_PIXELS
+    {
+        log::warn!(
+            "skipping SVG effect surface of {}x{} pixels; limit is {} pixels",
+            width,
+            height,
+            MAX_SVG_EFFECT_PIXELS
+        );
+        return None;
+    }
+    let mut pixmap =
+        rasterize_svg_paths_to_effect_pixmap(paths, bounds, width as u32, height as u32)?;
+    // Keep SourceGraphic available for binary named-input primitives. The
+    // working pixmap below becomes each primitive's result; this immutable
+    // copy is never reshaped or repainted.
+    let source_graphic = pixmap.data().to_vec();
+    let source_alpha = svg_source_alpha_surface(&source_graphic);
+    for pixel_effect in pixel_effects {
+        match pixel_effect {
+            SvgRasterPixelEffect::GaussianBlur { std_deviation } => gaussian_blur_rgba(
+                pixmap.data_mut(),
+                width as usize,
+                height as usize,
+                *std_deviation * SVG_EFFECT_RASTER_SCALE,
+            ),
+            SvgRasterPixelEffect::DropShadow {
+                std_deviation,
+                dx,
+                dy,
+                color,
+            } => apply_svg_drop_shadow(
+                pixmap.data_mut(),
+                width as usize,
+                height as usize,
+                *std_deviation * SVG_EFFECT_RASTER_SCALE,
+                (*dx * SVG_EFFECT_RASTER_SCALE).round() as i32,
+                (-*dy * SVG_EFFECT_RASTER_SCALE).round() as i32,
+                *color,
+            ),
+            SvgRasterPixelEffect::Offset { dx, dy } => apply_svg_offset(
+                pixmap.data_mut(),
+                width as usize,
+                height as usize,
+                (*dx * SVG_EFFECT_RASTER_SCALE).round() as i32,
+                (-*dy * SVG_EFFECT_RASTER_SCALE).round() as i32,
+            ),
+            SvgRasterPixelEffect::FloodInSourceAlpha { color } => {
+                apply_svg_flood_in_source_alpha(pixmap.data_mut(), *color)
+            }
+            SvgRasterPixelEffect::ColorMatrix { matrix, linear_rgb } => {
+                apply_svg_color_matrix(pixmap.data_mut(), *matrix, *linear_rgb);
+            }
+            SvgRasterPixelEffect::ComponentTransfer {
+                functions,
+                linear_rgb,
+            } => apply_svg_component_transfer(pixmap.data_mut(), functions, *linear_rgb),
+            SvgRasterPixelEffect::Morphology {
+                radius_x,
+                radius_y,
+                dilate,
+            } => {
+                let radius_x = (*radius_x * SVG_EFFECT_RASTER_SCALE).round();
+                let radius_y = (*radius_y * SVG_EFFECT_RASTER_SCALE).round();
+                if !(0.0..=256.0).contains(&radius_x) || !(0.0..=256.0).contains(&radius_y) {
+                    log::warn!("skipping SVG morphology with an effect radius over 256 pixels");
+                    return None;
+                }
+                apply_svg_morphology(
+                    pixmap.data_mut(),
+                    width as usize,
+                    height as usize,
+                    radius_x as usize,
+                    radius_y as usize,
+                    *dilate,
+                )
+            }
+            SvgRasterPixelEffect::ConvolveMatrix {
+                matrix,
+                columns,
+                rows,
+                target_x,
+                target_y,
+                divisor,
+                bias,
+                edge_mode,
+                preserve_alpha,
+                linear_rgb,
+            } => {
+                if !apply_svg_convolve_matrix(
+                    pixmap.data_mut(),
+                    width as usize,
+                    height as usize,
+                    matrix,
+                    *columns,
+                    *rows,
+                    *target_x,
+                    *target_y,
+                    *divisor,
+                    *bias,
+                    *edge_mode,
+                    *preserve_alpha,
+                    *linear_rgb,
+                ) {
+                    log::warn!("skipping SVG feConvolveMatrix exceeding compositor limits");
+                    return None;
+                }
+            }
+            SvgRasterPixelEffect::CompositeWithSourceGraphic {
+                operator,
+                source_as_second,
+            } => {
+                let current = pixmap.data().to_vec();
+                let composited = if *source_as_second {
+                    apply_svg_composite(&current, &source_graphic, pixmap.data_mut(), *operator)
+                } else {
+                    apply_svg_composite(&source_graphic, &current, pixmap.data_mut(), *operator)
+                };
+                debug_assert!(composited, "same-sized SVG graph surfaces composite");
+                if !composited {
+                    return None;
+                }
+            }
+            SvgRasterPixelEffect::CompositeWithSourceAlpha {
+                operator,
+                source_as_second,
+            } => {
+                let current = pixmap.data().to_vec();
+                let composited = if *source_as_second {
+                    apply_svg_composite(&current, &source_alpha, pixmap.data_mut(), *operator)
+                } else {
+                    apply_svg_composite(&source_alpha, &current, pixmap.data_mut(), *operator)
+                };
+                debug_assert!(composited, "same-sized SVG graph surfaces composite");
+                if !composited {
+                    return None;
+                }
+            }
+        }
+    }
+    if blur_radius > 0.0 {
+        // This receives an SVG-filter standard deviation in paint units.
+        // CSS text-shadow converts its implementation-defined blur radius at
+        // the caller, keeping CSS blur behavior out of SVG filter math.
+        gaussian_blur_rgba(
+            pixmap.data_mut(),
+            width as usize,
+            height as usize,
+            blur_radius * SVG_EFFECT_RASTER_SCALE,
+        );
+    }
+    svg_effect_pixmap_to_rendered_image(bounds, pixmap)
+}
+
+/// Encode one completed bounded SVG effect surface as the existing PDF image
+/// representation. Keeping this conversion separate from path rasterization
+/// is the graph-compositor boundary: named filter intermediates remain
+/// premultiplied tiny-skia surfaces until the final result alone is encoded.
+fn svg_effect_pixmap_to_rendered_image(
+    bounds: PaintRect,
+    pixmap: tiny_skia::Pixmap,
+) -> Option<RenderedImage> {
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let rgba = pixmap.take_demultiplied();
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    let mut alpha = Vec::with_capacity((width as usize) * (height as usize));
+    let (pixels, trailing) = rgba.as_chunks::<4>();
+    debug_assert!(trailing.is_empty(), "RGBA pixmap has whole pixels");
+    for &[red, green, blue, opacity] in pixels {
+        rgb.extend_from_slice(&[red, green, blue]);
+        alpha.push(opacity);
+    }
+    Some(RenderedImage::from_paint_rect(
+        bounds,
+        false,
+        width,
+        height,
+        None,
+        true,
+        Rc::from(rgb),
+        Some(Rc::from(alpha)),
+        None,
+    ))
+}
+
+/// Materialize retained solid SVG paths into one bounded premultiplied effect
+/// surface. The graph executor consumes this same source surface for
+/// `SourceGraphic`, derives `SourceAlpha` from it, and retains named results
+/// as surfaces until [`svg_effect_pixmap_to_rendered_image`] is called.
+fn rasterize_svg_paths_to_effect_pixmap(
+    paths: &[RenderedPath],
+    bounds: PaintRect,
+    width: u32,
+    height: u32,
+) -> Option<tiny_skia::Pixmap> {
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
+    for path in paths {
+        rasterize_svg_path(&mut pixmap, path, bounds)?;
+    }
+    Some(pixmap)
+}
+
+/// Derive the SVG standard input `SourceAlpha` from premultiplied
+/// `SourceGraphic`. RGB is transparent black while alpha is retained exactly.
+fn svg_source_alpha_surface(source_graphic: &[u8]) -> Vec<u8> {
+    let mut alpha = vec![0; source_graphic.len()];
+    for (source, alpha) in source_graphic
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(alpha.as_chunks_mut::<4>().0)
+    {
+        alpha[3] = source[3];
+    }
+    alpha
+}
+
+fn svg_paths_bounds(paths: &[RenderedPath]) -> Option<PaintRect> {
+    let mut left = f32::INFINITY;
+    let mut bottom = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    let mut top = f32::NEG_INFINITY;
+    for path in paths {
+        let bounds = path.bounds()?;
+        left = left.min(bounds.origin.x);
+        bottom = bottom.min(bounds.origin.y);
+        right = right.max(bounds.max_x());
+        top = top.max(bounds.max_y());
+    }
+    (left.is_finite() && bottom.is_finite() && right.is_finite() && top.is_finite()).then(|| {
+        PaintRect::new(
+            PaintPoint::new(left, bottom),
+            PaintSize::new((right - left).max(0.0), (top - bottom).max(0.0)),
+        )
+    })
+}
+
+fn rasterize_svg_path(
+    pixmap: &mut tiny_skia::Pixmap,
+    source: &RenderedPath,
+    bounds: PaintRect,
+) -> Option<()> {
+    let path = tiny_skia_path_from_rendered(source)?;
+    let transform = source.transform;
+    let matrix = tiny_skia::Transform::from_row(
+        SVG_EFFECT_RASTER_SCALE * transform.a(),
+        -SVG_EFFECT_RASTER_SCALE * transform.b(),
+        SVG_EFFECT_RASTER_SCALE * transform.c(),
+        -SVG_EFFECT_RASTER_SCALE * transform.d(),
+        SVG_EFFECT_RASTER_SCALE * (transform.e() - bounds.origin.x),
+        SVG_EFFECT_RASTER_SCALE * (bounds.max_y() - transform.f()),
+    );
+    let fill_rule = match source.fill_rule {
+        RenderedPathFillRule::NonZero => tiny_skia::FillRule::Winding,
+        RenderedPathFillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
+    };
+    let mut paint_path = |paint: &RenderedPathPaint, stroke: bool| {
+        let RenderedPathPaint::Solid(color) = paint else {
+            return false;
+        };
+        let mut paint = tiny_skia::Paint::default();
+        let color = color.to_rgb_space(css::RgbColorSpace::Srgb);
+        let [red, green, blue] = color.components();
+        paint.set_color_rgba8(
+            (red.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (green.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (blue.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.alpha() * 255.0).round() as u8,
+        );
+        if stroke {
+            let stroke = tiny_skia::Stroke {
+                width: source.stroke_width.points(),
+                miter_limit: source.stroke_style.miter_limit,
+                line_cap: match source.stroke_style.line_cap {
+                    RenderedPathLineCap::Butt => tiny_skia::LineCap::Butt,
+                    RenderedPathLineCap::Round => tiny_skia::LineCap::Round,
+                    RenderedPathLineCap::Square => tiny_skia::LineCap::Square,
+                },
+                line_join: match source.stroke_style.line_join {
+                    RenderedPathLineJoin::Miter => tiny_skia::LineJoin::Miter,
+                    RenderedPathLineJoin::Round => tiny_skia::LineJoin::Round,
+                    RenderedPathLineJoin::Bevel => tiny_skia::LineJoin::Bevel,
+                },
+                dash: tiny_skia::StrokeDash::new(
+                    source.stroke_style.dash_array.clone(),
+                    source.stroke_style.dash_offset,
+                ),
+            };
+            pixmap.stroke_path(&path, &paint, &stroke, matrix, None);
+        } else {
+            pixmap.fill_path(&path, &paint, fill_rule, matrix, None);
+        }
+        true
+    };
+    let mut painted = false;
+    match source.paint_order {
+        RenderedPathPaintOrder::FillThenStroke => {
+            if let Some(fill) = &source.fill_paint {
+                painted |= paint_path(fill, false);
+            }
+            if let Some(stroke) = &source.stroke_paint {
+                painted |= paint_path(stroke, true);
+            }
+        }
+        RenderedPathPaintOrder::StrokeThenFill => {
+            if let Some(stroke) = &source.stroke_paint {
+                painted |= paint_path(stroke, true);
+            }
+            if let Some(fill) = &source.fill_paint {
+                painted |= paint_path(fill, false);
+            }
+        }
+    }
+    painted.then_some(())
+}
+
+fn tiny_skia_path_from_rendered(source: &RenderedPath) -> Option<tiny_skia::Path> {
+    let mut builder = tiny_skia::PathBuilder::new();
+    for command in &source.commands {
+        match command {
+            RenderedPathCommand::MoveTo(point) => builder.move_to(point.x, point.y),
+            RenderedPathCommand::LineTo(point) => builder.line_to(point.x, point.y),
+            RenderedPathCommand::CurveTo {
+                control_1,
+                control_2,
+                end,
+            } => builder.cubic_to(
+                control_1.x,
+                control_1.y,
+                control_2.x,
+                control_2.y,
+                end.x,
+                end.y,
+            ),
+            RenderedPathCommand::Close => builder.close(),
+        }
+    }
+    builder.finish()
+}
+
+/// Translate a premultiplied RGBA filter surface, exposing transparent black
+/// outside the previous primitive subregion.
+///
+/// Surface rows are top-to-bottom while paint coordinates are bottom-to-top,
+/// hence the caller reverses the paint-space `dy` before this raster-space
+/// copy.
+fn apply_svg_offset(data: &mut [u8], width: usize, height: usize, dx: i32, dy: i32) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let source = data.to_vec();
+    data.fill(0);
+    for source_y in 0..height {
+        let destination_y = source_y as i32 + dy;
+        if !(0..height as i32).contains(&destination_y) {
+            continue;
+        }
+        for source_x in 0..width {
+            let destination_x = source_x as i32 + dx;
+            if !(0..width as i32).contains(&destination_x) {
+                continue;
+            }
+            let source_offset = (source_y * width + source_x) * 4;
+            let destination_offset = (destination_y as usize * width + destination_x as usize) * 4;
+            data[destination_offset..destination_offset + 4]
+                .copy_from_slice(&source[source_offset..source_offset + 4]);
+        }
+    }
+}
+
+/// Evaluate `feFlood` composited `in` the current `SourceAlpha` surface.
+///
+/// Filter surfaces are premultiplied RGBA, so the flood RGB and alpha are
+/// each multiplied by the retained source alpha exactly once.
+fn apply_svg_flood_in_source_alpha(data: &mut [u8], color: CssColor) {
+    let color = color.to_rgb_space(css::RgbColorSpace::Srgb);
+    let [red, green, blue] = color.components();
+    let flood_alpha = color.alpha().clamp(0.0, 1.0);
+    let flood = [
+        (red.clamp(0.0, 1.0) * flood_alpha * 255.0).round() as u8,
+        (green.clamp(0.0, 1.0) * flood_alpha * 255.0).round() as u8,
+        (blue.clamp(0.0, 1.0) * flood_alpha * 255.0).round() as u8,
+        (flood_alpha * 255.0).round() as u8,
+    ];
+    let mut flood_surface = Vec::with_capacity(data.len());
+    for _ in 0..data.len() / 4 {
+        flood_surface.extend_from_slice(&flood);
+    }
+    let mut output = vec![0; data.len()];
+    let composited = apply_svg_composite(
+        &flood_surface,
+        data,
+        &mut output,
+        usvg::filter::CompositeOperator::In,
+    );
+    debug_assert!(composited, "same-sized RGBA filter surfaces must composite");
+    data.copy_from_slice(&output);
+}
+
+/// Composite `input1` over/with `input2` using SVG Filter Effects' premultiplied
+/// pixel equations.
+///
+/// Both inputs must be same-sized premultiplied RGBA surfaces. Keeping this
+/// operation independent from SVG paths and text lets the future named-surface
+/// graph executor compose retained Quire-shaped text without another renderer.
+fn apply_svg_composite(
+    input1: &[u8],
+    input2: &[u8],
+    output: &mut [u8],
+    operator: usvg::filter::CompositeOperator,
+) -> bool {
+    if input1.len() != input2.len()
+        || input1.len() != output.len()
+        || !input1.len().is_multiple_of(4)
+    {
+        return false;
+    }
+    let (input1, remainder1) = input1.as_chunks::<4>();
+    let (input2, remainder2) = input2.as_chunks::<4>();
+    let (output, remainder_output) = output.as_chunks_mut::<4>();
+    debug_assert!(remainder1.is_empty() && remainder2.is_empty() && remainder_output.is_empty());
+    for ((first, second), destination) in input1.iter().zip(input2).zip(output) {
+        let first = first.map(|component| component as f32 / 255.0);
+        let second = second.map(|component| component as f32 / 255.0);
+        let first_alpha = first[3];
+        let second_alpha = second[3];
+        let result: [f32; 4] = match operator {
+            usvg::filter::CompositeOperator::Over => {
+                std::array::from_fn(|index| first[index] + second[index] * (1.0 - first_alpha))
+            }
+            usvg::filter::CompositeOperator::In => {
+                std::array::from_fn(|index| first[index] * second_alpha)
+            }
+            usvg::filter::CompositeOperator::Out => {
+                std::array::from_fn(|index| first[index] * (1.0 - second_alpha))
+            }
+            usvg::filter::CompositeOperator::Atop => std::array::from_fn(|index| {
+                first[index] * second_alpha + second[index] * (1.0 - first_alpha)
+            }),
+            usvg::filter::CompositeOperator::Xor => std::array::from_fn(|index| {
+                first[index] * (1.0 - second_alpha) + second[index] * (1.0 - first_alpha)
+            }),
+            usvg::filter::CompositeOperator::Arithmetic { k1, k2, k3, k4 } => {
+                std::array::from_fn(|index| {
+                    (k1 * first[index] * second[index]
+                        + k2 * first[index]
+                        + k3 * second[index]
+                        + k4)
+                        .clamp(0.0, 1.0)
+                })
+            }
+        };
+        for (destination, component) in destination.iter_mut().zip(result) {
+            *destination = (component.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+    true
+}
+
+/// Apply SVG's 4x5 color matrix to premultiplied sRGB samples.
+///
+/// Filter primitives operate on unpremultiplied components.  The retained
+/// offscreen buffer is premultiplied, so convert at this one backend boundary
+/// and re-premultiply before the image is handed to PDF resource planning.
+/// SVG Filter Effects defaults `color-interpolation-filters` to linearRGB.
+fn apply_svg_color_matrix(data: &mut [u8], matrix: [f32; 20], linear_rgb: bool) {
+    let (pixels, remainder) = data.as_chunks_mut::<4>();
+    debug_assert!(remainder.is_empty(), "SVG pixels have four channels");
+    for pixel in pixels {
+        let alpha = pixel[3] as f32 / 255.0;
+        if alpha <= 0.0 {
+            pixel.fill(0);
+            continue;
+        }
+        let mut red = (pixel[0] as f32 / 255.0 / alpha).clamp(0.0, 1.0);
+        let mut green = (pixel[1] as f32 / 255.0 / alpha).clamp(0.0, 1.0);
+        let mut blue = (pixel[2] as f32 / 255.0 / alpha).clamp(0.0, 1.0);
+        if linear_rgb {
+            red = srgb_to_linear(red);
+            green = srgb_to_linear(green);
+            blue = srgb_to_linear(blue);
+        }
+        let output = [
+            matrix[0] * red + matrix[1] * green + matrix[2] * blue + matrix[3] * alpha + matrix[4],
+            matrix[5] * red + matrix[6] * green + matrix[7] * blue + matrix[8] * alpha + matrix[9],
+            matrix[10] * red
+                + matrix[11] * green
+                + matrix[12] * blue
+                + matrix[13] * alpha
+                + matrix[14],
+            matrix[15] * red
+                + matrix[16] * green
+                + matrix[17] * blue
+                + matrix[18] * alpha
+                + matrix[19],
+        ];
+        let alpha = output[3].clamp(0.0, 1.0);
+        let encode = |component: f32| {
+            let component = component.clamp(0.0, 1.0);
+            let component = if linear_rgb {
+                linear_to_srgb(component)
+            } else {
+                component
+            };
+            (component * alpha * 255.0).round() as u8
+        };
+        pixel[0] = encode(output[0]);
+        pixel[1] = encode(output[1]);
+        pixel[2] = encode(output[2]);
+        pixel[3] = (alpha * 255.0).round() as u8;
+    }
+}
+
+/// Apply SVG `feComponentTransfer` channel functions to premultiplied samples.
+fn apply_svg_component_transfer(
+    data: &mut [u8],
+    functions: &[SvgTransferFunction; 4],
+    linear_rgb: bool,
+) {
+    let (pixels, remainder) = data.as_chunks_mut::<4>();
+    debug_assert!(remainder.is_empty(), "SVG pixels have four channels");
+    for pixel in pixels {
+        let alpha = pixel[3] as f32 / 255.0;
+        if alpha <= 0.0 {
+            pixel.fill(0);
+            continue;
+        }
+        let mut channels = [
+            (pixel[0] as f32 / 255.0 / alpha).clamp(0.0, 1.0),
+            (pixel[1] as f32 / 255.0 / alpha).clamp(0.0, 1.0),
+            (pixel[2] as f32 / 255.0 / alpha).clamp(0.0, 1.0),
+            alpha,
+        ];
+        if linear_rgb {
+            for channel in &mut channels[..3] {
+                *channel = srgb_to_linear(*channel);
+            }
+        }
+        for (channel, function) in channels.iter_mut().zip(functions) {
+            *channel = apply_svg_transfer_function(*channel, function).clamp(0.0, 1.0);
+        }
+        let alpha = channels[3];
+        for (index, channel) in channels[..3].iter().enumerate() {
+            let channel = if linear_rgb {
+                linear_to_srgb(*channel)
+            } else {
+                *channel
+            };
+            pixel[index] = (channel * alpha * 255.0).round() as u8;
+        }
+        pixel[3] = (alpha * 255.0).round() as u8;
+    }
+}
+
+fn apply_svg_transfer_function(value: f32, function: &SvgTransferFunction) -> f32 {
+    match function {
+        SvgTransferFunction::Identity => value,
+        SvgTransferFunction::Table(values) => {
+            if values.is_empty() {
+                return value;
+            }
+            if values.len() == 1 {
+                return values[0];
+            }
+            let position = value.clamp(0.0, 1.0) * (values.len() - 1) as f32;
+            let index = position.floor() as usize;
+            let next = (index + 1).min(values.len() - 1);
+            values[index] + (values[next] - values[index]) * (position - index as f32)
+        }
+        SvgTransferFunction::Discrete(values) => {
+            if values.is_empty() {
+                return value;
+            }
+            let index = (value.clamp(0.0, 1.0) * values.len() as f32).floor() as usize;
+            values[index.min(values.len() - 1)]
+        }
+        SvgTransferFunction::Linear { slope, intercept } => value * slope + intercept,
+        SvgTransferFunction::Gamma {
+            amplitude,
+            exponent,
+            offset,
+        } => amplitude * value.clamp(0.0, 1.0).powf(*exponent) + offset,
+    }
+}
+
+/// Apply `feMorphology` in the bounded filter surface.  Filter input outside
+/// the primitive subregion is transparent black, so erosion samples that
+/// boundary as zero while dilation leaves it without additional ink.
+fn apply_svg_morphology(
+    data: &mut [u8],
+    width: usize,
+    height: usize,
+    radius_x: usize,
+    radius_y: usize,
+    dilate: bool,
+) {
+    if radius_x == 0 && radius_y == 0 {
+        return;
+    }
+    let source = data.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let destination = (y * width + x) * 4;
+            for channel in 0..4 {
+                let mut value = if dilate { 0 } else { u8::MAX };
+                for sample_y in y.saturating_sub(radius_y)..=(y + radius_y).min(height - 1) {
+                    for sample_x in x.saturating_sub(radius_x)..=(x + radius_x).min(width - 1) {
+                        let sample = source[(sample_y * width + sample_x) * 4 + channel];
+                        if dilate {
+                            value = value.max(sample);
+                        } else {
+                            value = value.min(sample);
+                        }
+                    }
+                }
+                // Erosion's transparent-black exterior is observable at the
+                // finite source surface boundary.
+                if !dilate
+                    && (x < radius_x
+                        || y < radius_y
+                        || x.saturating_add(radius_x) >= width
+                        || y.saturating_add(radius_y) >= height)
+                {
+                    value = 0;
+                }
+                data[destination + channel] = value;
+            }
+        }
+    }
+}
+
+/// Apply SVG `feDropShadow` from the current source surface.
+///
+/// The primitive's result is the untouched input composited over its colored,
+/// blurred, translated alpha shadow. The source copy here is an effect
+/// intermediate, not a second text layer: SVG text was already shaped once
+/// before entering this raster compositor.
+fn apply_svg_drop_shadow(
+    data: &mut [u8],
+    width: usize,
+    height: usize,
+    std_deviation: f32,
+    dx: i32,
+    dy: i32,
+    color: CssColor,
+) {
+    let source = data.to_vec();
+    let mut shadow = source.clone();
+    apply_svg_flood_in_source_alpha(&mut shadow, color);
+    gaussian_blur_rgba(&mut shadow, width, height, std_deviation);
+    apply_svg_offset(&mut shadow, width, height, dx, dy);
+    let composited = apply_svg_composite(
+        &source,
+        &shadow,
+        data,
+        usvg::filter::CompositeOperator::Over,
+    );
+    debug_assert!(composited, "same-sized SVG drop-shadow surfaces composite");
+}
+
+/// Apply SVG `feConvolveMatrix` to a premultiplied filter surface.
+///
+/// The filter specification defines the kernel over unpremultiplied color
+/// components. This backend boundary therefore decodes each sample, applies
+/// the matrix in the primitive's declared color space, then premultiplies the
+/// clamped result for the PDF image. `edgeMode=none` samples transparent
+/// black; the other modes resolve coordinates before sampling.
+/// <https://www.w3.org/TR/filter-effects/#element-attrdef-feconvolvematrix-kernelmatrix>
+#[allow(clippy::too_many_arguments)]
+fn apply_svg_convolve_matrix(
+    data: &mut [u8],
+    width: usize,
+    height: usize,
+    matrix: &[f32],
+    columns: u32,
+    rows: u32,
+    target_x: u32,
+    target_y: u32,
+    divisor: f32,
+    bias: f32,
+    edge_mode: usvg::filter::EdgeMode,
+    preserve_alpha: bool,
+    linear_rgb: bool,
+) -> bool {
+    let columns = columns as usize;
+    let rows = rows as usize;
+    if width == 0
+        || height == 0
+        || columns == 0
+        || rows == 0
+        || target_x as usize >= columns
+        || target_y as usize >= rows
+        || matrix.len() != columns.saturating_mul(rows)
+        || !divisor.is_finite()
+        || divisor == 0.0
+        || !bias.is_finite()
+        || matrix.iter().any(|coefficient| !coefficient.is_finite())
+    {
+        return false;
+    }
+    let Some(work) = (width as u64)
+        .checked_mul(height as u64)
+        .and_then(|pixels| pixels.checked_mul(matrix.len() as u64))
+    else {
+        return false;
+    };
+    if work > MAX_SVG_CONVOLVE_SAMPLES {
+        return false;
+    }
+
+    let source = data.to_vec();
+    let sample = |x: isize, y: isize| -> [f32; 4] {
+        let (x, y) = match edge_mode {
+            usvg::filter::EdgeMode::None
+                if x < 0 || y < 0 || x >= width as isize || y >= height as isize =>
+            {
+                return [0.0; 4];
+            }
+            usvg::filter::EdgeMode::None => (x as usize, y as usize),
+            usvg::filter::EdgeMode::Duplicate => (
+                x.clamp(0, width as isize - 1) as usize,
+                y.clamp(0, height as isize - 1) as usize,
+            ),
+            usvg::filter::EdgeMode::Wrap => (
+                x.rem_euclid(width as isize) as usize,
+                y.rem_euclid(height as isize) as usize,
+            ),
+        };
+        let pixel = &source[(y * width + x) * 4..][..4];
+        let alpha = pixel[3] as f32 / 255.0;
+        if alpha <= 0.0 {
+            return [0.0; 4];
+        }
+        let mut result = [
+            (pixel[0] as f32 / 255.0 / alpha).clamp(0.0, 1.0),
+            (pixel[1] as f32 / 255.0 / alpha).clamp(0.0, 1.0),
+            (pixel[2] as f32 / 255.0 / alpha).clamp(0.0, 1.0),
+            alpha,
+        ];
+        if linear_rgb {
+            for channel in &mut result[..3] {
+                *channel = srgb_to_linear(*channel);
+            }
+        }
+        result
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let mut output = [0.0; 4];
+            for kernel_y in 0..rows {
+                for kernel_x in 0..columns {
+                    // SVG's target identifies the kernel element aligned to
+                    // the destination pixel. The other matrix coordinates
+                    // are sampled relative to that point.
+                    let sample = sample(
+                        x as isize - target_x as isize + kernel_x as isize,
+                        y as isize - target_y as isize + kernel_y as isize,
+                    );
+                    let coefficient = matrix[kernel_y * columns + kernel_x];
+                    for (component, sample) in output.iter_mut().zip(sample) {
+                        *component += sample * coefficient;
+                    }
+                }
+            }
+            let center_alpha = source[(y * width + x) * 4 + 3] as f32 / 255.0;
+            let alpha = if preserve_alpha {
+                center_alpha
+            } else {
+                (output[3] / divisor + bias).clamp(0.0, 1.0)
+            };
+            let destination = &mut data[(y * width + x) * 4..][..4];
+            for (destination, component) in destination[..3].iter_mut().zip(output[..3].iter()) {
+                let component = (component / divisor + bias).clamp(0.0, 1.0);
+                let component = if linear_rgb {
+                    linear_to_srgb(component)
+                } else {
+                    component
+                };
+                *destination = (component * alpha * 255.0).round() as u8;
+            }
+            destination[3] = (alpha * 255.0).round() as u8;
+        }
+    }
+    true
+}
+
+fn srgb_to_linear(component: f32) -> f32 {
+    if component <= 0.04045 {
+        component / 12.92
+    } else {
+        ((component + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(component: f32) -> f32 {
+    if component <= 0.003_130_8 {
+        component * 12.92
+    } else {
+        1.055 * component.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Blur a premultiplied RGBA buffer with a normalized separable Gaussian.
+///
+/// The bounded surface check in [`rasterize_svg_solid_paths`] means the
+/// straightforward deterministic convolution is appropriate here and avoids
+/// depending on a second graphics stack for SVG filter math.
+fn gaussian_blur_rgba(data: &mut [u8], width: usize, height: usize, sigma: f32) {
+    if !sigma.is_finite() || sigma <= 0.01 || width == 0 || height == 0 {
+        return;
+    }
+    let radius = (sigma * 3.0).ceil().clamp(1.0, 256.0) as isize;
+    let weights: Vec<f32> = (-radius..=radius)
+        .map(|offset| (-(offset * offset) as f32 / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let normalization: f32 = weights.iter().sum();
+    let mut horizontal = vec![0_u8; data.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let destination = (y * width + x) * 4;
+            for channel in 0..4 {
+                let mut value = 0.0;
+                for (weight_index, weight) in weights.iter().enumerate() {
+                    let sample_x = (x as isize + weight_index as isize - radius)
+                        .clamp(0, width as isize - 1) as usize;
+                    value += data[(y * width + sample_x) * 4 + channel] as f32 * *weight;
+                }
+                horizontal[destination + channel] = (value / normalization).round() as u8;
+            }
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let destination = (y * width + x) * 4;
+            for channel in 0..4 {
+                let mut value = 0.0;
+                for (weight_index, weight) in weights.iter().enumerate() {
+                    let sample_y = (y as isize + weight_index as isize - radius)
+                        .clamp(0, height as isize - 1) as usize;
+                    value += horizontal[(sample_y * width + x) * 4 + channel] as f32 * *weight;
+                }
+                data[destination + channel] = (value / normalization).round() as u8;
+            }
+        }
+    }
+}
+
+/// Resolve SVG's selected baseline and inherited `baseline-shift` list with
+/// Quire's document font metrics.
+///
+/// SVG 2 defines the text positioning point in terms of a selected baseline;
+/// an alphabetic baseline is the default. Quire's `FontSystem` already
+/// resolves OpenType BASE coordinates, variable-font instances, and
+/// synthesized fallback metrics for CSS inline layout, so SVG adapts the
+/// normalized `usvg` values to that concrete API instead of duplicating a
+/// font-metric path here.
+/// <https://www.w3.org/TR/SVG2/text.html#TextLayoutAlgorithm>
+/// <https://drafts.csswg.org/css-inline-3/#baseline-alignment>
+fn svg_text_baseline_shift(
+    font_system: &mut FontSystem,
+    span: &usvg::TextSpan,
+    style: &ComputedStyle,
+    font_scale: SvgFontScale,
+) -> crate::document::paint::text::TextRunDisplacement {
+    let baseline_metric = svg_alignment_baseline_metric(span);
+    let alphabetic = font_system
+        .baseline_offset_for_style(style, BaselineMetric::Alphabetic)
+        .points();
+    let selected = font_system
+        .baseline_offset_for_style(style, baseline_metric)
+        .points();
+    // Baseline coordinates are measured downward from the text content-area
+    // start. Moving an alternative selected baseline to SVG's positioning
+    // point therefore moves the alphabetic glyph origin by their difference.
+    let mut shift = alphabetic - selected;
+
+    // `usvg` retains the inherited property values from `<text>` down to the
+    // leaf tspan. SVG applies the innermost shift first; additions commute
+    // for the numeric values modelled here, but preserving that order makes
+    // the reset baseline explicit and matches its normalized representation.
+    for baseline_shift in span.baseline_shift().iter().rev() {
+        shift += match baseline_shift {
+            usvg::BaselineShift::Baseline => 0.0,
+            usvg::BaselineShift::Number(value) if value.is_finite() => {
+                -font_scale.scale_svg_length(*value)
+            }
+            usvg::BaselineShift::Superscript => -font_system
+                .script_vertical_align_shift(style, css::BaselineShift::Super)
+                .unwrap_or(style.font_size * 0.45),
+            usvg::BaselineShift::Subscript => -font_system
+                .script_vertical_align_shift(style, css::BaselineShift::Sub)
+                .unwrap_or(-style.font_size * 0.4),
+            usvg::BaselineShift::Number(_) => 0.0,
+        };
+    }
+    // Baseline coordinates are initially measured in SVG's y-down user
+    // space, while shaped runs use PDF's y-up glyph space.
+    crate::document::paint::text::TextRunDisplacement::new(0.0, -shift)
+}
+
+fn svg_alignment_baseline_metric(span: &usvg::TextSpan) -> BaselineMetric {
+    let alignment = match span.alignment_baseline() {
+        usvg::AlignmentBaseline::Auto | usvg::AlignmentBaseline::Baseline => {
+            match span.dominant_baseline() {
+                usvg::DominantBaseline::Ideographic => usvg::AlignmentBaseline::Ideographic,
+                usvg::DominantBaseline::Hanging => usvg::AlignmentBaseline::Hanging,
+                usvg::DominantBaseline::Mathematical => usvg::AlignmentBaseline::Mathematical,
+                usvg::DominantBaseline::Central => usvg::AlignmentBaseline::Central,
+                usvg::DominantBaseline::Middle => usvg::AlignmentBaseline::Middle,
+                usvg::DominantBaseline::TextAfterEdge => usvg::AlignmentBaseline::TextAfterEdge,
+                usvg::DominantBaseline::TextBeforeEdge => usvg::AlignmentBaseline::TextBeforeEdge,
+                usvg::DominantBaseline::Auto
+                | usvg::DominantBaseline::UseScript
+                | usvg::DominantBaseline::NoChange
+                | usvg::DominantBaseline::ResetSize
+                | usvg::DominantBaseline::Alphabetic => usvg::AlignmentBaseline::Alphabetic,
+            }
+        }
+        alignment => alignment,
+    };
+    match alignment {
+        usvg::AlignmentBaseline::BeforeEdge | usvg::AlignmentBaseline::TextBeforeEdge => {
+            BaselineMetric::TextTop
+        }
+        usvg::AlignmentBaseline::Middle => BaselineMetric::Middle,
+        usvg::AlignmentBaseline::Central => BaselineMetric::Central,
+        usvg::AlignmentBaseline::AfterEdge | usvg::AlignmentBaseline::TextAfterEdge => {
+            BaselineMetric::TextBottom
+        }
+        usvg::AlignmentBaseline::Ideographic => BaselineMetric::Ideographic,
+        usvg::AlignmentBaseline::Hanging => BaselineMetric::Hanging,
+        usvg::AlignmentBaseline::Mathematical => BaselineMetric::Mathematical,
+        usvg::AlignmentBaseline::Auto
+        | usvg::AlignmentBaseline::Baseline
+        | usvg::AlignmentBaseline::Alphabetic => BaselineMetric::Alphabetic,
+    }
+}
+
+/// Place Quire-shaped SVG glyphs along a normalized `<textPath>` contour.
+///
+/// Text-on-a-path needs an independently rotated origin for every glyph, so
+/// it is intentionally realized as semantic outline fallback. The path
+/// sampler is geometry-only; no upstream font selection or shaping occurs.
+fn svg_text_path_outline_paths(
+    font_system: &FontSystem,
+    line: &crate::document::paint::text::RenderedLine,
+    path: &usvg::TextPath,
+    coordinates: SvgTextCoordinateTransform,
+    start_offset: f32,
+    paint: &SvgTextPaint,
+) -> Vec<RenderedPath> {
+    if !start_offset.is_finite() {
+        return Vec::new();
+    }
+    let paint = paint.outline_paint();
+    let mut paths = Vec::new();
+    let mut cursor = start_offset;
+    for run in &line.runs {
+        let Some(glyphs) = run.glyphs.as_ref() else {
+            continue;
+        };
+        for glyph in glyphs {
+            let advance = coordinates
+                .font_scale()
+                .unscale_text_length(glyph.x_advance);
+            let glyph_offset = coordinates.font_scale().unscale_text_length(glyph.x_offset);
+            let center = cursor + glyph_offset + advance * 0.5;
+            let Some(position) = path.position_at_distance(center) else {
+                cursor += advance;
+                continue;
+            };
+            let page_position =
+                coordinates.map_position(SvgTextPosition::new(position.x, position.y));
+            let Some(glyph_matrix) = run.text_matrix.rotated_in_text_space(
+                coordinates.glyph_rotation_degrees(position.tangent_degrees),
+            ) else {
+                cursor += advance;
+                continue;
+            };
+            let center_offset = glyph_matrix.transform_local_point(
+                crate::document::paint::text::TextRunPoint::new(glyph.x_advance * 0.5, 0.0),
+            );
+            let mut glyph_run = run.clone();
+            glyph_run.x_offset = page_position.x - line.origin().x - center_offset.x;
+            glyph_run.y_offset = page_position.y - line.origin().y - center_offset.y;
+            let mut glyph = glyph.clone();
+            // The text-path distance has already consumed SVG's horizontal
+            // character offset. Avoid applying that same source position a
+            // second time inside the glyph-local outline transform.
+            glyph.x_offset = 0.0;
+            glyph_run.glyphs = Some(vec![glyph].into());
+            glyph_run.glyph_source_ranges = None;
+            glyph_run.text_matrix = glyph_matrix;
+            paths.extend(svg_text_outline_paths(
+                font_system,
+                line.origin(),
+                &[glyph_run],
+                &paint,
+            ));
+            cursor += advance;
+        }
+    }
+    paths
+}
+
+/// Lower a span with non-zero SVG character rotation to outlines while
+/// retaining the source text as one semantic unit. PDF text operators have a
+/// run-wide text matrix; emitting one native run would rotate later advances
+/// as well as the individual glyphs, which is not SVG's `rotate` behavior.
+/// The outlines still come from the same Quire-shaped glyph IDs and selected
+/// document font, and `SvgOutlinedText` carries the corresponding ActualText.
+fn svg_text_rotation_paths(
+    font_system: &FontSystem,
+    line: &crate::document::paint::text::RenderedLine,
+    source: &str,
+    rotate: &[f32],
+    source_character_offset: usize,
+    coordinates: SvgTextCoordinateTransform,
+    paint: &SvgTextPaint,
+) -> Option<Vec<RenderedPath>> {
+    let paint = paint.outline_paint();
+    let mut paths = Vec::new();
+    let mut saw_rotation = false;
+    for run in &line.runs {
+        let (Some(glyphs), Some(source_ranges)) =
+            (run.glyphs.as_ref(), run.glyph_source_ranges.as_ref())
+        else {
+            continue;
+        };
+        let mut cursor = 0.0;
+        let mut previous_cluster = None;
+        let mut cluster_angle = 0.0;
+        for (glyph, source_range) in glyphs.iter().zip(source_ranges.iter()) {
+            if let Some(source_range) = source_range
+                && previous_cluster != Some(source_range.start)
+            {
+                let character = source[..source_range.start].chars().count();
+                let absolute_character = source_character_offset + character;
+                cluster_angle = rotate
+                    .get(absolute_character)
+                    .copied()
+                    .or_else(|| rotate.last().copied())
+                    .filter(|angle| angle.is_finite())
+                    .unwrap_or(0.0);
+                previous_cluster = Some(source_range.start);
+            }
+            let pen = run.text_matrix.transform_local_point(
+                crate::document::paint::text::TextRunPoint::new(cursor, 0.0),
+            );
+            let mut glyph_run = run.clone();
+            glyph_run.x_offset += pen.x;
+            glyph_run.y_offset += pen.y;
+            if cluster_angle != 0.0 {
+                saw_rotation = true;
+                glyph_run.text_matrix = run
+                    .text_matrix
+                    .rotated_in_text_space(coordinates.glyph_rotation_degrees(cluster_angle))
+                    .expect("finite SVG rotation produces a finite text matrix");
+            }
+            glyph_run.glyphs = Some(vec![glyph.clone()].into());
+            glyph_run.glyph_source_ranges = None;
+            paths.extend(svg_text_outline_paths(
+                font_system,
+                line.origin(),
+                &[glyph_run],
+                &paint,
+            ));
+            cursor += glyph.x_advance;
+        }
+    }
+    saw_rotation.then_some(paths)
+}
+
+/// Apply SVG's character-indexed relative position lists to an already shaped
+/// glyph stream.  The lists belong to the outer `<text>` element, while spans
+/// and font fallback divide the stream into independently shaped runs; source
+/// ranges retained by Quire's shaping API reconnect those two coordinate
+/// systems without reshaping through `usvg`.
+///
+/// SVG 2 text positioning applies `dx`/`dy` before the affected character.
+/// A cluster can have several glyphs, so every glyph in a cluster receives
+/// the same relative origin while only the first glyph consumes the list
+/// entry.  This preserves ligatures and combining marks selected by Quire's
+/// shared OpenType shaping path.
+/// <https://www.w3.org/TR/SVG2/text.html#TextData>
+fn apply_svg_relative_positioning(
+    runs: &mut [crate::document::paint::text::RenderedTextRun],
+    source: &str,
+    dx: &[f32],
+    dy: &[f32],
+    source_character_offset: usize,
+    coordinates: SvgTextCoordinateTransform,
+) {
+    if dx.is_empty() && dy.is_empty() {
+        return;
+    }
+    let mut accumulated = SvgTextUserDisplacement::zero();
+    let mut next_character = 0;
+    let mut previous_cluster = None;
+    for run in runs {
+        let (Some(glyphs), Some(source_ranges)) =
+            (run.glyphs.as_ref(), run.glyph_source_ranges.as_ref())
+        else {
+            continue;
+        };
+        let mut adjusted = glyphs.as_ref().to_vec();
+        for (glyph, source_range) in adjusted.iter_mut().zip(source_ranges.iter()) {
+            let Some(source_range) = source_range else {
+                continue;
+            };
+            let character = source[..source_range.start].chars().count();
+            if previous_cluster != Some(source_range.start) {
+                for index in next_character..=character {
+                    let absolute_index = source_character_offset + index;
+                    accumulated.x += dx.get(absolute_index).copied().unwrap_or(0.0);
+                    accumulated.y += dy.get(absolute_index).copied().unwrap_or(0.0);
+                }
+                next_character = character.saturating_add(1);
+                previous_cluster = Some(source_range.start);
+            }
+            let Some(local_displacement) = run.text_matrix.inverse_transform_local_displacement(
+                coordinates.text_run_displacement(accumulated),
+            ) else {
+                // A non-invertible text matrix cannot preserve SVG's
+                // character-position semantics. `render_svg_text` rejects
+                // non-invertible outer transforms before this point, so this
+                // only protects a future per-run matrix extension.
+                continue;
+            };
+            glyph.x_offset += local_displacement.x;
+            glyph.y_offset += local_displacement.y;
+        }
+        run.glyphs = Some(adjusted.into());
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SvgTextLengthAdjustment {
+    advance: f32,
+    inline_scale: f32,
+}
+
+fn svg_text_length_adjustment(
+    span: &usvg::TextSpan,
+    runs: &mut [crate::document::paint::text::RenderedTextRun],
+    measured_advance: f32,
+    font_scale: SvgFontScale,
+    style: &ComputedStyle,
+) -> SvgTextLengthAdjustment {
+    let Some(requested) = span.text_length() else {
+        return SvgTextLengthAdjustment {
+            advance: measured_advance,
+            inline_scale: 1.0,
+        };
+    };
+    let requested = font_scale.scale_svg_length(requested);
+    if !requested.is_finite() || requested < 0.0 || measured_advance <= 0.0 {
+        return SvgTextLengthAdjustment {
+            advance: measured_advance,
+            inline_scale: 1.0,
+        };
+    }
+    match span.length_adjust() {
+        usvg::LengthAdjust::SpacingAndGlyphs => SvgTextLengthAdjustment {
+            advance: requested,
+            inline_scale: requested / measured_advance,
+        },
+        usvg::LengthAdjust::Spacing => {
+            let glyph_count = runs
+                .iter()
+                .filter_map(|run| run.glyphs.as_ref())
+                .map(|glyphs| glyphs.len())
+                .sum::<usize>();
+            if glyph_count < 2 {
+                return SvgTextLengthAdjustment {
+                    advance: measured_advance,
+                    inline_scale: 1.0,
+                };
+            }
+            let extra_spacing = (requested - measured_advance) / (glyph_count - 1) as f32;
+            let vertical_inline_axis =
+                crate::layout::text_paint::VerticalInlineAxis::for_style(style);
+            let mut remaining_glyphs = glyph_count;
+            let mut accumulated_spacing = 0.0;
+            for run in runs {
+                if let Some(axis) = vertical_inline_axis {
+                    run.y_offset += axis.advance_sign() * accumulated_spacing;
+                } else {
+                    run.x_offset += accumulated_spacing;
+                }
+                let Some(glyphs) = run.glyphs.as_ref() else {
+                    continue;
+                };
+                let mut adjusted = glyphs.as_ref().to_vec();
+                for glyph in &mut adjusted {
+                    remaining_glyphs -= 1;
+                    if remaining_glyphs != 0 {
+                        glyph.x_advance += extra_spacing;
+                        glyph.nominal_x_advance += extra_spacing;
+                        accumulated_spacing += extra_spacing;
+                    }
+                }
+                run.glyphs = Some(adjusted.into());
+            }
+            SvgTextLengthAdjustment {
+                advance: requested,
+                inline_scale: 1.0,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SvgTextPaint {
+    Native(CssColor),
+    Outline(SvgOutlinedTextPaint),
+}
+
+#[derive(Debug, Clone)]
+struct SvgOutlinedTextPaint {
+    fill: Option<RenderedPathPaint>,
+    stroke: Option<RenderedPathPaint>,
+    stroke_width: PaintStrokeWidth,
+    stroke_style: RenderedPathStrokeStyle,
+    paint_order: RenderedPathPaintOrder,
+}
+
+impl SvgTextPaint {
+    fn outline_paint(&self) -> SvgOutlinedTextPaint {
+        match self {
+            Self::Native(color) => SvgOutlinedTextPaint {
+                fill: Some(RenderedPathPaint::Solid(*color)),
+                stroke: None,
+                stroke_width: PaintStrokeWidth::ZERO,
+                stroke_style: RenderedPathStrokeStyle::default(),
+                paint_order: RenderedPathPaintOrder::FillThenStroke,
+            },
+            Self::Outline(paint) => paint.clone(),
+        }
+    }
+}
+
+fn svg_text_outline_paths(
+    font_system: &FontSystem,
+    origin: PaintPoint,
+    runs: &[crate::document::paint::text::RenderedTextRun],
+    paint: &SvgOutlinedTextPaint,
+) -> Vec<RenderedPath> {
+    let Some(seed_paint) = paint.fill.as_ref().or(paint.stroke.as_ref()).cloned() else {
+        return Vec::new();
+    };
+    font_system
+        .glyph_outline_paths(origin, runs, seed_paint)
+        .into_iter()
+        .map(|mut path| {
+            path.stroke_width = paint.stroke_width;
+            path.with_paints(paint.fill.clone(), paint.stroke.clone())
+                .with_stroke_style(paint.stroke_style.clone())
+                .with_paint_order(paint.paint_order)
+        })
+        .collect()
+}
+
+fn svg_text_paint(
+    span: &usvg::TextSpan,
+    transform: PaintTransform,
+    font_scale: SvgFontScale,
+) -> Option<SvgTextPaint> {
+    svg_text_paint_from_sources(
+        span.fill(),
+        span.stroke(),
+        span.paint_order(),
+        transform,
+        font_scale,
+    )
+}
+
+fn svg_text_paint_from_sources(
+    fill_source: Option<&usvg::Fill>,
+    stroke_source: Option<&usvg::Stroke>,
+    paint_order: usvg::PaintOrder,
+    transform: PaintTransform,
+    font_scale: SvgFontScale,
+) -> Option<SvgTextPaint> {
+    let mut fill = fill_source.and_then(|fill| svg_paint(fill.paint(), fill.opacity().get()));
+    let mut stroke =
+        stroke_source.and_then(|stroke| svg_paint(stroke.paint(), stroke.opacity().get()));
+    for paint in [&mut fill, &mut stroke].into_iter().flatten() {
+        if let RenderedPathPaint::Gradient(gradient) = paint {
+            gradient.transform = transform.multiply(gradient.transform);
+        }
+    }
+    if fill.is_none() && stroke.is_none() {
+        return None;
+    }
+    if let (Some(RenderedPathPaint::Solid(color)), None) = (&fill, &stroke) {
+        return Some(SvgTextPaint::Native(*color));
+    }
+    let (stroke_width, stroke_style) = stroke_source.map_or_else(
+        || (PaintStrokeWidth::ZERO, RenderedPathStrokeStyle::default()),
+        |stroke| {
+            (
+                PaintStrokeWidth::new(stroke.width().get() * font_scale.points()),
+                RenderedPathStrokeStyle {
+                    line_cap: match stroke.linecap() {
+                        usvg::LineCap::Butt => RenderedPathLineCap::Butt,
+                        usvg::LineCap::Round => RenderedPathLineCap::Round,
+                        usvg::LineCap::Square => RenderedPathLineCap::Square,
+                    },
+                    line_join: match stroke.linejoin() {
+                        usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => {
+                            RenderedPathLineJoin::Miter
+                        }
+                        usvg::LineJoin::Round => RenderedPathLineJoin::Round,
+                        usvg::LineJoin::Bevel => RenderedPathLineJoin::Bevel,
+                    },
+                    miter_limit: stroke.miterlimit().get(),
+                    dash_array: stroke.dasharray().map_or_else(Vec::new, ToOwned::to_owned),
+                    dash_offset: stroke.dashoffset(),
+                },
+            )
+        },
+    );
+    Some(SvgTextPaint::Outline(SvgOutlinedTextPaint {
+        fill: fill.take(),
+        stroke: stroke.take(),
+        stroke_width,
+        stroke_style,
+        paint_order: match paint_order {
+            usvg::PaintOrder::FillAndStroke => RenderedPathPaintOrder::FillThenStroke,
+            usvg::PaintOrder::StrokeAndFill => RenderedPathPaintOrder::StrokeThenFill,
+        },
+    }))
+}
+
+fn svg_text_style(
+    span: &usvg::TextSpan,
+    writing_mode: usvg::WritingMode,
+    text_orientation: usvg::TextOrientation,
+    direction: usvg::TextDirection,
+    unicode_bidi: usvg::TextUnicodeBidi,
+    scale: f32,
+) -> ComputedStyle {
+    let mut style = ComputedStyle::initial();
+    style.font_family = svg_font_family(span.font().families());
+    style.font_weight = FontWeight(span.font().weight());
+    style.font_style = match span.font().style() {
+        usvg::FontStyle::Normal => FontStyle::Normal,
+        usvg::FontStyle::Italic => FontStyle::Italic,
+        usvg::FontStyle::Oblique => FontStyle::DEFAULT_OBLIQUE,
+    };
+    style.font_width = match span.font().stretch() {
+        usvg::FontStretch::UltraCondensed => FontWidth::ULTRA_CONDENSED,
+        usvg::FontStretch::ExtraCondensed => FontWidth::EXTRA_CONDENSED,
+        usvg::FontStretch::Condensed => FontWidth::CONDENSED,
+        usvg::FontStretch::SemiCondensed => FontWidth::SEMI_CONDENSED,
+        usvg::FontStretch::Normal => FontWidth::NORMAL,
+        usvg::FontStretch::SemiExpanded => FontWidth::SEMI_EXPANDED,
+        usvg::FontStretch::Expanded => FontWidth::EXPANDED,
+        usvg::FontStretch::ExtraExpanded => FontWidth::EXTRA_EXPANDED,
+        usvg::FontStretch::UltraExpanded => FontWidth::ULTRA_EXPANDED,
+    };
+    style.font_size = span.font_size().get() * scale;
+    style.writing_mode = match writing_mode {
+        usvg::WritingMode::LeftToRight => css::WritingMode::HorizontalTb,
+        usvg::WritingMode::VerticalRl => css::WritingMode::VerticalRl,
+        usvg::WritingMode::VerticalLr => css::WritingMode::VerticalLr,
+        usvg::WritingMode::SidewaysRl => css::WritingMode::SidewaysRl,
+        usvg::WritingMode::SidewaysLr => css::WritingMode::SidewaysLr,
+    };
+    style.text_orientation = match text_orientation {
+        usvg::TextOrientation::Mixed => css::TextOrientation::Mixed,
+        usvg::TextOrientation::Upright => css::TextOrientation::Upright,
+        usvg::TextOrientation::Sideways => css::TextOrientation::Sideways,
+    };
+    style.direction = match direction {
+        usvg::TextDirection::LeftToRight => css::Direction::Ltr,
+        usvg::TextDirection::RightToLeft => css::Direction::Rtl,
+    };
+    style.unicode_bidi = match unicode_bidi {
+        usvg::TextUnicodeBidi::Normal => css::UnicodeBidi::Normal,
+        usvg::TextUnicodeBidi::Embed => css::UnicodeBidi::Embed,
+        usvg::TextUnicodeBidi::Isolate => css::UnicodeBidi::Isolate,
+        usvg::TextUnicodeBidi::BidiOverride => css::UnicodeBidi::BidiOverride,
+        usvg::TextUnicodeBidi::IsolateOverride => css::UnicodeBidi::IsolateOverride,
+        usvg::TextUnicodeBidi::Plaintext => css::UnicodeBidi::Plaintext,
+    };
+    style.line_height = style.font_size * 1.2;
+    style.letter_spacing =
+        css::ComputedLengthPercentage::from_points(span.letter_spacing() * scale);
+    style.word_spacing = css::ComputedLengthPercentage::from_points(span.word_spacing() * scale);
+    style.font_kerning = if span.apply_kerning() {
+        FontKerning::Normal
+    } else {
+        FontKerning::None
+    };
+    style.font_variant_caps = if span.small_caps() {
+        FontVariantCaps::SmallCaps
+    } else {
+        FontVariantCaps::Normal
+    };
+    style.font_variation_settings = FontVariationSettings(
+        span.font()
+            .variations()
+            .iter()
+            .filter(|variation| variation.value.is_finite())
+            .map(|variation| FontVariationSetting {
+                tag: variation.tag,
+                value: variation.value.to_bits(),
+            })
+            .collect(),
+    );
+    style.text_shadow = span
+        .text_shadow()
+        .and_then(|shadow| css::parse_text_shadow(shadow, style.font_size))
+        .unwrap_or_default();
+    style
+}
+
+fn svg_font_family(families: &[usvg::FontFamily]) -> FontFamily {
+    let mut families = families.iter().map(|family| match family {
+        usvg::FontFamily::SansSerif => FontFamily::SansSerif,
+        usvg::FontFamily::Serif => FontFamily::Serif,
+        usvg::FontFamily::Monospace => FontFamily::Monospace,
+        usvg::FontFamily::Named(name) => FontFamily::named(name.clone()),
+        // Quire does not yet expose distinct cursive/fantasy generic family
+        // values. Preserve the authored generic as a shared fallback name.
+        usvg::FontFamily::Cursive => FontFamily::named("cursive"),
+        usvg::FontFamily::Fantasy => FontFamily::named("fantasy"),
+    });
+    let first = families.next().unwrap_or(FontFamily::SansSerif);
+    match families.next() {
+        Some(second) => FontFamily::List(
+            std::iter::once(first)
+                .chain(std::iter::once(second))
+                .chain(families)
+                .collect(),
+        ),
+        None => first,
+    }
 }
 
 /// The vector result of proving that an SVG filter does not alter
@@ -1518,6 +4263,933 @@ enum SvgFilterAnalysis {
         filter_clip: Option<usvg::NonZeroRect>,
     },
     RequiresRasterBackend,
+}
+
+/// A normalized filter sequence that can currently be executed from one
+/// rasterized `SourceGraphic` without fabricating unsupported intermediate
+/// inputs.  This stays deliberately concrete: future primitives add explicit
+/// variants rather than treating every SVG filter as an opaque backend blob.
+#[derive(Debug, Clone)]
+enum SvgRasterFilter {
+    /// An ordered linear chain of in-place pixel transforms. Each primitive
+    /// consumes the previous primitive's result, so one bounded surface is
+    /// sufficient and no filter-graph input is approximated.
+    PixelEffects {
+        effects: Vec<SvgRasterPixelEffect>,
+        region: usvg::NonZeroRect,
+    },
+    /// `feFlood` composited `in` `SourceAlpha`. This is an exact two-input
+    /// filter pattern, but can be evaluated on the retained source-alpha
+    /// surface without fabricating a general graph cache.
+    FloodInSourceAlpha {
+        color: CssColor,
+        region: usvg::NonZeroRect,
+    },
+    GaussianBlur {
+        std_deviation: f32,
+        region: usvg::NonZeroRect,
+    },
+    Offset {
+        dx: f32,
+        dy: f32,
+        region: usvg::NonZeroRect,
+    },
+    ColorMatrix {
+        matrix: [f32; 20],
+        linear_rgb: bool,
+        region: usvg::NonZeroRect,
+    },
+    ComponentTransfer {
+        functions: [SvgTransferFunction; 4],
+        linear_rgb: bool,
+        region: usvg::NonZeroRect,
+    },
+    Morphology {
+        radius_x: f32,
+        radius_y: f32,
+        dilate: bool,
+        region: usvg::NonZeroRect,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum SvgRasterPixelEffect {
+    /// SVG-filter standard deviation in paint units. The raster boundary
+    /// converts it to surface pixels exactly once.
+    GaussianBlur {
+        std_deviation: f32,
+    },
+    /// SVG `feDropShadow`, whose result combines a generated shadow with the
+    /// current source surface instead of replacing it.
+    DropShadow {
+        std_deviation: f32,
+        dx: f32,
+        dy: f32,
+        color: CssColor,
+    },
+    /// A paint-space translation of the current filter surface.
+    Offset {
+        dx: f32,
+        dy: f32,
+    },
+    /// Replace current alpha coverage with a solid premultiplied flood.
+    FloodInSourceAlpha {
+        color: CssColor,
+    },
+    ColorMatrix {
+        matrix: [f32; 20],
+        linear_rgb: bool,
+    },
+    ComponentTransfer {
+        functions: [SvgTransferFunction; 4],
+        linear_rgb: bool,
+    },
+    Morphology {
+        /// Paint-space radii converted to surface pixels at the raster
+        /// boundary alongside every other spatial primitive.
+        radius_x: f32,
+        radius_y: f32,
+        dilate: bool,
+    },
+    ConvolveMatrix {
+        matrix: Vec<f32>,
+        columns: u32,
+        rows: u32,
+        target_x: u32,
+        target_y: u32,
+        divisor: f32,
+        bias: f32,
+        edge_mode: usvg::filter::EdgeMode,
+        preserve_alpha: bool,
+        linear_rgb: bool,
+    },
+    /// A named working result composited with the retained `SourceGraphic`.
+    /// The graph compiler emits this only when the preceding result name is
+    /// explicit, so it cannot silently substitute a different SVG input.
+    CompositeWithSourceGraphic {
+        operator: usvg::filter::CompositeOperator,
+        source_as_second: bool,
+    },
+    /// As above, with the derived SVG standard input `SourceAlpha`.
+    CompositeWithSourceAlpha {
+        operator: usvg::filter::CompositeOperator,
+        source_as_second: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum SvgTransferFunction {
+    Identity,
+    Table(Vec<f32>),
+    Discrete(Vec<f32>),
+    Linear {
+        slope: f32,
+        intercept: f32,
+    },
+    Gamma {
+        amplitude: f32,
+        exponent: f32,
+        offset: f32,
+    },
+}
+
+/// Recognize the first fully retained-scene filter operation.
+///
+/// SVG's filter graph has named intermediate results and multiple standard
+/// inputs.  A lone `feGaussianBlur` of `SourceGraphic` has neither ambiguity:
+/// its filter region, source pixels, and premultiplied-alpha blur are all
+/// available at this boundary.  Other graphs remain on the explicit
+/// `RequiresRasterBackend` path until their input/output rules are modeled.
+fn svg_raster_filter_plan(filters: &[Arc<usvg::filter::Filter>]) -> Option<SvgRasterFilter> {
+    if filters.len() != 1 {
+        return None;
+    }
+    let filter = &filters[0];
+    if let Some(color) = svg_flood_in_source_alpha(filter.primitives()) {
+        return Some(SvgRasterFilter::FloodInSourceAlpha {
+            color,
+            region: filter.rect(),
+        });
+    }
+    if let Some(shadow) = svg_blurred_flood_shadow_merge(filter.primitives()) {
+        return Some(SvgRasterFilter::PixelEffects {
+            effects: vec![shadow],
+            region: filter.rect(),
+        });
+    }
+    if let Some(effects) = svg_source_graphic_composite_effects(filter.primitives()) {
+        return Some(SvgRasterFilter::PixelEffects {
+            effects,
+            region: filter.rect(),
+        });
+    }
+    if let Some(effects) = svg_source_alpha_composite_effects(filter.primitives()) {
+        return Some(SvgRasterFilter::PixelEffects {
+            effects,
+            region: filter.rect(),
+        });
+    }
+    if let Some(effects) = svg_linear_pixel_effects(filter.primitives()) {
+        return Some(SvgRasterFilter::PixelEffects {
+            effects,
+            region: filter.rect(),
+        });
+    }
+    let primitive = filter.primitives().first()?;
+    if filter.primitives().len() != 1 {
+        return None;
+    }
+    match primitive.kind() {
+        usvg::filter::Kind::GaussianBlur(blur)
+            if matches!(blur.input(), usvg::filter::Input::SourceGraphic) =>
+        {
+            let std_deviation = (blur.std_dev_x().get() + blur.std_dev_y().get()) * 0.5;
+            (std_deviation.is_finite() && std_deviation > 0.0).then_some(
+                SvgRasterFilter::GaussianBlur {
+                    std_deviation,
+                    region: filter.rect(),
+                },
+            )
+        }
+        usvg::filter::Kind::Offset(offset)
+            if matches!(offset.input(), usvg::filter::Input::SourceGraphic)
+                && offset.dx().is_finite()
+                && offset.dy().is_finite() =>
+        {
+            Some(SvgRasterFilter::Offset {
+                dx: offset.dx(),
+                dy: offset.dy(),
+                region: filter.rect(),
+            })
+        }
+        usvg::filter::Kind::ColorMatrix(color_matrix)
+            if matches!(color_matrix.input(), usvg::filter::Input::SourceGraphic) =>
+        {
+            svg_color_matrix_values(color_matrix.kind()).map(|matrix| {
+                SvgRasterFilter::ColorMatrix {
+                    matrix,
+                    linear_rgb: primitive.color_interpolation()
+                        == usvg::filter::ColorInterpolation::LinearRGB,
+                    region: filter.rect(),
+                }
+            })
+        }
+        usvg::filter::Kind::ComponentTransfer(transfer)
+            if matches!(transfer.input(), usvg::filter::Input::SourceGraphic) =>
+        {
+            let functions = [
+                svg_transfer_function(transfer.func_r())?,
+                svg_transfer_function(transfer.func_g())?,
+                svg_transfer_function(transfer.func_b())?,
+                svg_transfer_function(transfer.func_a())?,
+            ];
+            Some(SvgRasterFilter::ComponentTransfer {
+                functions,
+                linear_rgb: primitive.color_interpolation()
+                    == usvg::filter::ColorInterpolation::LinearRGB,
+                region: filter.rect(),
+            })
+        }
+        usvg::filter::Kind::Morphology(morphology)
+            if matches!(morphology.input(), usvg::filter::Input::SourceGraphic) =>
+        {
+            let radius_x = morphology.radius_x().get();
+            let radius_y = morphology.radius_y().get();
+            (radius_x.is_finite() && radius_y.is_finite()).then_some(SvgRasterFilter::Morphology {
+                radius_x,
+                radius_y,
+                dilate: morphology.operator() == usvg::filter::MorphologyOperator::Dilate,
+                region: filter.rect(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Recognize `feFlood` followed by `feComposite operator="in"` with the
+/// flood as `in` and `SourceAlpha` as `in2`.
+///
+/// This is the common SVG filter idiom for coloring an alpha mask. It is a
+/// real binary primitive, yet does not require retaining two independent
+/// images: source-alpha coverage is already present in the glyph surface.
+fn svg_flood_in_source_alpha(primitives: &[usvg::filter::Primitive]) -> Option<CssColor> {
+    let [flood_primitive, composite_primitive] = primitives else {
+        return None;
+    };
+    let usvg::filter::Kind::Flood(flood) = flood_primitive.kind() else {
+        return None;
+    };
+    let usvg::filter::Kind::Composite(composite) = composite_primitive.kind() else {
+        return None;
+    };
+    (composite.operator() == usvg::filter::CompositeOperator::In
+        && matches!(composite.input1(), usvg::filter::Input::Reference(name) if name == flood_primitive.result())
+        && matches!(composite.input2(), usvg::filter::Input::SourceAlpha))
+        .then(|| svg_color(flood.color(), flood.opacity().get()))
+}
+
+/// Recognize the canonical SVG drop-shadow graph:
+/// `SourceGraphic` → blur → offset, flood `in` that alpha, then merge the
+/// shadow below `SourceGraphic`.
+///
+/// This is an exact named-input graph, not a heuristic for arbitrary merge or
+/// composite nodes. Its output is identical to `feDropShadow`, so it reuses
+/// the same bounded Quire-shaped source surface and compositing operation.
+/// <https://www.w3.org/TR/filter-effects/#element-attrdef-fedropshadow-in>
+fn svg_blurred_flood_shadow_merge(
+    primitives: &[usvg::filter::Primitive],
+) -> Option<SvgRasterPixelEffect> {
+    let [
+        blur_primitive,
+        offset_primitive,
+        flood_primitive,
+        composite_primitive,
+        merge_primitive,
+    ] = primitives
+    else {
+        return None;
+    };
+    let usvg::filter::Kind::GaussianBlur(blur) = blur_primitive.kind() else {
+        return None;
+    };
+    let usvg::filter::Kind::Offset(offset) = offset_primitive.kind() else {
+        return None;
+    };
+    let usvg::filter::Kind::Flood(flood) = flood_primitive.kind() else {
+        return None;
+    };
+    let usvg::filter::Kind::Composite(composite) = composite_primitive.kind() else {
+        return None;
+    };
+    let usvg::filter::Kind::Merge(merge) = merge_primitive.kind() else {
+        return None;
+    };
+    let std_deviation = (blur.std_dev_x().get() + blur.std_dev_y().get()) * 0.5;
+    (std_deviation.is_finite()
+        && std_deviation >= 0.0
+        && offset.dx().is_finite()
+        && offset.dy().is_finite()
+        && matches!(blur.input(), usvg::filter::Input::SourceGraphic)
+        && matches!(offset.input(), usvg::filter::Input::Reference(name) if name == blur_primitive.result())
+        && composite.operator() == usvg::filter::CompositeOperator::In
+        && matches!(composite.input1(), usvg::filter::Input::Reference(name) if name == flood_primitive.result())
+        && matches!(composite.input2(), usvg::filter::Input::Reference(name) if name == offset_primitive.result())
+        && matches!(merge.inputs(), [usvg::filter::Input::Reference(name), usvg::filter::Input::SourceGraphic] if name == composite_primitive.result()))
+    .then(|| SvgRasterPixelEffect::DropShadow {
+        std_deviation,
+        dx: offset.dx(),
+        dy: offset.dy(),
+        color: svg_color(flood.color(), flood.opacity().get()),
+    })
+}
+
+/// Compile a named linear result followed by `feComposite` with
+/// `SourceGraphic` as its second input. This is the first general retained
+/// graph edge: the working result and immutable source surface are explicit,
+/// rather than inferred from primitive order.
+fn svg_source_graphic_composite_effects(
+    primitives: &[usvg::filter::Primitive],
+) -> Option<Vec<SvgRasterPixelEffect>> {
+    let (prefix, [composite_primitive]) =
+        primitives.split_at_checked(primitives.len().checked_sub(1)?)?
+    else {
+        return None;
+    };
+    let usvg::filter::Kind::Composite(composite) = composite_primitive.kind() else {
+        return None;
+    };
+    let previous = prefix.last()?;
+    let source_as_second = match (composite.input1(), composite.input2()) {
+        (usvg::filter::Input::Reference(name), usvg::filter::Input::SourceGraphic)
+            if name == previous.result() =>
+        {
+            true
+        }
+        (usvg::filter::Input::SourceGraphic, usvg::filter::Input::Reference(name))
+            if name == previous.result() =>
+        {
+            false
+        }
+        _ => return None,
+    };
+    Some({
+        let mut effects = svg_linear_pixel_effects(prefix)?;
+        effects.push(SvgRasterPixelEffect::CompositeWithSourceGraphic {
+            operator: composite.operator(),
+            source_as_second,
+        });
+        effects
+    })
+}
+
+/// Compile a named linear result followed by `feComposite` with `SourceAlpha`
+/// as its second input.
+fn svg_source_alpha_composite_effects(
+    primitives: &[usvg::filter::Primitive],
+) -> Option<Vec<SvgRasterPixelEffect>> {
+    let (prefix, [composite_primitive]) =
+        primitives.split_at_checked(primitives.len().checked_sub(1)?)?
+    else {
+        return None;
+    };
+    let usvg::filter::Kind::Composite(composite) = composite_primitive.kind() else {
+        return None;
+    };
+    let previous = prefix.last()?;
+    let source_as_second = match (composite.input1(), composite.input2()) {
+        (usvg::filter::Input::Reference(name), usvg::filter::Input::SourceAlpha)
+            if name == previous.result() =>
+        {
+            true
+        }
+        (usvg::filter::Input::SourceAlpha, usvg::filter::Input::Reference(name))
+            if name == previous.result() =>
+        {
+            false
+        }
+        _ => return None,
+    };
+    Some({
+        let mut effects = svg_linear_pixel_effects(prefix)?;
+        effects.push(SvgRasterPixelEffect::CompositeWithSourceAlpha {
+            operator: composite.operator(),
+            source_as_second,
+        });
+        effects
+    })
+}
+
+/// Recognize a strictly linear sequence of in-place color transforms.
+///
+/// `usvg` has already normalized an omitted `in` to the previous primitive's
+/// `result`. Accepting only that exact dependency means every step can mutate
+/// the one retained `SourceGraphic` surface in order. A later explicit
+/// `SourceGraphic`, `SourceAlpha`, or any branch is intentionally rejected:
+/// it needs a graph compositor with more than one input surface.
+fn svg_linear_pixel_effects(
+    primitives: &[usvg::filter::Primitive],
+) -> Option<Vec<SvgRasterPixelEffect>> {
+    if primitives.is_empty() {
+        return None;
+    }
+    let mut effects = Vec::with_capacity(primitives.len());
+    let mut previous_result: Option<&str> = None;
+    for primitive in primitives {
+        let input = match primitive.kind() {
+            usvg::filter::Kind::GaussianBlur(blur) => blur.input(),
+            usvg::filter::Kind::DropShadow(shadow) => shadow.input(),
+            usvg::filter::Kind::Offset(offset) => offset.input(),
+            usvg::filter::Kind::Morphology(morphology) => morphology.input(),
+            usvg::filter::Kind::ConvolveMatrix(matrix) => matrix.input(),
+            usvg::filter::Kind::ColorMatrix(color_matrix) => color_matrix.input(),
+            usvg::filter::Kind::ComponentTransfer(transfer) => transfer.input(),
+            _ => return None,
+        };
+        let is_expected_input = match previous_result {
+            None => matches!(input, usvg::filter::Input::SourceGraphic),
+            Some(previous) => {
+                matches!(input, usvg::filter::Input::Reference(name) if name == previous)
+            }
+        };
+        if !is_expected_input {
+            return None;
+        }
+        let linear_rgb =
+            primitive.color_interpolation() == usvg::filter::ColorInterpolation::LinearRGB;
+        let effect = match primitive.kind() {
+            usvg::filter::Kind::GaussianBlur(blur) => {
+                let std_deviation = (blur.std_dev_x().get() + blur.std_dev_y().get()) * 0.5;
+                (std_deviation.is_finite() && std_deviation >= 0.0)
+                    .then_some(SvgRasterPixelEffect::GaussianBlur { std_deviation })?
+            }
+            usvg::filter::Kind::DropShadow(shadow)
+                if shadow.dx().is_finite() && shadow.dy().is_finite() =>
+            {
+                let std_deviation = (shadow.std_dev_x().get() + shadow.std_dev_y().get()) * 0.5;
+                (std_deviation.is_finite() && std_deviation >= 0.0).then(|| {
+                    SvgRasterPixelEffect::DropShadow {
+                        std_deviation,
+                        dx: shadow.dx(),
+                        dy: shadow.dy(),
+                        color: svg_color(shadow.color(), shadow.opacity().get()),
+                    }
+                })?
+            }
+            usvg::filter::Kind::Offset(offset)
+                if offset.dx().is_finite() && offset.dy().is_finite() =>
+            {
+                SvgRasterPixelEffect::Offset {
+                    dx: offset.dx(),
+                    dy: offset.dy(),
+                }
+            }
+            usvg::filter::Kind::Morphology(morphology) => {
+                let radius_x = morphology.radius_x().get();
+                let radius_y = morphology.radius_y().get();
+                (radius_x.is_finite() && radius_y.is_finite()).then_some(
+                    SvgRasterPixelEffect::Morphology {
+                        radius_x,
+                        radius_y,
+                        dilate: morphology.operator() == usvg::filter::MorphologyOperator::Dilate,
+                    },
+                )?
+            }
+            usvg::filter::Kind::ColorMatrix(color_matrix) => SvgRasterPixelEffect::ColorMatrix {
+                matrix: svg_color_matrix_values(color_matrix.kind())?,
+                linear_rgb,
+            },
+            usvg::filter::Kind::ComponentTransfer(transfer) => {
+                SvgRasterPixelEffect::ComponentTransfer {
+                    functions: [
+                        svg_transfer_function(transfer.func_r())?,
+                        svg_transfer_function(transfer.func_g())?,
+                        svg_transfer_function(transfer.func_b())?,
+                        svg_transfer_function(transfer.func_a())?,
+                    ],
+                    linear_rgb,
+                }
+            }
+            usvg::filter::Kind::ConvolveMatrix(convolve) => {
+                let matrix = convolve.matrix();
+                let values = matrix.data();
+                let divisor = convolve.divisor().get();
+                (values.len() <= 4096
+                    && values.iter().all(|value| value.is_finite())
+                    && divisor.is_finite()
+                    && convolve.bias().is_finite())
+                .then(|| SvgRasterPixelEffect::ConvolveMatrix {
+                    matrix: values.to_vec(),
+                    columns: matrix.columns(),
+                    rows: matrix.rows(),
+                    target_x: matrix.target_x(),
+                    target_y: matrix.target_y(),
+                    divisor,
+                    bias: convolve.bias(),
+                    edge_mode: convolve.edge_mode(),
+                    preserve_alpha: convolve.preserve_alpha(),
+                    linear_rgb,
+                })?
+            }
+            _ => unreachable!("input kind was filtered above"),
+        };
+        effects.push(effect);
+        previous_result = Some(primitive.result());
+    }
+    Some(effects)
+}
+
+fn svg_transfer_function(function: &usvg::filter::TransferFunction) -> Option<SvgTransferFunction> {
+    match function {
+        usvg::filter::TransferFunction::Identity => Some(SvgTransferFunction::Identity),
+        usvg::filter::TransferFunction::Table(values) => values
+            .iter()
+            .all(|value| value.is_finite())
+            .then(|| SvgTransferFunction::Table(values.clone())),
+        usvg::filter::TransferFunction::Discrete(values) => values
+            .iter()
+            .all(|value| value.is_finite())
+            .then(|| SvgTransferFunction::Discrete(values.clone())),
+        usvg::filter::TransferFunction::Linear { slope, intercept }
+            if slope.is_finite() && intercept.is_finite() =>
+        {
+            Some(SvgTransferFunction::Linear {
+                slope: *slope,
+                intercept: *intercept,
+            })
+        }
+        usvg::filter::TransferFunction::Gamma {
+            amplitude,
+            exponent,
+            offset,
+        } if amplitude.is_finite() && exponent.is_finite() && offset.is_finite() => {
+            Some(SvgTransferFunction::Gamma {
+                amplitude: *amplitude,
+                exponent: *exponent,
+                offset: *offset,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn svg_color_matrix_values(kind: &usvg::filter::ColorMatrixKind) -> Option<[f32; 20]> {
+    match kind {
+        usvg::filter::ColorMatrixKind::Matrix(values) => values
+            .as_slice()
+            .try_into()
+            .ok()
+            .filter(|matrix: &[f32; 20]| matrix.iter().all(|value| value.is_finite())),
+        usvg::filter::ColorMatrixKind::Saturate(amount) => {
+            let amount = amount.get();
+            amount.is_finite().then_some({
+                [
+                    0.213 + 0.787 * amount,
+                    0.715 - 0.715 * amount,
+                    0.072 - 0.072 * amount,
+                    0.0,
+                    0.0,
+                    0.213 - 0.213 * amount,
+                    0.715 + 0.285 * amount,
+                    0.072 - 0.072 * amount,
+                    0.0,
+                    0.0,
+                    0.213 - 0.213 * amount,
+                    0.715 - 0.715 * amount,
+                    0.072 + 0.928 * amount,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                ]
+            })
+        }
+        usvg::filter::ColorMatrixKind::HueRotate(angle) => {
+            if !angle.is_finite() {
+                return None;
+            }
+            let cosine = angle.to_radians().cos();
+            let sine = angle.to_radians().sin();
+            Some([
+                0.213 + cosine * 0.787 - sine * 0.213,
+                0.715 - cosine * 0.715 - sine * 0.715,
+                0.072 - cosine * 0.072 + sine * 0.928,
+                0.0,
+                0.0,
+                0.213 - cosine * 0.213 + sine * 0.143,
+                0.715 + cosine * 0.285 + sine * 0.140,
+                0.072 - cosine * 0.072 - sine * 0.283,
+                0.0,
+                0.0,
+                0.213 - cosine * 0.213 - sine * 0.787,
+                0.715 - cosine * 0.715 + sine * 0.715,
+                0.072 + cosine * 0.928 + sine * 0.072,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ])
+        }
+        usvg::filter::ColorMatrixKind::LuminanceToAlpha => Some([
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2125,
+            0.7154, 0.0721, 0.0, 0.0,
+        ]),
+    }
+}
+
+/// Rasterize a filterable SVG group and preserve its ordered source text as
+/// the image's semantic replacement.  A filtered SVG subtree cannot retain a
+/// native PDF text operation without duplicating its unfiltered ink, so the
+/// image's `/ActualText` is the only accessible representation.
+fn rasterize_svg_filtered_group(
+    group: SvgPaintGroup,
+    filter: SvgRasterFilter,
+    filter_transform: PaintTransform,
+) -> SvgPaintGroup {
+    let Some((mut paths, actual_text)) = svg_effect_paths_and_text(group) else {
+        return SvgPaintGroup::empty();
+    };
+    let scale = (filter_transform.a() * filter_transform.d()
+        - filter_transform.b() * filter_transform.c())
+    .abs()
+    .sqrt();
+    if !scale.is_finite() || scale <= 0.0 {
+        return SvgPaintGroup::empty();
+    }
+    let (blur_radius, pixel_effects, region) = match filter {
+        SvgRasterFilter::PixelEffects { effects, region } => (
+            0.0,
+            svg_pixel_effects_in_paint_space(effects, filter_transform),
+            region,
+        ),
+        SvgRasterFilter::FloodInSourceAlpha { color, region } => (
+            0.0,
+            vec![SvgRasterPixelEffect::FloodInSourceAlpha { color }],
+            region,
+        ),
+        SvgRasterFilter::GaussianBlur {
+            std_deviation,
+            region,
+        } => (std_deviation * scale, Vec::new(), region),
+        SvgRasterFilter::Offset { dx, dy, region } => {
+            let offset = PaintTranslation::new(
+                filter_transform.a() * dx + filter_transform.c() * dy,
+                filter_transform.b() * dx + filter_transform.d() * dy,
+            );
+            paths = paths
+                .into_iter()
+                .map(|path| path.transformed(PaintTransform::translate(offset)))
+                .collect();
+            (0.0, Vec::new(), region)
+        }
+        SvgRasterFilter::ColorMatrix {
+            matrix,
+            linear_rgb,
+            region,
+        } => (
+            0.0,
+            vec![SvgRasterPixelEffect::ColorMatrix { matrix, linear_rgb }],
+            region,
+        ),
+        SvgRasterFilter::ComponentTransfer {
+            functions,
+            linear_rgb,
+            region,
+        } => (
+            0.0,
+            vec![SvgRasterPixelEffect::ComponentTransfer {
+                functions,
+                linear_rgb,
+            }],
+            region,
+        ),
+        SvgRasterFilter::Morphology {
+            radius_x,
+            radius_y,
+            dilate,
+            region,
+        } => {
+            let radius_x = radius_x * scale;
+            let radius_y = radius_y * scale;
+            if !(0.0..=256.0).contains(&(radius_x * SVG_EFFECT_RASTER_SCALE).round())
+                || !(0.0..=256.0).contains(&(radius_y * SVG_EFFECT_RASTER_SCALE).round())
+            {
+                log::warn!("skipping SVG morphology with an effect radius over 256 pixels");
+                return SvgPaintGroup::empty();
+            }
+            (
+                0.0,
+                vec![SvgRasterPixelEffect::Morphology {
+                    radius_x,
+                    radius_y,
+                    dilate,
+                }],
+                region,
+            )
+        }
+    };
+    let Some(image) = rasterize_svg_solid_paths_with_effect(&paths, blur_radius, &pixel_effects)
+    else {
+        return SvgPaintGroup::empty();
+    };
+    let mut result = SvgPaintGroup::empty();
+    result.items.push(SvgPaintItem::RasterImage(Box::new(
+        image
+            .with_intersected_clip(svg_filter_clip_path(region, filter_transform))
+            .with_actual_text(Rc::from(actual_text)),
+    )));
+    result
+}
+
+/// Convert linear filter effects from normalized SVG user units to the paint
+/// units of their bounded raster surface. Color transforms are unitless;
+/// Gaussian standard deviations use the same geometric-mean affine scale as
+/// the single-primitive filter path.
+fn svg_pixel_effects_in_paint_space(
+    effects: Vec<SvgRasterPixelEffect>,
+    filter_transform: PaintTransform,
+) -> Vec<SvgRasterPixelEffect> {
+    let scale = (filter_transform.a() * filter_transform.d()
+        - filter_transform.b() * filter_transform.c())
+    .abs()
+    .sqrt();
+    effects
+        .into_iter()
+        .map(|effect| match effect {
+            SvgRasterPixelEffect::GaussianBlur { std_deviation } => {
+                SvgRasterPixelEffect::GaussianBlur {
+                    std_deviation: std_deviation * scale,
+                }
+            }
+            SvgRasterPixelEffect::DropShadow {
+                std_deviation,
+                dx,
+                dy,
+                color,
+            } => SvgRasterPixelEffect::DropShadow {
+                std_deviation: std_deviation * scale,
+                dx: filter_transform.a() * dx + filter_transform.c() * dy,
+                dy: filter_transform.b() * dx + filter_transform.d() * dy,
+                color,
+            },
+            SvgRasterPixelEffect::Offset { dx, dy } => SvgRasterPixelEffect::Offset {
+                dx: filter_transform.a() * dx + filter_transform.c() * dy,
+                dy: filter_transform.b() * dx + filter_transform.d() * dy,
+            },
+            SvgRasterPixelEffect::Morphology {
+                radius_x,
+                radius_y,
+                dilate,
+            } => SvgRasterPixelEffect::Morphology {
+                radius_x: radius_x * scale,
+                radius_y: radius_y * scale,
+                dilate,
+            },
+            effect @ SvgRasterPixelEffect::ConvolveMatrix { .. } => effect,
+            effect @ SvgRasterPixelEffect::CompositeWithSourceGraphic { .. } => effect,
+            effect @ SvgRasterPixelEffect::CompositeWithSourceAlpha { .. } => effect,
+            effect => effect,
+        })
+        .collect()
+}
+
+/// Rasterize the bounded retained solid-path subset of an SVG mask.
+///
+/// SVG masks affect the composited subtree, so native PDF text cannot remain
+/// alongside an image of its masked ink. Text is forced to the document-shaped
+/// outline stream before entering this function and the resulting image owns
+/// the source-order `/ActualText` replacement. This first compositor slice
+/// intentionally accepts only flat solid paths; gradients, images, nested
+/// masks, and filter-bearing mask content stay unsupported rather than being
+/// painted as an unmasked approximation.
+/// <https://www.w3.org/TR/SVG2/masking.html#MaskElement>
+fn rasterize_svg_masked_group(
+    source: SvgPaintGroup,
+    mask: SvgPaintGroup,
+    mask_type: usvg::MaskType,
+) -> SvgPaintGroup {
+    let Some((source_paths, actual_text)) = svg_effect_paths_and_text(source) else {
+        return SvgPaintGroup::empty();
+    };
+    let Some((mask_paths, _)) = svg_effect_paths_and_text(mask) else {
+        return SvgPaintGroup::empty();
+    };
+    let Some(image) = rasterize_svg_solid_paths_with_mask(&source_paths, &mask_paths, mask_type)
+    else {
+        return SvgPaintGroup::empty();
+    };
+    let image = if actual_text.is_empty() {
+        image
+    } else {
+        image.with_actual_text(Rc::from(actual_text))
+    };
+    SvgPaintGroup {
+        items: vec![SvgPaintItem::RasterImage(Box::new(image))],
+        ..SvgPaintGroup::empty()
+    }
+}
+
+/// Composite a solid retained SVG source against a solid retained mask into
+/// one alpha-bearing PDF image. The source bounds are the observable image
+/// extent, while mask samples outside those bounds are transparent black.
+fn rasterize_svg_solid_paths_with_mask(
+    source_paths: &[RenderedPath],
+    mask_paths: &[RenderedPath],
+    mask_type: usvg::MaskType,
+) -> Option<RenderedImage> {
+    let mut bounds = svg_paths_bounds(source_paths)?;
+    let max_stroke = source_paths
+        .iter()
+        .chain(mask_paths)
+        .map(|path| path.stroke_width.points())
+        .filter(|width| width.is_finite())
+        .fold(0.0_f32, f32::max);
+    let padding = max_stroke * 0.5 + 1.0;
+    bounds = PaintRect::new(
+        PaintPoint::new(bounds.origin.x - padding, bounds.origin.y - padding),
+        PaintSize::new(
+            bounds.size.width + padding * 2.0,
+            bounds.size.height + padding * 2.0,
+        ),
+    );
+    let width = (bounds.size.width * SVG_EFFECT_RASTER_SCALE).ceil() as u64;
+    let height = (bounds.size.height * SVG_EFFECT_RASTER_SCALE).ceil() as u64;
+    if width == 0
+        || height == 0
+        || width > u32::MAX as u64
+        || height > u32::MAX as u64
+        || width.saturating_mul(height) > MAX_SVG_EFFECT_PIXELS
+    {
+        return None;
+    }
+    let mut source = tiny_skia::Pixmap::new(width as u32, height as u32)?;
+    let mut mask = tiny_skia::Pixmap::new(width as u32, height as u32)?;
+    for path in source_paths {
+        rasterize_svg_path(&mut source, path, bounds)?;
+    }
+    for path in mask_paths {
+        rasterize_svg_path(&mut mask, path, bounds)?;
+    }
+    let (source_pixels, source_remainder) = source.data_mut().as_chunks_mut::<4>();
+    let (mask_pixels, mask_remainder) = mask.data().as_chunks::<4>();
+    debug_assert!(source_remainder.is_empty(), "SVG pixels have four channels");
+    debug_assert!(mask_remainder.is_empty(), "SVG pixels have four channels");
+    for (source_pixel, mask_pixel) in source_pixels.iter_mut().zip(mask_pixels) {
+        let alpha = match mask_type {
+            usvg::MaskType::Alpha => mask_pixel[3] as f32 / 255.0,
+            usvg::MaskType::Luminance => {
+                let alpha = mask_pixel[3] as f32 / 255.0;
+                if alpha <= 0.0 {
+                    0.0
+                } else {
+                    let red = mask_pixel[0] as f32 / 255.0 / alpha;
+                    let green = mask_pixel[1] as f32 / 255.0 / alpha;
+                    let blue = mask_pixel[2] as f32 / 255.0 / alpha;
+                    (0.2126 * red + 0.7152 * green + 0.0722 * blue).clamp(0.0, 1.0) * alpha
+                }
+            }
+        };
+        for channel in source_pixel {
+            *channel = (*channel as f32 * alpha).round() as u8;
+        }
+    }
+    let rgba = source.take_demultiplied();
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    let mut alpha = Vec::with_capacity((width * height) as usize);
+    let (pixels, trailing) = rgba.as_chunks::<4>();
+    debug_assert!(trailing.is_empty(), "RGBA pixmap has whole pixels");
+    for &[red, green, blue, opacity] in pixels {
+        rgb.extend_from_slice(&[red, green, blue]);
+        alpha.push(opacity);
+    }
+    Some(RenderedImage::from_paint_rect(
+        bounds,
+        false,
+        width as u32,
+        height as u32,
+        None,
+        true,
+        Rc::from(rgb),
+        Some(Rc::from(alpha)),
+        None,
+    ))
+}
+
+/// Flatten a self-contained effect source only when every item can be
+/// rasterized from the retained scene without losing a non-text resource.
+fn svg_effect_paths_and_text(group: SvgPaintGroup) -> Option<(Vec<RenderedPath>, String)> {
+    if group.opacity != 1.0
+        || group.blend_mode != PaintBlendMode::Normal
+        || group.isolation
+        || group.bounds.is_some()
+    {
+        return None;
+    }
+    let mut paths = Vec::new();
+    let mut actual_text = String::new();
+    for item in group.items {
+        match item {
+            SvgPaintItem::Path(path) => paths.push(*path),
+            SvgPaintItem::OutlinedText(outlined) => {
+                paths.extend(outlined.paths);
+                actual_text.push_str(&outlined.actual_text);
+            }
+            SvgPaintItem::Group(group) | SvgPaintItem::NestedSvg(group) => {
+                let (child_paths, child_text) = svg_effect_paths_and_text(*group)?;
+                paths.extend(child_paths);
+                actual_text.push_str(&child_text);
+            }
+            // Text must have been forced to document-shaped outlines before
+            // effect collection; raster images require their own sampler.
+            SvgPaintItem::Text(_) | SvgPaintItem::RasterImage(_) => return None,
+        }
+    }
+    (!paths.is_empty()).then_some((paths, actual_text))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1799,6 +5471,7 @@ fn render_svg_image(
     image_transform: usvg::Transform,
     viewport: ViewportTransform,
     additional_clips: &[RenderedPathClipPath],
+    font_system: &mut Option<&mut FontSystem>,
 ) -> Option<SvgPaintItem> {
     if !image.is_visible() {
         return None;
@@ -1861,12 +5534,15 @@ fn render_svg_image(
                 true,
                 false,
             );
-            let mut scene = collect_svg_group(
+            let nested_text_typography = HashMap::new();
+            let mut scene = collect_svg_group_with_font_system(
                 tree.root(),
                 local_viewport,
                 &[],
                 usvg::Transform::default(),
                 &SvgFilterTaintCatalog::default(),
+                &nested_text_typography,
+                font_system,
             )
             .transformed(image_to_paint);
             if viewport.clip_viewport {
@@ -2386,7 +6062,11 @@ pub(crate) fn parse_inline_svg_with_presentation_overrides(
     let xml = external_uses.expand_inline_svg(serialize_inline_svg_with_presentation_overrides(
         element, overrides,
     ));
-    parse_svg_bytes_with_filter_taint(xml.as_bytes(), filter_taint_catalog(element, overrides))
+    parse_svg_bytes_with_filter_taint_and_typography(
+        xml.as_bytes(),
+        filter_taint_catalog(element, overrides),
+        overrides.typography(),
+    )
 }
 
 pub(crate) fn parse_svg_bytes(bytes: &[u8]) -> Result<SvgAsset, String> {
@@ -2397,7 +6077,20 @@ fn parse_svg_bytes_with_filter_taint(
     bytes: &[u8],
     filter_taint: SvgFilterTaintCatalog,
 ) -> Result<SvgAsset, String> {
-    parse_svg_bytes_with_optional_image_context_and_filter_taint(bytes, None, filter_taint)
+    parse_svg_bytes_with_filter_taint_and_typography(bytes, filter_taint, HashMap::new())
+}
+
+fn parse_svg_bytes_with_filter_taint_and_typography(
+    bytes: &[u8],
+    filter_taint: SvgFilterTaintCatalog,
+    text_typography: HashMap<SvgTextTypographyKey, SvgTextTypography>,
+) -> Result<SvgAsset, String> {
+    parse_svg_bytes_with_optional_image_context_and_filter_taint(
+        bytes,
+        None,
+        filter_taint,
+        text_typography,
+    )
 }
 
 /// Parse an external SVG image in the color-scheme environment of its
@@ -2410,6 +6103,7 @@ pub(crate) fn parse_svg_bytes_with_image_context(
         bytes,
         Some(image_context),
         SvgFilterTaintCatalog::default(),
+        HashMap::new(),
     )
 }
 
@@ -2417,6 +6111,7 @@ fn parse_svg_bytes_with_optional_image_context_and_filter_taint(
     bytes: &[u8],
     image_context: Option<SvgImageContext>,
     filter_taint: SvgFilterTaintCatalog,
+    text_typography: HashMap<SvgTextTypographyKey, SvgTextTypography>,
 ) -> Result<SvgAsset, String> {
     let normalized_source = image_context
         .and_then(|context| normalize_svg_image_stylesheet(bytes, context))
@@ -2438,6 +6133,7 @@ fn parse_svg_bytes_with_optional_image_context_and_filter_taint(
     let view_fragments = svg_view_fragments(&normalized_source);
     Ok(SvgAsset {
         tree,
+        text_typography,
         filter_taint,
         viewport_background,
         intrinsic_size: LayoutSize::new(
@@ -3252,6 +6948,104 @@ fn svg_user_length(value: &str) -> Option<f32> {
     value.parse::<f32>().ok()
 }
 
+/// Serialize a cascaded CSS `text-shadow` list into SVG user units.
+///
+/// Inline SVG is parsed as an isolated normalized resource, while its host
+/// HTML stylesheet is evaluated by Quire before that boundary. CSS pixels are
+/// stored as points in `ComputedStyle`; SVG presentation values use CSS-pixel
+/// user units, so this is the one explicit conversion between those systems.
+pub(crate) fn svg_text_shadow_presentation_attribute(style: &ComputedStyle) -> String {
+    style
+        .text_shadow
+        .iter()
+        .map(|shadow| {
+            let color = shadow.color.resolve(style.color);
+            let srgb = color.to_rgb_space(css::RgbColorSpace::Srgb);
+            let [red, green, blue] = srgb.components();
+            let rgba = format!(
+                "rgba({} {} {} / {})",
+                red * 255.0,
+                green * 255.0,
+                blue * 255.0,
+                srgb.alpha()
+            );
+            let unit = |length: &css::ComputedLengthPercentage| {
+                format!("{}px", length.length_points() / css::CSS_PX_TO_PT)
+            };
+            let mut value = format!(
+                "{} {} {} {} {}",
+                unit(&shadow.offset_x),
+                unit(&shadow.offset_y),
+                unit(&shadow.blur_radius),
+                unit(&shadow.spread),
+                rgba,
+            );
+            if shadow.inset {
+                value.push_str(" inset");
+            }
+            value
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Serialize a computed CSS `font-family` list for the retained SVG parser.
+/// The document `FontSystem` still performs resolution; this only transfers
+/// the cascade result across the inline-SVG serialization boundary.
+pub(crate) fn svg_font_family_presentation_attribute(family: &FontFamily) -> String {
+    fn one(family: &FontFamily) -> String {
+        match family {
+            FontFamily::SansSerif => "sans-serif".to_owned(),
+            FontFamily::Serif => "serif".to_owned(),
+            FontFamily::Monospace => "monospace".to_owned(),
+            FontFamily::SystemUi => "system-ui".to_owned(),
+            FontFamily::UiSerif => "ui-serif".to_owned(),
+            FontFamily::UiSansSerif => "ui-sans-serif".to_owned(),
+            FontFamily::UiMonospace => "ui-monospace".to_owned(),
+            FontFamily::UiRounded => "ui-rounded".to_owned(),
+            FontFamily::Named(name) => format!("\"{}\"", name.as_str().replace('"', "\\\"")),
+            FontFamily::List(_) => unreachable!("font-family list is flattened below"),
+        }
+    }
+    match family {
+        FontFamily::List(families) => families.iter().map(one).collect::<Vec<_>>().join(", "),
+        family => one(family),
+    }
+}
+
+/// Serialize computed OpenType variation coordinates for the standalone SVG
+/// normalization payload. Values remain CSS numbers; the parser retains them
+/// as axis/value pairs and `svg_text_style` passes their exact IEEE-754 bits
+/// into the shared document-font request.
+pub(crate) fn svg_font_variation_settings_presentation_attribute(
+    settings: &FontVariationSettings,
+) -> String {
+    if settings.0.is_empty() {
+        return "normal".to_owned();
+    }
+    settings
+        .0
+        .iter()
+        .filter_map(|setting| {
+            let value = f32::from_bits(setting.value);
+            value.is_finite().then(|| {
+                let tag = setting
+                    .tag
+                    .iter()
+                    .map(|byte| match byte {
+                        b'\\' => "\\\\".to_owned(),
+                        b'\"' => "\\\"".to_owned(),
+                        0x20..=0x7e => char::from(*byte).to_string(),
+                        byte => format!("\\{:x} ", byte),
+                    })
+                    .collect::<String>();
+                format!("\"{tag}\" {value}")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn serialize_inline_svg_with_presentation_overrides(
     element: &Element,
     overrides: &SvgPresentationOverrides,
@@ -3341,6 +7135,7 @@ fn serialize_element(
             .map(|transform| svg_presentation_transform_with_origin(element, transform)),
     };
     let mut emitted_transform = false;
+    let mut emitted_style = false;
     for (name, value) in attrs {
         if name == "xmlns" || name.starts_with("xmlns:") {
             continue;
@@ -3367,22 +7162,55 @@ fn serialize_element(
         if name == "style"
             && (transform_is_owned
                 || override_values.is_some_and(|values| {
-                    values.flood_color.is_some() || values.lighting_color.is_some()
+                    values.flood_color.is_some()
+                        || values.lighting_color.is_some()
+                        || [
+                            "fill",
+                            "stroke",
+                            "stroke-width",
+                            "text-shadow",
+                            "font-family",
+                            "font-size",
+                            "font-weight",
+                            "font-style",
+                            "font-stretch",
+                            "font-variation-settings",
+                            "font-kerning",
+                            "writing-mode",
+                            "text-orientation",
+                            "direction",
+                            "unicode-bidi",
+                        ]
+                        .into_iter()
+                        .any(|name| values.owns_style_property(name))
                 }))
         {
-            if let Some(style) = sanitize_inline_svg_presentation_style(
-                value,
-                transform_is_owned,
-                override_values.is_some_and(|values| values.flood_color.is_some()),
-                override_values.is_some_and(|values| values.lighting_color.is_some()),
-            ) {
+            if let Some(style) =
+                sanitize_inline_svg_presentation_style(value, transform_is_owned, override_values)
+            {
                 push_attribute(output, name, &style);
+                emitted_style = true;
             }
             continue;
         }
         if matches!(
             name,
-            "fill" | "stroke" | "stroke-width" | "flood-color" | "lighting-color"
+            "fill"
+                | "stroke"
+                | "stroke-width"
+                | "text-shadow"
+                | "font-family"
+                | "font-size"
+                | "font-weight"
+                | "font-style"
+                | "font-stretch"
+                | "font-variation-settings"
+                | "writing-mode"
+                | "text-orientation"
+                | "direction"
+                | "unicode-bidi"
+                | "flood-color"
+                | "lighting-color"
         ) && ((name == "fill"
             && override_values
                 .and_then(|values| values.fill.as_ref())
@@ -3394,6 +7222,58 @@ fn serialize_element(
             || (name == "stroke-width"
                 && override_values
                     .and_then(|values| values.stroke_width.as_ref())
+                    .is_some())
+            || (name == "text-shadow"
+                && override_values
+                    .and_then(|values| values.text_shadow.as_ref())
+                    .is_some())
+            || (name == "font-family"
+                && override_values
+                    .and_then(|values| values.font_family.as_ref())
+                    .is_some())
+            || (name == "font-size"
+                && override_values
+                    .and_then(|values| values.font_size.as_ref())
+                    .is_some())
+            || (name == "font-weight"
+                && override_values
+                    .and_then(|values| values.font_weight.as_ref())
+                    .is_some())
+            || (name == "font-style"
+                && override_values
+                    .and_then(|values| values.font_style.as_ref())
+                    .is_some())
+            || (name == "font-stretch"
+                && override_values
+                    .and_then(|values| values.font_stretch.as_ref())
+                    .is_some())
+            || (name == "font-variation-settings"
+                && override_values
+                    .and_then(|values| values.font_variation_settings.as_ref())
+                    .is_some())
+            || (name == "letter-spacing"
+                && override_values
+                    .and_then(|values| values.letter_spacing.as_ref())
+                    .is_some())
+            || (name == "word-spacing"
+                && override_values
+                    .and_then(|values| values.word_spacing.as_ref())
+                    .is_some())
+            || (name == "writing-mode"
+                && override_values
+                    .and_then(|values| values.writing_mode.as_ref())
+                    .is_some())
+            || (name == "text-orientation"
+                && override_values
+                    .and_then(|values| values.text_orientation.as_ref())
+                    .is_some())
+            || (name == "direction"
+                && override_values
+                    .and_then(|values| values.direction.as_ref())
+                    .is_some())
+            || (name == "unicode-bidi"
+                && override_values
+                    .and_then(|values| values.unicode_bidi.as_ref())
                     .is_some())
             || (name == "flood-color"
                 && override_values
@@ -3424,11 +7304,20 @@ fn serialize_element(
             emitted_transform = true;
             push_attribute(output, name, resolved_transform.as_deref().unwrap_or(value));
         } else {
+            if name == "style" {
+                emitted_style = true;
+            }
             push_attribute(output, name, value);
         }
     }
     if !emitted_transform && let Some(transform) = resolved_transform.as_deref() {
         push_attribute(output, "transform", transform);
+    }
+    if !emitted_style
+        && let Some(font_kerning) =
+            override_values.and_then(|values| values.font_kerning.as_deref())
+    {
+        push_attribute(output, "style", &format!("font-kerning: {font_kerning};"));
     }
     for (name, value) in [
         (
@@ -3443,10 +7332,69 @@ fn serialize_element(
             "stroke-width",
             override_values.and_then(|values| values.stroke_width.as_deref()),
         ),
+        (
+            "text-shadow",
+            override_values.and_then(|values| values.text_shadow.as_deref()),
+        ),
+        (
+            "font-family",
+            override_values.and_then(|values| values.font_family.as_deref()),
+        ),
+        (
+            "font-size",
+            override_values.and_then(|values| values.font_size.as_deref()),
+        ),
+        (
+            "font-weight",
+            override_values.and_then(|values| values.font_weight.as_deref()),
+        ),
+        (
+            "font-style",
+            override_values.and_then(|values| values.font_style.as_deref()),
+        ),
+        (
+            "font-stretch",
+            override_values.and_then(|values| values.font_stretch.as_deref()),
+        ),
+        (
+            "font-variation-settings",
+            override_values.and_then(|values| values.font_variation_settings.as_deref()),
+        ),
+        (
+            "letter-spacing",
+            override_values.and_then(|values| values.letter_spacing.as_deref()),
+        ),
+        (
+            "word-spacing",
+            override_values.and_then(|values| values.word_spacing.as_deref()),
+        ),
+        (
+            "writing-mode",
+            override_values.and_then(|values| values.writing_mode.as_deref()),
+        ),
+        (
+            "text-orientation",
+            override_values.and_then(|values| values.text_orientation.as_deref()),
+        ),
+        (
+            "direction",
+            override_values.and_then(|values| values.direction.as_deref()),
+        ),
+        (
+            "unicode-bidi",
+            override_values.and_then(|values| values.unicode_bidi.as_deref()),
+        ),
     ] {
         if let Some(value) = value {
             push_attribute(output, name, value);
         }
+    }
+    if let Some(key) = override_values.and_then(|values| values.text_typography_key) {
+        push_attribute(
+            output,
+            SVG_TEXT_TYPOGRAPHY_KEY_ATTRIBUTE,
+            &key.as_attribute_value(),
+        );
     }
     for (name, value) in [
         (
@@ -3536,11 +7484,10 @@ fn svg_element_transform_attribute(transform: SvgElementTransform) -> String {
 fn sanitize_inline_svg_presentation_style(
     value: &str,
     remove_transform: bool,
-    remove_flood_color: bool,
-    remove_lighting_color: bool,
+    overrides: Option<&SvgPresentationOverride>,
 ) -> Option<String> {
     let declarations = css::parse_declarations(value);
-    let style = declarations
+    let mut style = declarations
         .iter()
         .filter(|(name, _)| {
             !((remove_transform
@@ -3553,11 +7500,15 @@ fn sanitize_inline_svg_presentation_style(
                         | "rotate"
                         | "scale"
                 ))
-                || (remove_flood_color && name == "flood-color")
-                || (remove_lighting_color && name == "lighting-color"))
+                || overrides.is_some_and(|overrides| overrides.owns_style_property(name)))
         })
         .map(|(name, value)| format!("{name}: {value};"))
         .collect::<String>();
+    if let Some(font_kerning) = overrides.and_then(|overrides| overrides.font_kerning.as_deref()) {
+        style.push_str("font-kerning: ");
+        style.push_str(font_kerning);
+        style.push(';');
+    }
     (!style.is_empty()).then_some(style)
 }
 
@@ -3608,6 +7559,8 @@ pub(crate) type SharedSvgAsset = Rc<SvgAsset>;
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+
     use super::*;
     use crate::dom::Node;
     use crate::units::content_box_size_pt;
@@ -4612,16 +8565,46 @@ mod tests {
     }
 
     #[test]
-    fn omits_masked_svg_subtrees_instead_of_painting_unmasked_children() {
+    fn solid_svg_masks_rasterize_the_retained_subtree_instead_of_painting_it_unmasked() {
         let element = svg_element(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><mask id="fade"><rect width="20" height="10" fill="white"/></mask><g mask="url(#fade)"><rect width="20" height="10" fill="red"/></g></svg>"#,
         );
         let asset = parse_inline_svg(&element).unwrap();
 
+        let mut fonts = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 15.0, 7.5),
+            true,
+            &mut fonts,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "scene={scene:#?}");
+        assert!(images[0].actual_text.is_none());
+    }
+
+    #[test]
+    fn solid_inline_svg_masks_outline_shared_text_once_with_actual_text() {
+        let element = svg_element(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="30"><mask id="ink" maskUnits="userSpaceOnUse"><rect width="80" height="30" fill="white"/></mask><text mask="url(#ink)" x="4" y="20" font-size="16">Masked text</text></svg>"#,
+        );
+        let asset = parse_inline_svg(&element).unwrap();
+        let mut fonts = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 60.0, 22.5),
+            true,
+            &mut fonts,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "scene={scene:#?}");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Masked text"));
         assert!(
-            asset
-                .paint_paths(paint_rect(0.0, 0.0, 15.0, 7.5))
-                .is_empty()
+            !scene
+                .items
+                .iter()
+                .any(|item| matches!(item, SvgPaintItem::Text(_))),
+            "masked text must not leave an invisible native-PDF duplicate"
         );
     }
 
@@ -4684,5 +8667,1375 @@ mod tests {
         let first = cache.inline_svg_asset(&element).unwrap();
         let second = cache.inline_svg_asset(&element).unwrap();
         assert!(Rc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn inline_svg_text_uses_the_document_font_system() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="10" y="15" font-family="sans-serif" font-size="12" fill="red">Shared font</text></svg>"#,
+        )
+        .expect("test SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 15.0),
+            true,
+            &mut font_system,
+        );
+        let [SvgPaintItem::Text(line)] = scene.items.as_slice() else {
+            panic!("expected one native SVG text item, got {:?}", scene.items);
+        };
+        assert_eq!(line.text, "Shared font");
+        assert!(line.runs.iter().all(|run| run.font_id.is_some()));
+        assert!(line.runs.iter().any(|run| run.glyphs.is_some()));
+    }
+
+    #[test]
+    fn inline_svg_text_keeps_normal_glyphs_upright_in_a_y_down_viewport() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="10" y="20" font-size="12">Upright</text></svg>"#,
+        )
+        .expect("test SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let line = first_svg_text(&scene).expect("solid SVG text stays native");
+        let [a, b, c, d] = line.runs[0].text_matrix.pdf_components();
+
+        assert_eq!([a, b, c, d], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(line.origin(), PaintPoint::new(7.5, 7.5));
+    }
+
+    #[test]
+    fn inline_svg_text_converts_positive_dy_to_a_downward_glyph_offset() {
+        let plain = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="10" y="20" font-size="12">A</text></svg>"#,
+        )
+        .unwrap();
+        let shifted = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="10" y="20" dy="4" font-size="12">A</text></svg>"#,
+        )
+        .unwrap();
+        let destination = paint_rect(0.0, 0.0, 75.0, 22.5);
+        let mut plain_fonts = FontSystem::new();
+        let mut shifted_fonts = FontSystem::new();
+        let plain = plain.paint_inline_group_with_font_system(destination, true, &mut plain_fonts);
+        let shifted =
+            shifted.paint_inline_group_with_font_system(destination, true, &mut shifted_fonts);
+        let plain = first_svg_text(&plain).unwrap();
+        let shifted = first_svg_text(&shifted).unwrap();
+
+        let plain_glyph = plain.runs[0].glyphs.as_ref().unwrap()[0].y_offset;
+        let shifted_glyph = shifted.runs[0].glyphs.as_ref().unwrap()[0].y_offset;
+        assert!(shifted_glyph < plain_glyph - 2.5);
+        assert_eq!(shifted.runs[0].text_matrix.pdf_components()[3], 1.0);
+    }
+
+    #[test]
+    fn inline_svg_text_preserves_an_authored_y_reflection() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><g transform="scale(1 -1)"><text x="10" y="-20" font-size="12">Reflected</text></g></svg>"#,
+        )
+        .expect("test SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let line = first_svg_text(&scene).expect("solid SVG text stays native");
+
+        assert_eq!(
+            line.runs[0].text_matrix.pdf_components(),
+            [1.0, 0.0, 0.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn inline_svg_text_maps_view_box_translation_and_non_uniform_scale() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="10 20 100 50" preserveAspectRatio="none"><text x="10" y="20" font-size="12">Mapped</text></svg>"#,
+        )
+        .expect("test SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 150.0, 100.0),
+            true,
+            &mut font_system,
+        );
+        let line = first_svg_text(&scene).expect("solid SVG text stays native");
+        let [a, b, c, d] = line.runs[0].text_matrix.pdf_components();
+
+        assert!(line.origin().x.abs() < 0.001);
+        assert!((line.origin().y - 100.0).abs() < 0.001);
+        assert!(a > 0.0 && d > 0.0 && a < d);
+        assert!(b.abs() < 0.001 && c.abs() < 0.001);
+    }
+
+    /// The SVG adapter and HTML computed-style adapter submit equivalent
+    /// requests to one document font registry. Native SVG PDF text therefore
+    /// reuses HTML's selected variation instance, glyph mapping, subset, and
+    /// ToUnicode source (the PDF-level native-text assertion lives in the
+    /// smoke test alongside this unit-level identity check).
+    #[test]
+    fn equivalent_html_and_svg_requests_share_document_font_and_glyph_mapping() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="4" y="16" font-family="serif" font-size="16" letter-spacing="2">Shared glyph mapping</text></svg>"#,
+        )
+        .expect("test SVG parses");
+        let (source, svg_style) = {
+            let usvg::Node::Text(text) = &asset.tree.root().children()[0] else {
+                panic!("parser retains text");
+            };
+            let chunk = &text.chunks()[0];
+            let span = &chunk.spans()[0];
+            (
+                chunk.text()[span.start()..span.end()].to_owned(),
+                svg_text_style(
+                    span,
+                    text.writing_mode(),
+                    text.text_orientation(),
+                    text.direction(),
+                    text.unicode_bidi(),
+                    0.75,
+                ),
+            )
+        };
+        let mut font_system = FontSystem::new();
+        let html_shaped = font_system
+            .shape_text_request(TextShapingRequest::from_html_computed_style(
+                &source,
+                &svg_style,
+                svg_style.line_height,
+            ))
+            .expect("equivalent HTML request shapes");
+        let html_runs = html_shaped.rendered_runs();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 15.0),
+            true,
+            &mut font_system,
+        );
+        let svg_line = first_svg_text(&scene).expect("solid SVG text stays native");
+
+        assert_eq!(html_runs.len(), svg_line.runs.len());
+        for (html, svg) in html_runs.iter().zip(&svg_line.runs) {
+            assert_eq!(html.font_id, svg.font_id);
+            assert_eq!(html.glyphs, svg.glyphs);
+            assert_eq!(html.glyph_source_ranges, svg.glyph_source_ranges);
+        }
+    }
+
+    #[test]
+    fn retained_svg_text_does_not_require_usvg_font_lookup() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="10" y="15" font-family="quire-font-that-does-not-exist" font-size="12">Retained text</text></svg>"#,
+        )
+        .expect("the parser-only usvg fork retains unresolved font families");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 15.0),
+            true,
+            &mut font_system,
+        );
+        assert_eq!(first_svg_text(&scene).unwrap().text, "Retained text");
+    }
+
+    #[test]
+    fn inline_svg_text_preserves_its_affine_transform_in_the_pdf_text_matrix() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g transform="translate(20 30) rotate(30) skewX(10)"><text x="4" y="20" font-size="12">Affine</text></g></svg>"#,
+        )
+        .expect("test SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 75.0),
+            true,
+            &mut font_system,
+        );
+        let line = first_svg_text(&scene).expect("one transformed text item");
+        assert!(line.runs.iter().all(|run| !run.text_matrix.is_identity()));
+        let [a, b, c, d] = line.runs[0].text_matrix.pdf_components();
+        assert!([a, b, c, d].into_iter().all(f32::is_finite));
+        assert!(b.abs() > 0.01 || c.abs() > 0.01);
+    }
+
+    #[test]
+    fn inline_svg_text_anchor_offsets_the_text_space_pen() {
+        let start = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="50" y="15" text-anchor="start" font-size="12">Anchor</text></svg>"#,
+        )
+        .unwrap();
+        let middle = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="50" y="15" text-anchor="middle" font-size="12">Anchor</text></svg>"#,
+        )
+        .unwrap();
+        let mut start_fonts = FontSystem::new();
+        let mut middle_fonts = FontSystem::new();
+        let destination = paint_rect(0.0, 0.0, 75.0, 15.0);
+        let start_scene =
+            start.paint_inline_group_with_font_system(destination, true, &mut start_fonts);
+        let middle_scene =
+            middle.paint_inline_group_with_font_system(destination, true, &mut middle_fonts);
+        let start = first_svg_text(&start_scene).unwrap();
+        let middle = first_svg_text(&middle_scene).unwrap();
+        assert_eq!(start.origin(), middle.origin());
+        assert!(middle.runs[0].x_offset < start.runs[0].x_offset);
+    }
+
+    #[test]
+    fn inline_svg_text_applies_character_indexed_dx_and_dy_without_reshaping() {
+        let plain = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="0" y="15" font-size="12">AB</text></svg>"#,
+        )
+        .unwrap();
+        let positioned = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="0" y="15" dx="5 3" dy="2 4" font-size="12">AB</text></svg>"#,
+        )
+        .unwrap();
+        let destination = paint_rect(0.0, 0.0, 75.0, 15.0);
+        let mut plain_fonts = FontSystem::new();
+        let mut positioned_fonts = FontSystem::new();
+        let plain_scene =
+            plain.paint_inline_group_with_font_system(destination, true, &mut plain_fonts);
+        let positioned_scene = positioned.paint_inline_group_with_font_system(
+            destination,
+            true,
+            &mut positioned_fonts,
+        );
+        let plain = first_svg_text(&plain_scene).unwrap();
+        let positioned = first_svg_text(&positioned_scene).unwrap();
+        let plain_glyphs = plain.runs[0].glyphs.as_ref().unwrap();
+        let positioned_glyphs = positioned.runs[0].glyphs.as_ref().unwrap();
+        assert_eq!(plain_glyphs.len(), positioned_glyphs.len());
+        assert!(positioned_glyphs[0].x_offset > plain_glyphs[0].x_offset);
+        assert!(positioned_glyphs[0].y_offset < plain_glyphs[0].y_offset);
+        assert!(positioned_glyphs[1].x_offset > plain_glyphs[1].x_offset);
+        assert!(positioned_glyphs[1].y_offset < plain_glyphs[1].y_offset);
+    }
+
+    #[test]
+    fn inline_svg_text_uses_absolute_character_x_and_y_chunks() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="4 40" y="20 8" font-size="16">AB</text></svg>"#,
+        )
+        .unwrap();
+        let mut fonts = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut fonts,
+        );
+        let lines = scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SvgPaintItem::Text(line) => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert!(lines[1].origin().x > lines[0].origin().x + 20.0);
+        assert!(lines[1].origin().y > lines[0].origin().y + 5.0);
+    }
+
+    #[test]
+    fn inline_svg_text_uses_document_baselines_and_inherited_baseline_shift() {
+        let plain = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="4" y="20" font-size="16">Base</text></svg>"#,
+        )
+        .unwrap();
+        let shifted = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="4" y="20" font-size="16" dominant-baseline="hanging" baseline-shift="2"><tspan baseline-shift="3">Base</tspan></text></svg>"#,
+        )
+        .unwrap();
+        let destination = paint_rect(0.0, 0.0, 75.0, 22.5);
+        let mut plain_fonts = FontSystem::new();
+        let mut shifted_fonts = FontSystem::new();
+        let plain_scene =
+            plain.paint_inline_group_with_font_system(destination, true, &mut plain_fonts);
+        let shifted_scene =
+            shifted.paint_inline_group_with_font_system(destination, true, &mut shifted_fonts);
+        let plain = first_svg_text(&plain_scene).unwrap();
+        let shifted = first_svg_text(&shifted_scene).unwrap();
+
+        // Positive SVG baseline-shift raises text, while hanging changes the
+        // positioning baseline via the selected document-font baseline set.
+        assert!(shifted.runs[0].y_offset < plain.runs[0].y_offset - 3.0);
+        assert_eq!(plain.runs[0].font_id, shifted.runs[0].font_id);
+    }
+
+    #[test]
+    fn inline_svg_vertical_text_uses_quire_vertical_glyph_positioning() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="80"><text writing-mode="vertical-rl" x="10" y="5" font-size="16">AB</text></svg>"#,
+        )
+        .expect("vertical SVG parses");
+        let usvg::Node::Text(text) = &asset.tree.root().children()[0] else {
+            panic!("parser retains vertical SVG text");
+        };
+        assert_eq!(text.writing_mode(), usvg::WritingMode::VerticalRl);
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 30.0, 60.0),
+            true,
+            &mut font_system,
+        );
+        let line = first_svg_text(&scene).expect("vertical SVG remains native PDF text");
+        assert!(
+            line.runs.iter().any(|run| !run.text_matrix.is_identity()),
+            "sideways vertical glyphs carry Quire's vertical inline axis in their PDF text matrix"
+        );
+    }
+
+    #[test]
+    fn inline_svg_vertical_text_keeps_dx_and_dy_in_svg_user_axes() {
+        let plain = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="80"><text writing-mode="vertical-rl" x="10" y="5" font-size="16">A</text></svg>"#,
+        )
+        .unwrap();
+        let positioned = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="80"><text writing-mode="vertical-rl" x="10" y="5" dx="5" dy="3" font-size="16">A</text></svg>"#,
+        )
+        .unwrap();
+        let destination = paint_rect(0.0, 0.0, 30.0, 60.0);
+        let mut plain_fonts = FontSystem::new();
+        let mut positioned_fonts = FontSystem::new();
+        let plain_scene =
+            plain.paint_inline_group_with_font_system(destination, true, &mut plain_fonts);
+        let positioned_scene = positioned.paint_inline_group_with_font_system(
+            destination,
+            true,
+            &mut positioned_fonts,
+        );
+        let plain = first_svg_text(&plain_scene).expect("vertical SVG remains native PDF text");
+        let positioned =
+            first_svg_text(&positioned_scene).expect("vertical SVG remains native PDF text");
+        let plain_glyph = &plain.runs[0].glyphs.as_ref().unwrap()[0];
+        let positioned_glyph = &positioned.runs[0].glyphs.as_ref().unwrap()[0];
+        let plain_offset = plain.runs[0].text_matrix.transform_local_point(
+            crate::document::paint::text::TextRunPoint::new(
+                plain_glyph.x_offset,
+                plain_glyph.y_offset,
+            ),
+        );
+        let positioned_offset = positioned.runs[0].text_matrix.transform_local_point(
+            crate::document::paint::text::TextRunPoint::new(
+                positioned_glyph.x_offset,
+                positioned_glyph.y_offset,
+            ),
+        );
+
+        // SVG `dx` moves right and `dy` moves down in the source user space,
+        // even though Quire's sideways glyph run has a rotated inline axis.
+        assert!(positioned_offset.x > plain_offset.x + 0.1);
+        assert!(positioned_offset.y < plain_offset.y - 0.1);
+    }
+
+    #[test]
+    fn inline_svg_upright_vertical_text_length_scales_the_vertical_inline_axis() {
+        let plain = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="120"><text writing-mode="vertical-rl" text-orientation="upright" x="10" y="5" font-size="16">AB</text></svg>"#,
+        )
+        .unwrap();
+        let adjusted = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="120"><text writing-mode="vertical-rl" text-orientation="upright" x="10" y="5" font-size="16" textLength="48" lengthAdjust="spacingAndGlyphs">AB</text></svg>"#,
+        )
+        .unwrap();
+        let destination = paint_rect(0.0, 0.0, 30.0, 90.0);
+        let mut plain_fonts = FontSystem::new();
+        let mut adjusted_fonts = FontSystem::new();
+        let plain_scene =
+            plain.paint_inline_group_with_font_system(destination, true, &mut plain_fonts);
+        let adjusted_scene =
+            adjusted.paint_inline_group_with_font_system(destination, true, &mut adjusted_fonts);
+        let plain = first_svg_text(&plain_scene).expect("plain upright vertical SVG is native");
+        let adjusted =
+            first_svg_text(&adjusted_scene).expect("adjusted upright vertical SVG is native");
+        assert_eq!(
+            plain.runs.len(),
+            2,
+            "upright units retain individual origins"
+        );
+        assert_eq!(adjusted.runs.len(), 2);
+
+        let plain_distance = (plain.runs[1].y_offset - plain.runs[0].y_offset).abs();
+        let adjusted_distance = (adjusted.runs[1].y_offset - adjusted.runs[0].y_offset).abs();
+        assert!(
+            adjusted_distance > plain_distance * 1.5,
+            "the second upright unit moves along the vertical SVG inline axis"
+        );
+        let [_, plain_b, _, plain_d] = plain.runs[0].text_matrix.pdf_components();
+        let [_, adjusted_b, _, adjusted_d] = adjusted.runs[0].text_matrix.pdf_components();
+        assert!(
+            adjusted_b.abs() > plain_b.abs() * 1.1 || adjusted_d.abs() > plain_d.abs() * 1.1,
+            "upright glyph geometry scales on the vertical text-space axis"
+        );
+    }
+
+    #[test]
+    fn inline_svg_upright_vertical_text_anchor_moves_along_the_inline_axis() {
+        let start = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="120"><text writing-mode="vertical-rl" text-orientation="upright" x="10" y="60" font-size="16">AB</text></svg>"#,
+        )
+        .unwrap();
+        let middle = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="120"><text writing-mode="vertical-rl" text-orientation="upright" text-anchor="middle" x="10" y="60" font-size="16">AB</text></svg>"#,
+        )
+        .unwrap();
+        let destination = paint_rect(0.0, 0.0, 30.0, 90.0);
+        let mut start_fonts = FontSystem::new();
+        let mut middle_fonts = FontSystem::new();
+        let start = start.paint_inline_group_with_font_system(destination, true, &mut start_fonts);
+        let middle =
+            middle.paint_inline_group_with_font_system(destination, true, &mut middle_fonts);
+        let start = first_svg_text(&start).expect("start-aligned vertical SVG is native");
+        let middle = first_svg_text(&middle).expect("middle-aligned vertical SVG is native");
+        assert!(
+            middle.runs[0].y_offset > start.runs[0].y_offset + 0.1,
+            "vertical text-anchor moves the text origin upward along SVG's inline axis"
+        );
+        assert!(
+            (middle.runs[0].x_offset - start.runs[0].x_offset).abs() < 0.1,
+            "vertical text-anchor does not become a horizontal translation"
+        );
+    }
+
+    #[test]
+    fn parser_retains_vertical_lr_distinct_from_vertical_rl() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="80"><text writing-mode="vertical-lr" x="10" y="5" font-size="16">A</text></svg>"#,
+        )
+        .expect("vertical SVG parses");
+        let usvg::Node::Text(text) = &asset.tree.root().children()[0] else {
+            panic!("parser retains vertical SVG text");
+        };
+        assert_eq!(text.writing_mode(), usvg::WritingMode::VerticalLr);
+    }
+
+    #[test]
+    fn parser_retains_sideways_writing_modes_for_shared_text_layout() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="80"><text writing-mode="sideways-lr" x="10" y="5" font-size="16">A</text></svg>"#,
+        )
+        .expect("sideways SVG parses");
+        let usvg::Node::Text(text) = &asset.tree.root().children()[0] else {
+            panic!("parser retains sideways SVG text");
+        };
+        assert_eq!(text.writing_mode(), usvg::WritingMode::SidewaysLr);
+        let style = svg_text_style(
+            &text.chunks()[0].spans()[0],
+            text.writing_mode(),
+            text.text_orientation(),
+            text.direction(),
+            text.unicode_bidi(),
+            0.75,
+        );
+        assert_eq!(style.writing_mode, css::WritingMode::SidewaysLr);
+
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 30.0, 60.0),
+            true,
+            &mut font_system,
+        );
+        assert!(
+            first_svg_text(&scene).is_some(),
+            "sideways SVG uses the shared native-PDF text route when its paint is representable"
+        );
+    }
+
+    #[test]
+    fn parser_retains_text_orientation_for_shared_vertical_shaping() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="80"><text writing-mode="vertical-rl" text-orientation="upright" x="10" y="5" font-size="16">A</text></svg>"#,
+        )
+        .expect("vertical SVG parses");
+        let usvg::Node::Text(text) = &asset.tree.root().children()[0] else {
+            panic!("parser retains vertical SVG text");
+        };
+        assert_eq!(text.text_orientation(), usvg::TextOrientation::Upright);
+
+        let span = &text.chunks()[0].spans()[0];
+        let style = svg_text_style(
+            span,
+            text.writing_mode(),
+            text.text_orientation(),
+            text.direction(),
+            text.unicode_bidi(),
+            0.75,
+        );
+        assert_eq!(style.text_orientation, css::TextOrientation::Upright);
+    }
+
+    #[test]
+    fn parser_cascades_text_orientation_from_svg_style() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="80"><g style="text-orientation: sideways"><text writing-mode="vertical-rl" x="10" y="5" font-size="16">A</text></g></svg>"#,
+        )
+        .expect("styled vertical SVG parses");
+        let usvg::Node::Group(group) = &asset.tree.root().children()[0] else {
+            panic!("parser retains SVG group");
+        };
+        let usvg::Node::Text(text) = &group.children()[0] else {
+            panic!("parser retains styled vertical SVG text");
+        };
+        assert_eq!(text.text_orientation(), usvg::TextOrientation::Sideways);
+    }
+
+    #[test]
+    fn inline_svg_text_shadow_rasterizes_shaped_outlines_without_duplicate_text() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="4" y="20" font-size="16" style="text-shadow: 0 0 4px green" fill="darkgreen">Shadow</text></svg>"#,
+        )
+        .unwrap();
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let native_text = scene
+            .items
+            .iter()
+            .filter(|item| matches!(item, SvgPaintItem::Text(_)))
+            .count();
+        let shadow_images = scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SvgPaintItem::RasterImage(image) => Some(image),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(native_text, 1, "only source SVG text is selectable");
+        assert_eq!(
+            shadow_images.len(),
+            1,
+            "blur uses one bounded effect surface"
+        );
+        assert!(
+            shadow_images[0].actual_text.is_none(),
+            "the decorative blur must not introduce semantic duplicate text"
+        );
+    }
+
+    #[test]
+    fn filtered_svg_text_uses_one_actual_text_effect_image() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="blur" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feGaussianBlur stdDeviation="2"/></filter></defs><text filter="url(#blur)" x="4" y="20" font-size="16" fill="darkgreen">Filtered</text></svg>"#,
+        )
+        .expect("filtered SVG parses");
+        fn has_raster_filter(group: &usvg::Group) -> bool {
+            svg_raster_filter_plan(group.filters()).is_some()
+                || group.children().iter().any(|node| match node {
+                    usvg::Node::Group(group) => has_raster_filter(group),
+                    _ => false,
+                })
+        }
+        assert!(
+            has_raster_filter(asset.tree.root()),
+            "{:#?}",
+            asset.tree.root()
+        );
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        assert!(
+            !scene
+                .items
+                .iter()
+                .any(|item| matches!(item, SvgPaintItem::Text(_))),
+            "a filtered subtree must not also emit unfiltered native text"
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one source-graphic filter image");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Filtered"));
+    }
+
+    #[test]
+    fn offset_filtered_svg_text_uses_the_same_actual_text_effect_image() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="offset" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feOffset dx="8" dy="3"/></filter></defs><text filter="url(#offset)" x="4" y="20" font-size="16" fill="darkgreen">Offset</text></svg>"#,
+        )
+        .expect("filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one source-graphic filter image");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Offset"));
+    }
+
+    #[test]
+    fn color_matrix_filtered_svg_text_uses_the_same_actual_text_effect_image() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="matrix" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feColorMatrix type="saturate" values="0"/></filter></defs><text filter="url(#matrix)" x="4" y="20" font-size="16" fill="darkgreen">Matrix</text></svg>"#,
+        )
+        .expect("filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one source-graphic filter image");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Matrix"));
+    }
+
+    #[test]
+    fn svg_color_matrix_unpremultiplies_and_repremultiplies_alpha() {
+        let mut pixel = [64, 32, 16, 128];
+        apply_svg_color_matrix(
+            &mut pixel,
+            [
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+            ],
+            false,
+        );
+        assert_eq!(pixel, [128, 0, 0, 128]);
+    }
+
+    #[test]
+    fn component_transfer_filtered_svg_text_uses_the_same_actual_text_effect_image() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="transfer" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feComponentTransfer><feFuncR type="linear" slope="0" intercept="1"/><feFuncG type="table" tableValues="0 1"/><feFuncB type="discrete" tableValues="0 1"/></feComponentTransfer></filter></defs><text filter="url(#transfer)" x="4" y="20" font-size="16" fill="darkgreen">Transfer</text></svg>"#,
+        )
+        .expect("filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one source-graphic filter image");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Transfer"));
+    }
+
+    #[test]
+    fn linear_color_filter_chain_reuses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="chain" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feColorMatrix result="gray" type="saturate" values="0"/><feComponentTransfer in="gray"><feFuncR type="linear" slope="0" intercept="1"/></feComponentTransfer></filter></defs><text filter="url(#chain)" x="4" y="20" font-size="16" fill="darkgreen">Chained</text></svg>"#,
+        )
+        .expect("linear filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        assert!(
+            !scene
+                .items
+                .iter()
+                .any(|item| matches!(item, SvgPaintItem::Text(_))),
+            "a filtered chain owns the text as one semantic image"
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one bounded surface for a linear chain");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Chained"));
+    }
+
+    #[test]
+    fn linear_blur_and_color_filter_chain_reuses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="chain" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feGaussianBlur result="soft" stdDeviation="2"/><feColorMatrix in="soft" type="saturate" values="0"/></filter></defs><text filter="url(#chain)" x="4" y="20" font-size="16" fill="darkgreen">Blurred chain</text></svg>"#,
+        )
+        .expect("linear blur and color filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one bounded surface for a linear chain");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Blurred chain"));
+    }
+
+    #[test]
+    fn named_blur_composited_with_source_graphic_uses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="30"><defs><filter id="composite" filterUnits="userSpaceOnUse" x="0" y="0" width="120" height="30"><feGaussianBlur stdDeviation="1" result="blur"/><feComposite in="blur" in2="SourceGraphic" operator="over"/></filter></defs><text filter="url(#composite)" x="4" y="20" font-size="16" fill="darkgreen">Binary graph</text></svg>"#,
+        )
+        .expect("named composite SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 90.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].actual_text.as_deref(), Some("Binary graph"));
+    }
+
+    #[test]
+    fn named_blur_composited_with_source_alpha_uses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="30"><defs><filter id="composite" filterUnits="userSpaceOnUse" x="0" y="0" width="120" height="30"><feGaussianBlur stdDeviation="1" result="blur"/><feComposite in="blur" in2="SourceAlpha" operator="in"/></filter></defs><text filter="url(#composite)" x="4" y="20" font-size="16" fill="darkgreen">Alpha graph</text></svg>"#,
+        )
+        .expect("named source-alpha composite SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 90.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].actual_text.as_deref(), Some("Alpha graph"));
+    }
+
+    #[test]
+    fn source_graphic_composited_over_a_named_blur_uses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="30"><defs><filter id="composite" filterUnits="userSpaceOnUse" x="0" y="0" width="120" height="30"><feGaussianBlur stdDeviation="1" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter></defs><text filter="url(#composite)" x="4" y="20" font-size="16" fill="darkgreen">Reverse graph</text></svg>"#,
+        )
+        .expect("reverse named composite SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 90.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].actual_text.as_deref(), Some("Reverse graph"));
+    }
+
+    #[test]
+    fn linear_offset_and_color_filter_chain_reuses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="chain" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feOffset result="moved" dx="5" dy="2"/><feColorMatrix in="moved" type="saturate" values="0"/></filter></defs><text filter="url(#chain)" x="4" y="20" font-size="16" fill="darkgreen">Offset chain</text></svg>"#,
+        )
+        .expect("linear offset and color filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one bounded surface for a linear chain");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Offset chain"));
+    }
+
+    #[test]
+    fn linear_morphology_and_color_filter_chain_reuses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="chain" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feMorphology result="grown" operator="dilate" radius="1"/><feColorMatrix in="grown" type="saturate" values="0"/></filter></defs><text filter="url(#chain)" x="4" y="20" font-size="16" fill="darkgreen">Morphology chain</text></svg>"#,
+        )
+        .expect("linear morphology and color filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one bounded surface for a linear chain");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Morphology chain"));
+    }
+
+    #[test]
+    fn linear_convolution_and_color_filter_chain_reuses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="chain" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feConvolveMatrix order="1" kernelMatrix="1" preserveAlpha="true" result="sharp"/><feColorMatrix in="sharp" type="saturate" values="0"/></filter></defs><text filter="url(#chain)" x="4" y="20" font-size="16" fill="darkgreen">Convolution chain</text></svg>"#,
+        )
+        .expect("linear convolution and color filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one bounded surface for a linear chain");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Convolution chain"));
+    }
+
+    #[test]
+    fn drop_shadow_filtered_svg_text_reuses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="shadow" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feDropShadow dx="2" dy="1" stdDeviation="1" flood-color="red"/></filter></defs><text filter="url(#shadow)" x="4" y="20" font-size="16" fill="darkgreen">Filter shadow</text></svg>"#,
+        )
+        .expect("drop shadow filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one bounded surface for feDropShadow");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Filter shadow"));
+    }
+
+    #[test]
+    fn canonical_blur_flood_composite_merge_shadow_reuses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="30"><defs><filter id="shadow" filterUnits="userSpaceOnUse" x="0" y="0" width="120" height="30"><feGaussianBlur in="SourceGraphic" stdDeviation="1" result="blur"/><feOffset in="blur" dx="2" dy="1" result="offset"/><feFlood flood-color="red" result="flood"/><feComposite in="flood" in2="offset" operator="in" result="shadow"/><feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><text filter="url(#shadow)" x="4" y="20" font-size="16" fill="darkgreen">Merged shadow</text></svg>"#,
+        )
+        .expect("canonical merged shadow SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 90.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one bounded source surface for the graph");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Merged shadow"));
+    }
+
+    #[test]
+    fn svg_drop_shadow_composites_source_over_its_offset_alpha_shadow() {
+        let mut pixels = [255, 0, 0, 255, 0, 0, 0, 0];
+        apply_svg_drop_shadow(&mut pixels, 2, 1, 0.0, 1, 0, CssColor::new(0, 255, 0));
+        assert_eq!(pixels, [255, 0, 0, 255, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn svg_convolution_honors_target_edge_mode_and_preserved_alpha() {
+        let mut pixels = [
+            255, 0, 0, 255, // opaque red
+            0, 64, 0, 128, // half-transparent green
+        ];
+        // The second coefficient is aligned to targetX=0. The first output
+        // pixel therefore samples its right neighbor; the last pixel wraps
+        // to the first. `preserveAlpha` keeps each destination coverage.
+        assert!(apply_svg_convolve_matrix(
+            &mut pixels,
+            2,
+            1,
+            &[0.0, 1.0],
+            2,
+            1,
+            0,
+            0,
+            1.0,
+            0.0,
+            usvg::filter::EdgeMode::Wrap,
+            true,
+            false,
+        ));
+        assert_eq!(pixels, [0, 128, 0, 255, 128, 0, 0, 128]);
+    }
+
+    #[test]
+    fn svg_offset_exposes_transparent_black_at_the_surface_edge() {
+        let mut pixels = [255, 0, 0, 255, 0, 255, 0, 255];
+        apply_svg_offset(&mut pixels, 2, 1, 1, 0);
+        assert_eq!(pixels, [0, 0, 0, 0, 255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn svg_flood_in_source_alpha_recolors_premultiplied_coverage() {
+        let mut pixels = [64, 32, 16, 128];
+        apply_svg_flood_in_source_alpha(&mut pixels, CssColor::new(0, 255, 0));
+        assert_eq!(pixels, [0, 128, 0, 128]);
+    }
+
+    #[test]
+    fn svg_composite_uses_premultiplied_source_over_and_in_equations() {
+        let first = [128, 0, 0, 128];
+        let second = [0, 64, 0, 64];
+        let mut over = [0; 4];
+        assert!(apply_svg_composite(
+            &first,
+            &second,
+            &mut over,
+            usvg::filter::CompositeOperator::Over,
+        ));
+        assert_eq!(over, [128, 32, 0, 160]);
+
+        let mut inside = [0; 4];
+        assert!(apply_svg_composite(
+            &first,
+            &second,
+            &mut inside,
+            usvg::filter::CompositeOperator::In,
+        ));
+        assert_eq!(inside, [32, 0, 0, 32]);
+    }
+
+    #[test]
+    fn svg_source_alpha_surface_retains_only_coverage() {
+        assert_eq!(
+            svg_source_alpha_surface(&[64, 32, 16, 128, 255, 0, 0, 255]),
+            [0, 0, 0, 128, 0, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn flood_in_source_alpha_filter_uses_one_shaped_text_surface() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="tint" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feFlood result="flood" flood-color="blue"/><feComposite in="flood" in2="SourceAlpha" operator="in"/></filter></defs><text filter="url(#tint)" x="4" y="20" font-size="16" fill="darkgreen">Tinted</text></svg>"#,
+        )
+        .expect("flood and source-alpha SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].actual_text.as_deref(), Some("Tinted"));
+    }
+
+    #[test]
+    fn svg_component_transfer_table_and_discrete_functions_follow_channel_ranges() {
+        assert_eq!(
+            apply_svg_transfer_function(0.25, &SvgTransferFunction::Table(vec![0.0, 1.0])),
+            0.25
+        );
+        assert_eq!(
+            apply_svg_transfer_function(0.25, &SvgTransferFunction::Discrete(vec![0.0, 1.0])),
+            0.0
+        );
+        assert_eq!(
+            apply_svg_transfer_function(0.75, &SvgTransferFunction::Discrete(vec![0.0, 1.0])),
+            1.0
+        );
+    }
+
+    #[test]
+    fn morphology_filtered_svg_text_uses_the_same_actual_text_effect_image() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><defs><filter id="morphology" filterUnits="userSpaceOnUse" x="0" y="0" width="100" height="30"><feMorphology operator="dilate" radius="1"/></filter></defs><text filter="url(#morphology)" x="4" y="20" font-size="16" fill="darkgreen">Morphology</text></svg>"#,
+        )
+        .expect("filtered SVG parses");
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let mut images = Vec::new();
+        scene.raster_images(&mut images);
+        assert_eq!(images.len(), 1, "one source-graphic filter image");
+        assert_eq!(images[0].actual_text.as_deref(), Some("Morphology"));
+    }
+
+    #[test]
+    fn svg_morphology_dilate_and_erode_handle_transparent_surface_edges() {
+        let mut dilated = [0, 0, 0, 0, 255, 0, 0, 255, 0, 0, 0, 0];
+        apply_svg_morphology(&mut dilated, 3, 1, 1, 0, true);
+        assert_eq!(dilated, [255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255]);
+
+        let mut eroded = dilated;
+        apply_svg_morphology(&mut eroded, 3, 1, 1, 0, false);
+        assert_eq!(eroded, [0, 0, 0, 0, 255, 0, 0, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn inline_svg_text_decorations_use_document_metrics_and_svg_paint_order() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="4" y="20" font-size="16" fill="red" text-decoration="underline overline line-through">Decorate</text></svg>"#,
+        )
+        .unwrap();
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let text_index = scene
+            .items
+            .iter()
+            .position(|item| matches!(item, SvgPaintItem::Text(_)))
+            .expect("the solid source text remains native PDF text");
+        let path_indices = scene
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| matches!(item, SvgPaintItem::Path(_)).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(path_indices.len(), 3);
+        assert!(path_indices.iter().any(|index| *index < text_index));
+        assert!(path_indices.iter().any(|index| *index > text_index));
+        assert!(
+            scene
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    SvgPaintItem::Path(path) => Some(path.fill),
+                    _ => None,
+                })
+                .all(|fill| fill == Some(CssColor::new(255, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn upright_vertical_svg_text_decorations_follow_the_vertical_inline_axis() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80"><text x="20" y="4" font-size="16" writing-mode="vertical-rl" text-orientation="upright" text-decoration="underline overline line-through">Vertical</text></svg>"#,
+        )
+        .unwrap();
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 60.0),
+            true,
+            &mut font_system,
+        );
+        let decoration_bounds = scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SvgPaintItem::Path(path) => path.bounds(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoration_bounds.len(), 3);
+        assert!(
+            decoration_bounds
+                .iter()
+                .all(|bounds| { bounds.size.height > bounds.size.width * 4.0 })
+        );
+    }
+
+    #[test]
+    fn host_css_text_overrides_cross_the_inline_svg_serialization_boundary() {
+        let svg = svg_element(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><text x="4" y="20" style="font-size: 4px; font-variation-settings: 'wght' 100; letter-spacing: 1px; word-spacing: 2px; writing-mode: horizontal-tb; text-orientation: mixed">Shadow</text></svg>"#,
+        );
+        let NodeKind::Element(text) = &svg.children[0].kind else {
+            panic!("expected SVG text child");
+        };
+        let mut overrides = SvgPresentationOverrides::new();
+        overrides.insert(
+            text.id,
+            SvgPresentationOverride {
+                font_family: Some("\"Ahem\"".to_owned()),
+                font_size: Some("16px".to_owned()),
+                font_weight: Some("700".to_owned()),
+                font_style: Some("italic".to_owned()),
+                font_stretch: Some("75%".to_owned()),
+                font_variation_settings: Some("\"wght\" 650".to_owned()),
+                font_kerning: Some("none".to_owned()),
+                letter_spacing: Some("3px".to_owned()),
+                word_spacing: Some("4px".to_owned()),
+                writing_mode: Some("vertical-lr".to_owned()),
+                text_orientation: Some("upright".to_owned()),
+                direction: Some("rtl".to_owned()),
+                unicode_bidi: Some("isolate-override".to_owned()),
+                text_shadow: Some("0px 0px 5px 0px rgba(0 128 0 / 1)".to_owned()),
+                ..SvgPresentationOverride::default()
+            },
+        );
+        let xml = serialize_inline_svg_with_presentation_overrides(&svg, &overrides);
+        assert!(xml.contains("font-family=\"&quot;Ahem&quot;\""));
+        assert!(xml.contains("font-size=\"16px\""));
+        assert!(xml.contains("font-weight=\"700\""));
+        assert!(xml.contains("font-style=\"italic\""));
+        assert!(xml.contains("font-stretch=\"75%\""));
+        assert!(xml.contains("font-variation-settings=\"&quot;wght&quot; 650\""));
+        assert!(xml.contains("letter-spacing=\"3px\""));
+        assert!(xml.contains("word-spacing=\"4px\""));
+        assert!(xml.contains("style=\"font-kerning: none;\""));
+        assert!(xml.contains("writing-mode=\"vertical-lr\""));
+        assert!(xml.contains("text-orientation=\"upright\""));
+        assert!(!xml.contains("font-size: 4px"));
+        assert!(!xml.contains("font-variation-settings: 'wght' 100"));
+        assert!(!xml.contains("letter-spacing: 1px"));
+        assert!(!xml.contains("word-spacing: 2px"));
+        assert!(!xml.contains("writing-mode: horizontal-tb"));
+        assert!(!xml.contains("text-orientation: mixed"));
+        assert!(xml.contains("direction=\"rtl\""));
+        assert!(xml.contains("unicode-bidi=\"isolate-override\""));
+        assert!(xml.contains("text-shadow=\"0px 0px 5px 0px rgba(0 128 0 / 1)\""));
+
+        let asset = parse_svg_bytes(xml.as_bytes()).expect("serialized SVG parses");
+        let usvg::Node::Text(text) = &asset.tree.root().children()[0] else {
+            panic!("serialized text remains retained");
+        };
+        assert!(
+            text.chunks()[0].spans()[0]
+                .font()
+                .variations()
+                .contains(&usvg::FontVariation::new(*b"wght", 650.0)),
+            "the bridged axis survives alongside style-derived font axes"
+        );
+        assert!(!text.chunks()[0].spans()[0].apply_kerning());
+        assert_eq!(text.writing_mode(), usvg::WritingMode::VerticalLr);
+        assert_eq!(text.text_orientation(), usvg::TextOrientation::Upright);
+        let mut fonts = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut fonts,
+        );
+        assert!(
+            scene
+                .items
+                .iter()
+                .any(|item| matches!(item, SvgPaintItem::RasterImage(_))),
+            "a bridged blurred shadow crosses the boundary as one effect image"
+        );
+        assert_eq!(
+            scene
+                .items
+                .iter()
+                .filter(|item| matches!(item, SvgPaintItem::Text(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn inline_svg_text_span_retains_its_typed_host_typography_key() {
+        let svg = svg_element(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="4" y="20">Keyed text</text></svg>"#,
+        );
+        let NodeKind::Element(text) = &svg.children[0].kind else {
+            panic!("expected SVG text child");
+        };
+        let mut host_style = ComputedStyle::initial();
+        host_style.font_weight = FontWeight(650);
+        host_style.font_feature_settings =
+            css::FontFeatureSettings(vec![css::FontFeatureSetting::new(*b"liga", 0)]);
+        host_style.font_synthesis = css::FontSynthesis::NONE;
+        host_style.font_language_override = css::FontLanguageOverride::OpenType(*b"TRK ");
+        host_style.font_palette = css::FontPalette::Index(2);
+
+        let mut overrides = SvgPresentationOverrides::new();
+        let key = overrides.record_typography(SvgTextTypography::from_computed_style(&host_style));
+        overrides.insert(
+            text.id,
+            SvgPresentationOverride {
+                text_typography_key: Some(key),
+                ..SvgPresentationOverride::default()
+            },
+        );
+        let asset = parse_inline_svg_with_presentation_overrides(
+            &svg,
+            &overrides,
+            &ExternalSvgUseResolver::default(),
+        )
+        .expect("keyed inline SVG parses");
+        let usvg::Node::Text(text) = &asset.tree.root().children()[0] else {
+            panic!("expected retained SVG text");
+        };
+        assert_eq!(
+            text.chunks()[0].spans()[0].text_typography_key(),
+            Some(key.0)
+        );
+
+        let restored = asset
+            .text_typography
+            .get(&key)
+            .expect("asset retains host typography")
+            .computed_style_at_font_scale(SvgFontScale(1.0));
+        assert_eq!(restored.font_weight, FontWeight(650));
+        assert_eq!(
+            restored.font_feature_settings,
+            host_style.font_feature_settings
+        );
+        assert_eq!(restored.font_synthesis, css::FontSynthesis::NONE);
+        assert_eq!(
+            restored.font_language_override,
+            css::FontLanguageOverride::OpenType(*b"TRK ")
+        );
+        assert_eq!(restored.font_palette, css::FontPalette::Index(2));
+    }
+
+    #[test]
+    fn inline_svg_text_rotation_uses_quire_glyph_outlines_with_actual_text() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="4" y="20" rotate="30" font-size="16">Rotate</text></svg>"#,
+        )
+        .unwrap();
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let [SvgPaintItem::OutlinedText(outlined)] = scene.items.as_slice() else {
+            panic!(
+                "expected one outlined rotated SVG text item, got {:?}",
+                scene.items
+            );
+        };
+        assert_eq!(outlined.actual_text.as_ref(), "Rotate");
+        assert!(!outlined.paths.is_empty());
+    }
+
+    #[test]
+    fn inline_svg_text_stroke_uses_the_same_shaped_glyph_outlines() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="30"><text x="4" y="20" font-size="16" fill="red" stroke="blue" stroke-width="2" paint-order="stroke fill">Stroke</text></svg>"#,
+        )
+        .unwrap();
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let [SvgPaintItem::OutlinedText(outlined)] = scene.items.as_slice() else {
+            panic!(
+                "expected one outlined stroked SVG text item, got {:?}",
+                scene.items
+            );
+        };
+        assert!(
+            outlined
+                .paths
+                .iter()
+                .all(|path| path.fill == Some(CssColor::new(255, 0, 0)))
+        );
+        assert!(
+            outlined
+                .paths
+                .iter()
+                .all(|path| path.stroke == Some(CssColor::new(0, 0, 255)))
+        );
+        assert!(outlined.paths.iter().all(|path| {
+            path.stroke_width != PaintStrokeWidth::ZERO
+                && path.paint_order == RenderedPathPaintOrder::StrokeThenFill
+        }));
+        assert!(
+            outlined.paths.iter().all(|path| path.transform.d() > 0.0),
+            "outline fallback must use the same upright glyph basis as native SVG text"
+        );
+    }
+
+    #[test]
+    fn inline_svg_text_path_places_quire_shaped_glyphs_on_the_retained_path() {
+        let asset = parse_svg_bytes(
+            br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="30"><path id="guide" d="M 0 20 H 100"/><text x="0" y="0" font-size="12"><textPath xlink:href="#guide">Path</textPath></text></svg>"##,
+        )
+        .unwrap();
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let outlined = scene.items.iter().find_map(|item| match item {
+            SvgPaintItem::OutlinedText(outlined) => Some(outlined),
+            _ => None,
+        });
+        let outlined = outlined.expect("textPath must retain Quire-shaped outline glyphs");
+        assert_eq!(outlined.actual_text.as_ref(), "Path");
+        assert!(!outlined.paths.is_empty());
+        assert!(outlined.paths.iter().all(|path| path.bounds().is_some()));
+    }
+
+    #[test]
+    fn inline_svg_text_length_scales_the_pdf_inline_axis() {
+        let plain = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="0" y="15" font-size="12">Length</text></svg>"#,
+        )
+        .unwrap();
+        let adjusted = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><text x="0" y="15" font-size="12" textLength="60" lengthAdjust="spacingAndGlyphs">Length</text></svg>"#,
+        )
+        .unwrap();
+        let mut plain_fonts = FontSystem::new();
+        let mut adjusted_fonts = FontSystem::new();
+        let destination = paint_rect(0.0, 0.0, 75.0, 15.0);
+        let plain_scene =
+            plain.paint_inline_group_with_font_system(destination, true, &mut plain_fonts);
+        let adjusted_scene =
+            adjusted.paint_inline_group_with_font_system(destination, true, &mut adjusted_fonts);
+        let plain = first_svg_text(&plain_scene).unwrap();
+        let adjusted = first_svg_text(&adjusted_scene).unwrap();
+        let plain_inline = plain.runs[0].text_matrix.pdf_components()[0].abs();
+        let adjusted_inline = adjusted.runs[0].text_matrix.pdf_components()[0].abs();
+        assert!(adjusted_inline > plain_inline * 1.5);
+    }
+
+    #[test]
+    fn nested_svg_image_text_uses_the_owning_document_font_system() {
+        let nested = base64::engine::general_purpose::STANDARD.encode(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="20"><text x="2" y="15" font-size="12">Nested</text></svg>"#,
+        );
+        let outer = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30"><image href="data:image/svg+xml;base64,{nested}" width="30" height="20"/></svg>"#
+        );
+        let asset = parse_svg_bytes(outer.as_bytes()).unwrap();
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 30.0, 22.5),
+            true,
+            &mut font_system,
+        );
+        let line = first_svg_text(&scene).expect("nested text run");
+        assert_eq!(line.text, "Nested");
+        assert!(line.runs.iter().all(|run| run.font_id.is_some()));
+    }
+
+    #[test]
+    fn gradient_svg_text_lowers_quire_shaped_glyphs_to_outlines() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="20"><defs><linearGradient id="g"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs><text x="2" y="15" font-size="12" fill="url(#g)">Gradient</text></svg>"#,
+        )
+        .unwrap();
+        let mut font_system = FontSystem::new();
+        let scene = asset.paint_inline_group_with_font_system(
+            paint_rect(0.0, 0.0, 75.0, 15.0),
+            true,
+            &mut font_system,
+        );
+        let outlined = scene.items.iter().find_map(|item| match item {
+            SvgPaintItem::OutlinedText(outlined) => Some(outlined),
+            _ => None,
+        });
+        let outlined = outlined.expect("gradient text outline item");
+        assert_eq!(outlined.actual_text.as_ref(), "Gradient");
+        assert!(!outlined.paths.is_empty());
+        assert!(
+            outlined
+                .paths
+                .iter()
+                .all(|path| matches!(path.fill_paint, Some(RenderedPathPaint::Gradient(_))))
+        );
+    }
+
+    fn first_svg_text(
+        group: &SvgPaintGroup,
+    ) -> Option<&crate::document::paint::text::RenderedLine> {
+        group.items.iter().find_map(|item| match item {
+            SvgPaintItem::Text(line) => Some(line.as_ref()),
+            SvgPaintItem::Group(group) | SvgPaintItem::NestedSvg(group) => first_svg_text(group),
+            SvgPaintItem::Path(_)
+            | SvgPaintItem::RasterImage(_)
+            | SvgPaintItem::OutlinedText(_) => None,
+        })
     }
 }

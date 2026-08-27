@@ -1579,6 +1579,15 @@ impl PaintBandList {
             .flatten()
             .any(PaintDisplayItem::contains_overflow_clip)
     }
+
+    /// See [`PaintFragment::into_fragmentable_source_canvas`].
+    pub(crate) fn make_fragmentable_source_canvas(&mut self) {
+        for items in &mut self.bands {
+            for item in items {
+                item.make_fragmentable_source_canvas();
+            }
+        }
+    }
 }
 
 pub(in crate::document) fn shared_prefix_len(
@@ -1608,6 +1617,19 @@ pub(crate) enum PaintDisplayItem {
 }
 
 impl PaintDisplayItem {
+    fn make_fragmentable_source_canvas(&mut self) {
+        match self {
+            Self::StackingContext(context) => context.bands.make_fragmentable_source_canvas(),
+            Self::EffectScope(scope) => {
+                scope.fragmentation = PaintFragmentation::Fragmentable;
+                for item in &mut scope.items {
+                    item.make_fragmentable_source_canvas();
+                }
+            }
+            Self::Operation(_) | Self::Primitive(_) | Self::Link(_) => {}
+        }
+    }
+
     fn contains_affine_3d_transform(&self) -> bool {
         match self {
             Self::StackingContext(context) => {

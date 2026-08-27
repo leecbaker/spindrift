@@ -223,23 +223,6 @@ impl ResolvedSubgridAxis {
         self.line_offsets.last().copied().unwrap_or(0.0)
     }
 
-    /// Materialize the resolved parent gutters in this subgrid's local
-    /// physical coordinate space for final gap-rule painting.
-    pub(super) fn gap_gutters(&self) -> Vec<GapDecorationGutter> {
-        self.gutter_sizes
-            .iter()
-            .enumerate()
-            .filter(|(_, size)| **size > 0.0)
-            .map(|(index, _)| {
-                GapDecorationGutter::with_grid_line(
-                    self.track_ends[index],
-                    self.track_starts[index + 1],
-                    u16::try_from(index + 2).ok(),
-                )
-            })
-            .collect()
-    }
-
     /// Resolve a physical Taffy area to the parent-owned track-area span.
     /// <https://www.w3.org/TR/css-grid-2/#subgrids>
     pub(super) fn track_area_span(&self, start_line: u16, end_line: u16) -> Option<(f32, f32)> {
@@ -733,19 +716,22 @@ fn subgrid_axis_from_parent(
     let child_physical_axis =
         WritingModeAxes::new(child_style.writing_mode, child_style.used_direction())
             .physical_axis(child_logical_axis);
+    let column_offsets = parent_layout.columns.line_offsets();
+    let row_offsets = parent_layout.rows.line_offsets();
+    let parent_gutters = parent_layout.gap_decoration_gutters(parent_style);
     let (offsets, track_sizes, gutters, line_names, start, end) = match child_physical_axis {
         PhysicalAxis::Horizontal => (
-            &parent_layout.column_line_offsets,
+            &column_offsets,
             parent_layout.physical_track_sizes(GridAxis::Column),
-            &parent_layout.gap_gutters.columns,
+            &parent_gutters.columns,
             &parent_layout.column_line_names,
             area.column_start,
             area.column_end,
         ),
         PhysicalAxis::Vertical => (
-            &parent_layout.row_line_offsets,
+            &row_offsets,
             parent_layout.physical_track_sizes(GridAxis::Row),
-            &parent_layout.gap_gutters.rows,
+            &parent_gutters.rows,
             &parent_layout.row_line_names,
             area.row_start,
             area.row_end,
@@ -758,7 +744,6 @@ fn subgrid_axis_from_parent(
     let inherit_parent_line_names = !grid_lanes_placement.is_some_and(|placement| {
         placement.is_automatic() && placement.grid_axis() == child_parent_physical_axis
     });
-    let _ = parent_style;
     ResolvedGridAxis::from_parent_layout(offsets, track_sizes, gutters, line_names).subgrid_slice(
         start,
         end,
@@ -884,9 +869,16 @@ mod tests {
         assert_eq!(slice.outer_extent(), 100.0);
         assert_eq!(
             slice
-                .gap_gutters()
+                .gutter_sizes()
                 .iter()
-                .map(|gutter| (gutter.span.start, gutter.span.end, gutter.grid_line))
+                .enumerate()
+                .map(|(index, _)| {
+                    (
+                        slice.track_ends()[index],
+                        slice.track_starts()[index + 1],
+                        u16::try_from(index + 2).ok(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
                 (17.5, 27.5, Some(2)),

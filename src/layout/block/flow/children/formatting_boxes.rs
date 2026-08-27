@@ -563,6 +563,15 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 None
             };
+            let generated_pseudo_source =
+                child_box
+                    .element_core()
+                    .and_then(|core| match &core.source {
+                        box_tree::BoxSource::GeneratedPseudo(pseudo) => {
+                            Some(pseudo.kind.counter_event_source())
+                        }
+                        box_tree::BoxSource::Principal => None,
+                    });
             let split_inline_float_block_offset = split_block_context.and_then(|_| {
                 self.split_inline_static_position_y_offset_before_child(
                     child_boxes,
@@ -595,6 +604,19 @@ impl<'a> LayoutBuilder<'a> {
                     FloatPlacementAxes::for_style(style),
                     &mut float_run,
                     split_inline_float_block_offset,
+                    generated_pseudo_source,
+                )
+            } else if let Some(pseudo_source) = generated_pseudo_source {
+                self.layout_generated_floating_child(
+                    child_element,
+                    child_signature.clone(),
+                    &child_style,
+                    Some(child_children),
+                    child_table_fragment,
+                    stylesheets,
+                    FloatPlacementAxes::for_style(style),
+                    &mut float_run,
+                    pseudo_source,
                 )
             } else {
                 self.layout_floating_child(
@@ -1471,11 +1493,32 @@ impl<'a> LayoutBuilder<'a> {
                 // omit empty boxes, so using them here changes normal-flow
                 // placement according to incidental ink.
                 // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
-                let child_block_end_margin = placement.child_block_end_margin(child_style);
+                let mut projected_root_before_style;
+                let block_axis_child_style = if element.tag.eq_ignore_ascii_case("html")
+                    && self.principal_flow.has_propagated_body()
+                    && self.principal_flow.writing_mode == WritingMode::VerticalLr
+                    && matches!(
+                        child_box.element_core().map(|core| &core.source),
+                        Some(box_tree::BoxSource::GeneratedPseudo(pseudo))
+                            if pseudo.kind == box_tree::GeneratedPseudoKind::Before
+                    ) {
+                    // The pseudo retains its horizontal computed margins for
+                    // painting, but its parent advances in the propagated
+                    // vertical body's block axis. Map the horizontal
+                    // block-end margin to that axis for sibling placement.
+                    // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+                    projected_root_before_style = child_style.clone();
+                    projected_root_before_style.margin.right = child_style.margin.top;
+                    &projected_root_before_style
+                } else {
+                    child_style
+                };
+                let child_block_end_margin =
+                    placement.child_block_end_margin(block_axis_child_style);
                 let child_margin_box_block_extent = placement.child_margin_box_block_extent(
                     self.last_block_layout_outcome
                         .physical_border_box_inline_span,
-                    child_style,
+                    block_axis_child_style,
                 );
                 let remaining_block_track =
                     placement.track_after_committed_child(child_margin_box_block_extent);

@@ -642,28 +642,37 @@ impl<'a> LayoutBuilder<'a> {
             - used_style.margin.right)
             .max(used_style.font_size);
         let replaced_content_size = if is_replaced_element(element) {
-            used_image(
+            resolve_replaced_element(
                 element,
                 &used_style,
-                positioned_available_outer_width,
-                PercentageBasis::definite_from(
-                    content_box_pt(containing_block.height()),
-                    BlockSizeBasisSource::AbsolutePositioned,
-                ),
+                ReplacedBoxSizingContext {
+                    available_width: content_box_pt(positioned_available_outer_width),
+                    inline_percentage_basis: PercentageBasis::definite_from(
+                        content_box_pt(positioned_available_outer_width),
+                        IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
+                    ),
+                    block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
+                        PercentageBasis::definite_from(
+                            content_box_pt(containing_block.height()),
+                            BlockSizeBasisSource::AbsolutePositioned,
+                        ),
+                    ),
+                },
                 self.base_url,
                 self.root_url,
                 self.resource_cache,
             )
-            .map(|image| {
+            .map(|replaced| {
+                let geometry = replaced.geometry();
                 // CSS 2.2 gives absolutely positioned replaced elements their
                 // own auto-size rules: intrinsic dimensions and aspect ratio
                 // resolve the content size before the absolute inset equation
                 // is solved.
                 // <https://www.w3.org/TR/CSS22/visudet.html#abs-replaced-width>
                 // and <https://www.w3.org/TR/CSS22/visudet.html#abs-replaced-height>.
-                set_style_used_width(&mut used_style, image.content_size.width);
-                set_style_used_height(&mut used_style, image.content_size.height);
-                (image.content_size.width, image.content_size.height)
+                set_style_used_width(&mut used_style, geometry.content_size.width);
+                set_style_used_height(&mut used_style, geometry.content_size.height);
+                (geometry.content_size.width, geometry.content_size.height)
             })
         } else {
             None

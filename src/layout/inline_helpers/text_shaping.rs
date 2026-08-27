@@ -87,20 +87,20 @@ pub(in crate::layout) fn can_queue_inline_fragments_for_shaping(
 /// CSS Text shaping operates over typographic runs after inline box tree
 /// construction. Font/style changes can split the resulting font runs, but
 /// they must not by themselves remove adjacent context for cursive-script
-/// shaping; CSS Text only requires an inline-boundary break for separating
-/// margin/border/padding, non-baseline alignment, or bidi isolation:
+/// shaping; non-baseline alignment and bidi isolation remain fragment-level
+/// boundaries. Inline margin, border, and padding instead belong to the
+/// explicit edge atom between these fragments, which is the only place that
+/// can identify the decorated side of a box:
 /// <https://www.w3.org/TR/css-text-3/#boundary-shaping>.
 pub(in crate::layout) fn can_shape_inline_fragments_together(
     left: &(impl InlineFragmentAccess + ?Sized),
     right: &(impl InlineFragmentAccess + ?Sized),
 ) -> bool {
     if inline_fragment_is_join_control_only(left) {
-        return !inline_box_edge_breaks_shaping(right.style())
-            && !inline_bidi_isolation_boundary_breaks_shaping(left, right);
+        return !inline_bidi_isolation_boundary_breaks_shaping(left, right);
     }
     if inline_fragment_is_join_control_only(right) {
-        return !inline_box_edge_breaks_shaping(left.style())
-            && !inline_bidi_isolation_boundary_breaks_shaping(left, right);
+        return !inline_bidi_isolation_boundary_breaks_shaping(left, right);
     }
     if left.visual_offset() != right.visual_offset() {
         return false;
@@ -113,8 +113,6 @@ pub(in crate::layout) fn can_shape_inline_fragments_together(
         // run rather than borrowing cursive context from the neighbor.
         // <https://www.w3.org/TR/css-text-3/#letter-spacing-property>
         && left.style().letter_spacing == right.style().letter_spacing
-        && !inline_box_edge_breaks_shaping(left.style())
-        && !inline_box_edge_breaks_shaping(right.style())
         && !inline_bidi_isolation_boundary_breaks_shaping(left, right)
 }
 
@@ -239,16 +237,24 @@ pub(in crate::layout) fn inline_bidi_scope_affects_line_ordering(style: &Compute
         && !(style.display.is_block_level() && style.unicode_bidi == UnicodeBidi::Isolate)
 }
 
-/// Return whether an inline box boundary must interrupt text shaping.
+/// Return whether one explicit inline-box edge atom must interrupt text
+/// shaping.
 ///
-/// CSS Text boundary shaping allows shaping across inline boundaries unless
-/// the boundary has nonzero margin, border, or padding, which creates a real
-/// visual separation:
+/// A computed style owns both inline sides of its box, but a source or visual
+/// line contains one side at a time. Looking at the entire style would make a
+/// start decoration also break shaping at the end (and vice versa). The atom
+/// therefore supplies the exact logical side whose used margin, border, and
+/// padding create a real visual separation:
 /// <https://www.w3.org/TR/css-text-3/#boundary-shaping>.
-pub(in crate::layout) fn inline_box_edge_breaks_shaping(style: &ComputedStyle) -> bool {
-    style.display.is_inline_level()
-        && (inline_box_edge_has_nonzero_component(style, InlineBoxEdge::Start)
-            || inline_box_edge_has_nonzero_component(style, InlineBoxEdge::End))
+pub(in crate::layout) fn inline_box_edge_fragment_breaks_shaping(
+    style: &ComputedStyle,
+    edge: InlineBoxEdgeFragment,
+) -> bool {
+    let box_edge = match edge.logical_edge {
+        InlineLogicalEdge::Start => InlineBoxEdge::Start,
+        InlineLogicalEdge::End => InlineBoxEdge::End,
+    };
+    style.display.is_inline_level() && inline_box_edge_has_nonzero_component(style, box_edge)
 }
 
 /// Return whether an inline bidi-isolation boundary interrupts shaping.

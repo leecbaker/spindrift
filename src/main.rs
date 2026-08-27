@@ -202,6 +202,11 @@ fn main() {
     let cli_started = Instant::now();
     let result = match thread::Builder::new()
         .name("quire-cli-render".to_string())
+        // Recursive CSS layout and paint traversal can exceed macOS's small
+        // default spawned-thread stack for deeply nested reports. This is a
+        // bounded rendering worker, so reserve a stable 32 MiB stack rather
+        // than depending on the caller's `RUST_MIN_STACK` environment.
+        .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

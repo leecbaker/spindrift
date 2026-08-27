@@ -796,7 +796,7 @@ fn inline_svg_presentation_overrides(
     let NodeKind::Element(root_element) = &root.kind else {
         return crate::svg::SvgPresentationOverrides::new();
     };
-    let mut overrides = HashMap::new();
+    let mut overrides = crate::svg::SvgPresentationOverrides::new();
     let forced_color_palette = stylesheets
         .iter()
         .find_map(|stylesheet| stylesheet.forced_colors.palette());
@@ -857,9 +857,14 @@ fn collect_inline_svg_presentation_overrides(
     // box handles CSS transforms separately, but fill/stroke establish the
     // inherited SVG paint for its scene descendants.
     let applies_to_svg_scene = inside_inline_svg || enters_inline_svg;
-    if applies_to_svg_scene
-        && (svg_transformable_element(element) || svg_filter_color_element(element))
-    {
+    // `usvg` owns SVG geometry and text chunks, but its retained `TextSpan`
+    // cannot represent Quire's complete shaping style. Attach an opaque key
+    // for every scene element so the eventual span can recover this exact
+    // host-CSS cascade result without treating CSS values as parser strings.
+    let text_typography_key = applies_to_svg_scene.then(|| {
+        overrides.record_typography(crate::svg::SvgTextTypography::from_computed_style(&style))
+    });
+    if applies_to_svg_scene {
         let transform = if !enters_inline_svg
             && !style.has_transform()
             && svg_presentation.has_valid_transform()
@@ -914,6 +919,90 @@ fn collect_inline_svg_presentation_overrides(
                     style.svg_stroke_width.value().length_points() / css::CSS_PX_TO_PT
                 )
             }),
+            text_shadow: (!style.text_shadow.is_empty())
+                .then(|| crate::svg::svg_text_shadow_presentation_attribute(&style)),
+            // The standalone SVG parser starts its own UA cascade. Even when
+            // the inline SVG root merely inherits the host family unchanged,
+            // serialize that used value so SVG text does not fall back to the
+            // SVG UA's `serif` default.
+            // <https://www.w3.org/TR/SVG2/styling.html#UsingCSS>
+            // <https://www.w3.org/TR/css-cascade-5/#inheritance>
+            // Text geometry (`em` positions, textLength and chunk
+            // normalization) still belongs to usvg. Serialize the final
+            // cascade values rather than only parent differences so its
+            // geometry inputs agree with the typed shaping side table even
+            // when a host rule resets a source SVG attribute to its inherited
+            // value.
+            font_family: Some(crate::svg::svg_font_family_presentation_attribute(
+                &style.font_family,
+            )),
+            font_size: Some(format!("{}px", style.font_size / css::CSS_PX_TO_PT)),
+            font_weight: Some(style.font_weight.0.to_string()),
+            font_style: Some({
+                match style.font_style {
+                    css::FontStyle::Normal => "normal".to_owned(),
+                    css::FontStyle::Italic => "italic".to_owned(),
+                    css::FontStyle::Oblique(angle) => {
+                        format!("oblique {}deg", f32::from_bits(angle))
+                    }
+                }
+            }),
+            font_stretch: Some(format!("{}%", style.font_width.0 as f32 / 10.0)),
+            font_variation_settings: Some(
+                crate::svg::svg_font_variation_settings_presentation_attribute(
+                    &style.font_variation_settings,
+                ),
+            ),
+            font_kerning: Some({
+                match style.font_kerning {
+                    css::FontKerning::Auto => "auto",
+                    css::FontKerning::Normal => "normal",
+                    css::FontKerning::None => "none",
+                }
+                .to_owned()
+            }),
+            letter_spacing: Some(format!(
+                "{}px",
+                style.used_letter_spacing().points() / css::CSS_PX_TO_PT
+            )),
+            word_spacing: Some(format!(
+                "{}px",
+                style.used_word_spacing().points() / css::CSS_PX_TO_PT
+            )),
+            writing_mode: Some({
+                match style.writing_mode {
+                    css::WritingMode::HorizontalTb => "horizontal-tb",
+                    css::WritingMode::VerticalRl => "vertical-rl",
+                    css::WritingMode::VerticalLr => "vertical-lr",
+                    css::WritingMode::SidewaysRl => "sideways-rl",
+                    css::WritingMode::SidewaysLr => "sideways-lr",
+                }
+                .to_owned()
+            }),
+            text_orientation: Some(
+                match style.text_orientation {
+                    css::TextOrientation::Mixed => "mixed",
+                    css::TextOrientation::Upright => "upright",
+                    css::TextOrientation::Sideways => "sideways",
+                }
+                .to_owned(),
+            ),
+            direction: Some(match style.direction {
+                css::Direction::Ltr => "ltr".to_owned(),
+                css::Direction::Rtl => "rtl".to_owned(),
+            }),
+            unicode_bidi: Some({
+                match style.unicode_bidi {
+                    css::UnicodeBidi::Normal => "normal",
+                    css::UnicodeBidi::Embed => "embed",
+                    css::UnicodeBidi::Isolate => "isolate",
+                    css::UnicodeBidi::BidiOverride => "bidi-override",
+                    css::UnicodeBidi::IsolateOverride => "isolate-override",
+                    css::UnicodeBidi::Plaintext => "plaintext",
+                }
+                .to_owned()
+            }),
+            text_typography_key,
             flood_color: svg_filter_color_element(element)
                 .then(|| crate::svg::SvgFilterColorOverride::from(style.svg_flood_color)),
             lighting_color: svg_lighting_color_element(element)
@@ -930,6 +1019,20 @@ fn collect_inline_svg_presentation_overrides(
             || presentation.fill.is_some()
             || presentation.stroke.is_some()
             || presentation.stroke_width.is_some()
+            || presentation.font_family.is_some()
+            || presentation.font_size.is_some()
+            || presentation.font_weight.is_some()
+            || presentation.font_style.is_some()
+            || presentation.font_stretch.is_some()
+            || presentation.font_variation_settings.is_some()
+            || presentation.font_kerning.is_some()
+            || presentation.letter_spacing.is_some()
+            || presentation.word_spacing.is_some()
+            || presentation.writing_mode.is_some()
+            || presentation.text_orientation.is_some()
+            || presentation.direction.is_some()
+            || presentation.unicode_bidi.is_some()
+            || presentation.text_typography_key.is_some()
             || presentation.flood_color.is_some()
             || presentation.lighting_color.is_some()
         {
@@ -1047,27 +1150,6 @@ fn svg_presentation_paint(color: Option<CssColor>) -> String {
     )
 }
 
-fn svg_transformable_element(element: &Element) -> bool {
-    element.namespace_url == "http://www.w3.org/2000/svg"
-        && matches!(
-            element.tag.as_str(),
-            "a" | "circle"
-                | "ellipse"
-                | "foreignObject"
-                | "g"
-                | "image"
-                | "line"
-                | "path"
-                | "polygon"
-                | "polyline"
-                | "rect"
-                | "svg"
-                | "switch"
-                | "text"
-                | "use"
-        )
-}
-
 fn svg_filter_color_element(element: &Element) -> bool {
     element.namespace_url == "http://www.w3.org/2000/svg"
         && matches!(element.tag.as_str(), "feFlood" | "feDropShadow")
@@ -1088,12 +1170,54 @@ fn svg_lighting_color_element(element: &Element) -> bool {
 fn svg_transform_presentation_declarations(
     element: &Element,
 ) -> css::SvgPresentationAttributeDeclarations {
+    const TEXT_PRESENTATION_ATTRIBUTES: &[&str] = &[
+        "font-family",
+        "font-size",
+        "font-size-adjust",
+        "font-weight",
+        "font-style",
+        "font-stretch",
+        "font-language-override",
+        "font-synthesis",
+        "font-synthesis-weight",
+        "font-synthesis-style",
+        "font-synthesis-small-caps",
+        "font-synthesis-position",
+        "font-feature-settings",
+        "font-variation-settings",
+        "font-kerning",
+        "font-variant",
+        "font-variant-ligatures",
+        "font-variant-position",
+        "font-variant-caps",
+        "font-variant-numeric",
+        "font-variant-alternates",
+        "font-variant-east-asian",
+        "font-variant-emoji",
+        "font-palette",
+        "letter-spacing",
+        "word-spacing",
+        "direction",
+        "unicode-bidi",
+        "writing-mode",
+        "text-orientation",
+    ];
+    let text_presentation_attributes = TEXT_PRESENTATION_ATTRIBUTES
+        .iter()
+        .filter_map(|name| {
+            element
+                .attrs
+                .get(*name)
+                .map(|value| (*name, value.as_str()))
+        })
+        .collect::<Vec<_>>();
     css::SvgPresentationAttributeDeclarations::svg_properties(
         element.attrs.get("transform").map(String::as_str),
         element.attrs.get("transform-origin").map(String::as_str),
         element.attrs.get("transform-box").map(String::as_str),
         element.attrs.get("flood-color").map(String::as_str),
         element.attrs.get("lighting-color").map(String::as_str),
+        &text_presentation_attributes,
     )
 }
 
@@ -1488,6 +1612,7 @@ fn layout_dom_with_font_system(
                 // state. Restore all paint and page-local event state before
                 // retrying from the document's fragmentainer boundary.
                 builder.restore(initial_snapshot.clone());
+                builder.constrain_footnote_calls_to_observed_pages(&next_measurements);
                 measurements = next_measurements;
                 reservations = next_reservations;
 
@@ -2009,6 +2134,12 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// the durable page-local exclusion that owns the captured paint subtree.
     pub(in crate::layout) committed_inline_floats: HashMap<InlineFloatId, CommittedInlineFloat>,
     pub(in crate::layout) footnote_reservations: HashMap<usize, f32>,
+    /// Lower bounds retained by footnote convergence once a reserved source
+    /// page has pushed a call into a later fragmentainer. Replaying with only
+    /// the destination's reservation must not move that call back earlier and
+    /// recreate the same unsatisfied page constraint.
+    /// <https://www.w3.org/TR/css-gcpm-3/#footnotes>
+    pub(in crate::layout) footnote_call_minimum_page_indices: HashMap<ElementId, usize>,
     pub(in crate::layout) footnote_layout_mode: FootnoteLayoutMode,
     pub(in crate::layout) footnote_measurement_depth: usize,
     pub(in crate::layout) rendered_footnotes: HashSet<ElementId>,
@@ -2639,6 +2770,46 @@ impl FragmentOffsets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_element_with_tag<'a>(node: &'a Node, tag: &str) -> Option<&'a Element> {
+        let NodeKind::Element(element) = &node.kind else {
+            return None;
+        };
+        if element.tag == tag {
+            return Some(element);
+        }
+        element.children.iter().find_map(|child| match &child.kind {
+            NodeKind::Element(_) => first_element_with_tag(child, tag),
+            NodeKind::Text(_) => None,
+        })
+    }
+
+    #[test]
+    fn inline_svg_typography_keeps_host_font_controls_in_a_typed_side_table() {
+        let root = crate::dom::parse(
+            r#"<html><body><svg xmlns="http://www.w3.org/2000/svg"><text>Features</text></svg></body></html>"#,
+        );
+        let stylesheet = css::parse_stylesheet(&css::Css::from_string(
+            r#"svg text {
+                font-feature-settings: "liga" off;
+                font-synthesis: none;
+                font-language-override: "TRK";
+                font-palette: 2;
+            }"#,
+        ));
+        let stylesheets = css::Stylesheets::document_only(std::slice::from_ref(&stylesheet));
+        let overrides =
+            inline_svg_presentation_overrides(&root, &stylesheets, &ComputedStyle::initial());
+        let text = first_element_with_tag(&root, "text").expect("expected SVG text element");
+        let key = overrides
+            .get(&text.id)
+            .and_then(|override_values| override_values.text_typography_key)
+            .expect("every inline SVG element receives a typography key");
+        assert!(
+            overrides.typography_for_key(key).is_some(),
+            "the key resolves to a typed shaping record"
+        );
+    }
 
     #[test]
     fn fragment_offsets_only_clear_the_destination_block_start_inset() {

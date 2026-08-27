@@ -738,9 +738,11 @@ Primary references:
   ruby/non-atomic-inline applicability exceptions, and separates a principal
   box's definite fragmentainer consumption from visible descendant overflow.
   Form controls, fieldsets, grid, and table descendants follow the
-  empty-principal-box sizing rule. Monolithic overflow through complex flex
-  child replay and positioned contexts, plus remaining replaced/table sizing
-  matrices, is still incomplete.
+  empty-principal-box sizing rule. Nested normal-flow size-contained overflow
+  now has a measured unclipped source extent in Flex, without changing the
+  used flex-item geometry, but source-canvas replay through later
+  fragmentainers remains incomplete. Grid propagation and complex positioned
+  replay and remaining replaced/table sizing matrices are still incomplete.
 - Divergence: size-contained principal block boxes and their descendant flow
   retain monolithic placement in ordinary multicol flow while visible overflow
   remains attached without contributing to the principal used size. Simple
@@ -846,7 +848,8 @@ Primary references:
 - Divergence: the aligned-subtree model for deeply nested mixed inline runs
   needs broader conformance coverage.
 - Divergence: complex-script justification expansion rules are incomplete.
-- Divergence: fallback transformed vertical glyph forms for Unicode
+- Divergence: SVG `text-orientation` is retained and submitted to the shared
+  font shaper, but fallback transformed vertical glyph forms for Unicode
   `Vertical_Orientation` classes `Tr` and `Tu` are not implemented when font
   alternates are unavailable or incomplete.
 - Divergence: `text-autospace` is incomplete for punctuation-specific spacing,
@@ -913,6 +916,23 @@ Primary references:
   retained selected-source ranges and the shared CSS Text boundary-shaping
   path. Authored and renderer-inserted join controls are normalized as
   zero-advance shaping context; remaining mismatches need separate coverage.
+  <https://drafts.csswg.org/css-text-3/#boundary-shaping>
+- Divergence: CSS Text boundary shaping across a nonzero inline box edge in a
+  bidi-reordered Arabic run remains incomplete. Quire now preserves the
+  one-sided shaping boundary for ordinary inline text, but does not yet place
+  every virtual joining control and its margin/border/padding advance at the
+  matching visual boundary (`boundary-shaping-009`).
+  <https://drafts.csswg.org/css-text-3/#boundary-shaping>
+- Divergence: `css/css-text/shaping/shaping-arabic-diacritics-002.html`
+  remains mismatched because Arabic mark positioning across the NBSP boundary
+  is not yet preserved. This is independent of boundary joining: the Arabic,
+  N'Ko, and Mongolian boundary-shaping WPT cluster is covered by the shared
+  authored shaping stream.
+  <https://drafts.csswg.org/css-text-3/#boundary-shaping>
+- Divergence: an authored Arabic U+0640 TATWEEL that crosses a font-selection
+  transition does not yet preserve all contextual joining forms. Tatweel is
+  retained as visible, advancing source text; Quire does not synthesize it as
+  boundary context.
   <https://drafts.csswg.org/css-text-3/#boundary-shaping>
 
 ### Tables
@@ -1273,13 +1293,49 @@ Primary references:
   `preserveAspectRatio="none"`) pending upstream `usvg` support.
   <https://www.w3.org/TR/SVG2/painting.html#VectorEffects>
   `repeat`/`reflect` spread methods, pattern tiles with nested paint servers,
-  text, masks, filters, external string-URL SVG `<image>` resources in
-  secure-static mode, SVG fonts, `<object>`, and `<embed>` remain unsupported;
+  SVG text beyond the supported normalized visible `<text>`/`<tspan>` subset:
+  shared-font shaping, affine transforms, relative `dx`/`dy`, `text-anchor`,
+  `textLength`, normalized absolute `x`/`y` chunks, horizontal BASE-table baseline selection/inherited
+  `baseline-shift`, native solid PDF text, gradient/stroked/rotated/text-path
+  glyph-outline fallback with tagged `ActualText`, and `text-shadow` replay
+  from the same glyph outlines (including bounded premultiplied-alpha raster
+  blur without a duplicate text layer) are implemented. Remaining
+  character-list edge cases, complete SVG vertical writing/baselines (the
+  retained `vertical-rl`, `vertical-lr`, `sideways-rl`, and `sideways-lr`
+  modes already use Quire's vertical glyph-orientation/PDF-matrix path and
+  relative `dx`/`dy` lists remain in SVG user axes, but mixed-run anchors,
+  mixed-run `textLength`, and baseline semantics remain incomplete; upright
+  vertical `textLength`, both `lengthAdjust` modes, and `text-anchor` use the
+  shared typed vertical inline axis; upright vertical decorations also follow
+  that axis), complete text-path behavior, mixed-orientation/path-text
+  decoration geometry,
+  patterns, exact SVG/CSS blur kernel matching and grouped effects (the
+  retained scene currently supports only a single `feGaussianBlur`,
+  `feDropShadow`, `feOffset`, `feColorMatrix`, or `feComponentTransfer` of `SourceGraphic`,
+  a bounded `feMorphology` of `SourceGraphic`, or a strictly linear
+  `feGaussianBlur`/`feDropShadow`/`feOffset`/`feColorMatrix`/`feComponentTransfer`/
+  `feMorphology`/`feConvolveMatrix` chain whose named inputs consume the previous result, all
+  with an explicit `userSpaceOnUse` region, plus the exact `feFlood`/`feComposite`
+  `operator="in"`/`SourceAlpha` coloring pattern and canonical
+  blur/offset/flood/composite/merge drop-shadow graph), SVG text processing
+  that changes parser chunk construction (`text-transform`, `white-space`,
+  `tab-size`, and line-breaking/line-height behavior), masks beyond
+  the bounded flat-solid-path alpha/luminance `userSpaceOnUse` subset (including
+  nested/object-bounding-box masks, images, gradients, and patterns),
+  filters (including masks and object-bounding-box filters on retained text),
+  and exact SVG `text-shadow` raster matching (the text is visible and uses
+  the shared shaped outlines, but `svg/painting/reftests/text-shadow-03.html`
+  still differs from its reference in Ahem baseline/outline geometry and blur
+  samples),
+  external string-URL SVG `<image>` resources in secure-static mode,
+  SVG fonts, `<object>`, and `<embed>` remain unsupported;
   affected SVG subtrees are omitted rather than approximated. Inline SVG
   `<use>` supports statically preloaded same-origin HTML, XML, and SVG
   documents with fragment targets and nested external `<use>` chains. Its
   external-document CSS scope, cross-origin requests, and external `<image>`
-  descendants remain unsupported.
+  descendants remain unsupported. The shared-font SVG text design and its
+  implemented native-PDF subset are documented in
+  [`doc/svg_text_architecture.md`](doc/svg_text_architecture.md).
 - Divergence: non-root inline SVG descendants cascade valid SVG `transform`
   presentation attributes at author origin/specificity zero with CSS
   `transform`, including invalid-CSS fallback, explicit `none`, SVG unitless
@@ -1303,8 +1359,7 @@ Primary references:
   eligible `contents` container/text/use cases, but not the full SVG display,
   rendering-tree, and shadow-tree rules.
 - Divergence: SVG path rendering does not yet preserve `stroke-linejoin:
-  miter-clip`, marker cases that depend on unsupported paints/effects, or SVG
-  text accessibility/selectability.
+  miter-clip` or marker cases that depend on unsupported paints/effects.
 - Divergence: URL SVG is supported by existing image consumers (`<img>`,
   backgrounds, border images, list markers, and generated content), but only
   for preloaded file/HTTP or `data:` resources; stylesheet and inline-style

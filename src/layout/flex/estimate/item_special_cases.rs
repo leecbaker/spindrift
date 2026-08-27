@@ -4,6 +4,23 @@ use super::item_flow::{
 };
 use super::*;
 
+/// Return the normalized single block-level replaced child, if it is the
+/// entire flow content of this flex item.
+///
+/// Flex-item blockification must preserve the descendant's authored outer
+/// display role. This narrow fast path keeps a `display:block` SVG out of the
+/// inline-replaced-row measurement while preserving its CSS used size.
+/// <https://www.w3.org/TR/css-display-3/#box-generation>
+fn direct_block_replaced_child<'a>(
+    child_boxes: &'a [box_tree::FormattingBox<'a>],
+) -> Option<(&'a Element, &'a ComputedStyle)> {
+    let [child_box] = child_boxes else {
+        return None;
+    };
+    let (element, _, style, _) = child_box.element_parts()?;
+    (is_replaced_element(element) && style.display.is_block_level()).then_some((element, style))
+}
+
 /// Shared inputs derived once for all flex-item sizing cases.
 ///
 /// The normalized style and its physical/logical percentage bases must travel
@@ -299,6 +316,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         stylesheets: &Stylesheets<'_>,
         context: FlexItemEstimateContext<'_>,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> FlexItemEstimate {
         let FlexItemEstimateContext {
             style,
@@ -316,8 +334,43 @@ impl<'a> LayoutBuilder<'a> {
         // and widens an auto-sized nested flex container.
         let block_basis =
             flex_item_estimate_percentage_height_basis(style, available, vertical_non_content);
-        let (row_width, row_height) =
-            self.measure_direct_inline_row(element, style, stylesheets, block_basis);
+        let direct_block_replaced_row = child_boxes.and_then(direct_block_replaced_child).and_then(
+            |(replaced_child, replaced_style)| {
+                let parent_content_width = used_content_box_width_or_auto_with_basis(
+                    style,
+                    containing_width_basis,
+                    non_content_pt(
+                        style.padding.left + style.padding.right + horizontal_border_width(style),
+                    ),
+                )?;
+                let replaced = resolve_replaced_element(
+                    replaced_child,
+                    replaced_style,
+                    ReplacedBoxSizingContext {
+                        available_width: parent_content_width,
+                        inline_percentage_basis: PercentageBasis::definite_from(
+                            parent_content_width,
+                            IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
+                        ),
+                        block_basis: intrinsic_block_basis_from_flex_available_height(
+                            containing_height_basis,
+                        ),
+                    },
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                )?;
+                Some((
+                    parent_content_width.points(),
+                    replaced_style.margin.top
+                        + replaced.geometry().border_box_size.height
+                        + replaced_style.margin.bottom,
+                ))
+            },
+        );
+        let (row_width, row_height) = direct_block_replaced_row.unwrap_or_else(|| {
+            self.measure_direct_inline_row(element, style, stylesheets, block_basis)
+        });
         let content_width = used_length_percentage_or_auto_with_basis(
             style.box_values.width.clone(),
             containing_width_basis,

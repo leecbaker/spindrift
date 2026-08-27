@@ -1408,6 +1408,9 @@ impl<'a> LayoutBuilder<'a> {
         // for this layout pass so later flex continuations resume their child
         // state rather than reconstructing it from the current page cursor.
         let mut split_item_replay_fragments = vec![Vec::<PaintFragment>::new(); children.len()];
+        let mut split_item_source_replay = std::iter::repeat_with(|| None)
+            .take(children.len())
+            .collect::<Vec<Option<ContinuousSourceReplay>>>();
         let mut split_item_replay_fragment_local_block_ends =
             vec![Vec::<Option<f32>>::new(); children.len()];
         let mut split_item_replay_fragment_bottoms = Vec::<Option<f32>>::new();
@@ -1806,11 +1809,10 @@ impl<'a> LayoutBuilder<'a> {
                     decoration.is_clone(),
                     style.box_decoration_break == css::BoxDecorationBreak::Clone,
                 );
-                // A descendant-overflow-only continuation owns child paint,
-                // but not another flex container principal box. The used
-                // flex container has already ended in an earlier
-                // fragmentainer; retaining its source-overflow range here
-                // would clone its background and border into later columns.
+                // A descendant-overflow continuation has no additional used
+                // flex-box fragment. Its container paint is projected later
+                // from the committed source slice without turning that paint
+                // continuation into normal-flow box geometry.
                 let principal_fragment =
                     committed_slice_start.points() < total_content_height - 0.01;
                 let mut materialized_fragment = if principal_fragment {
@@ -2246,25 +2248,7 @@ impl<'a> LayoutBuilder<'a> {
                                 let mut replay_destination_block_end = None;
                                 let has_descendant_source_overflow =
                                     item_fragment.source_bounds.height().points()
-                                        > item_fragment.used_bounds.height().points() + 0.01
-                                        // Size containment suppresses an
-                                        // item's intrinsic contribution, not
-                                        // its visible descendant paint. The
-                                        // frozen used item box can therefore
-                                        // equal its recorded source range
-                                        // while its contained descendants
-                                        // still overflow and must replay as
-                                        // one continuous source canvas.
-                                        // <https://www.w3.org/TR/css-contain-2/#size-containment>
-                                        || child.element_parts().is_some_and(
-                                            |(element, _, _)| {
-                                                used_property_containment(
-                                                    element,
-                                                    &child.style,
-                                                )
-                                                .size
-                                            },
-                                        );
+                                        > item_fragment.used_bounds.height().points() + 0.01;
                                 layout.paint_split_flex_item_fragment(
                                     child,
                                     &placed_style,
@@ -2282,6 +2266,9 @@ impl<'a> LayoutBuilder<'a> {
                                             item_replay_clip.height(),
                                         ),
                                         source_item_top: item_top,
+                                        source_height: PhysicalContentHeight::new(content_box_pt(
+                                            item_fragment.source_bounds.height().points(),
+                                        )),
                                         continuation: materialized_item.continuation,
                                         replay_origin: materialized_item.continuation.replay_origin,
                                         has_descendant_source_overflow,
@@ -2317,6 +2304,7 @@ impl<'a> LayoutBuilder<'a> {
                                             }),
                                     },
                                     inline_flex::SplitFlexItemReplayState {
+                                        source_replay: &mut split_item_source_replay[index],
                                         fragments: &mut split_item_replay_fragments[index],
                                         local_block_ends:
                                             &mut split_item_replay_fragment_local_block_ends[index],
@@ -2325,10 +2313,7 @@ impl<'a> LayoutBuilder<'a> {
                                         destination_block_end: &mut replay_destination_block_end,
                                     },
                                 );
-                                if item_continues_from_previous_fragment
-                                    && let Some(destination_block_end) =
-                                        replay_destination_block_end
-                                {
+                                if let Some(destination_block_end) = replay_destination_block_end {
                                     if replayed_child_destination_ends.len() <= item_page_index {
                                         replayed_child_destination_ends
                                             .resize(item_page_index + 1, None);
@@ -2658,7 +2643,7 @@ impl<'a> LayoutBuilder<'a> {
             // would turn the unused tail into a synthetic extra page.
             // <https://www.w3.org/TR/css-flexbox-1/#pagination>
             // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-            self.cursor_y = self.cursor_y.max(*destination_block_end);
+            self.cursor_y = self.cursor_y.min(*destination_block_end);
         }
         if let Some(Some(child_bottom)) = split_item_replay_fragment_bottoms.get(self.pages.len()) {
             self.cursor_y = self.cursor_y.max(*child_bottom);
@@ -2988,26 +2973,72 @@ impl<'a> LayoutBuilder<'a> {
                         PaintClip::new(outer_x, block_end, outer_width, block_start - block_end)
                     })
                 } else {
-                    flex_container_page_fragment_bounds(&flex_layout.fragment_plan, page_index)
-                        .or_else(|| {
-                            // When a flex continuation record exists but has
-                            // no destination principal box, it is carrying
-                            // descendant overflow only. Do not fall back to
-                            // that child paint's bounds and recreate the
-                            // flex container decoration in this fragment.
-                            (!page_has_materialized_flex_fragment && flex_spanned_pages)
-                                .then(|| {
-                                    fragment.bounds().map(|bounds| {
-                                        PaintClip::from_paint_rect(paint_space_rect(
-                                            outer_x,
-                                            bounds.y(),
-                                            outer_width,
-                                            bounds.height(),
-                                        ))
-                                    })
+                    let principal_bounds =
+                        flex_container_page_fragment_bounds(&flex_layout.fragment_plan, page_index);
+                    let source_paint_bounds = flex_item_overflows_container_source
+                        .then(|| {
+                            fragment.bounds().and_then(|bounds| {
+                                // The page fragment may also contain the
+                                // following normal-flow sibling. A cached
+                                // source replay records the split item's
+                                // final destination edge, which is the only
+                                // valid lower bound for its projected
+                                // background on this final page.
+                                let lower = replayed_child_destination_ends
+                                    .get(page_index)
+                                    .and_then(|entry| *entry)
+                                    .map(|(_, end)| end)
+                                    .unwrap_or(bounds.y())
+                                    .max(bounds.y());
+                                let top = bounds.y() + bounds.height();
+                                (lower < top - 0.01).then(|| {
+                                    PaintClip::from_paint_rect(paint_space_rect(
+                                        outer_x,
+                                        lower,
+                                        outer_width,
+                                        top - lower,
+                                    ))
                                 })
-                                .flatten()
+                            })
                         })
+                        .flatten();
+                    match (principal_bounds, source_paint_bounds) {
+                        (Some(principal), Some(source)) => {
+                            let bottom = principal.y().min(source.y());
+                            let top = (principal.y() + principal.height())
+                                .max(source.y() + source.height());
+                            Some(PaintClip::new(
+                                principal.x().min(source.x()),
+                                bottom,
+                                (principal.x() + principal.width())
+                                    .max(source.x() + source.width())
+                                    - principal.x().min(source.x()),
+                                top - bottom,
+                            ))
+                        }
+                        (Some(principal), None) => Some(principal),
+                        (None, Some(source)) => Some(source),
+                        (None, None) => None,
+                    }
+                    .or_else(|| {
+                        // When a flex continuation record exists but has
+                        // no destination principal box, it is carrying
+                        // descendant overflow only. Do not fall back to
+                        // that child paint's bounds and recreate the
+                        // flex container decoration in this fragment.
+                        (!page_has_materialized_flex_fragment && flex_spanned_pages)
+                            .then(|| {
+                                fragment.bounds().map(|bounds| {
+                                    PaintClip::from_paint_rect(paint_space_rect(
+                                        outer_x,
+                                        bounds.y(),
+                                        outer_width,
+                                        bounds.height(),
+                                    ))
+                                })
+                            })
+                            .flatten()
+                    })
                 };
                 if let Some(fragment_bounds) = fragment_bounds {
                     // An unsplit flex plan may have already materialized its

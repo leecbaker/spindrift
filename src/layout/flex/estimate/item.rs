@@ -209,7 +209,12 @@ impl<'a> LayoutBuilder<'a> {
                 &mut self.font_system,
             )
         {
-            return self.estimate_inline_replaced_row_flex_item(element, stylesheets, context);
+            return self.estimate_inline_replaced_row_flex_item(
+                element,
+                stylesheets,
+                context,
+                child_boxes,
+            );
         }
 
         self.estimate_normal_flow_flex_item(

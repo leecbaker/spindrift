@@ -2399,6 +2399,7 @@ impl<'a> LayoutBuilder<'a> {
             self.record_in_flow_line_baseline(line, context.block_style);
             return;
         };
+        self.advance_to_footnote_call_page_constraint(line);
         if self.cursor_y - line_height < self.page_bottom() - 0.01
             && self.out_of_flow_prebreak_suppression_depth == 0
         {
@@ -2466,6 +2467,45 @@ impl<'a> LayoutBuilder<'a> {
             self.prepare_inline_line_record(&paint_line, paint_context, plaintext_direction_state)
         {
             self.paint_prepared_inline_line_with_text_source(&prepared, text_source);
+        }
+    }
+
+    /// Apply the monotonic page constraint discovered by footnote
+    /// convergence before this line can be accepted into an earlier page.
+    ///
+    /// A footnote body can make its source page too short for the call line.
+    /// Once that line has moved later, replaying with only the destination
+    /// footnote-area reservation must not move it back and recreate the same
+    /// unsatisfied layout state.
+    /// <https://www.w3.org/TR/css-gcpm-3/#footnotes>
+    fn advance_to_footnote_call_page_constraint(&mut self, line: &InlineLineRecord) {
+        let minimum_page_index = line
+            .fragment
+            .as_ref()
+            .into_iter()
+            .flat_map(|fragment| fragment.items())
+            .filter_map(|item| match &item.item {
+                InlineLineItem::Fragment(fragment) => fragment.source().footnote_call(),
+                _ => None,
+            })
+            .filter_map(|element| {
+                self.footnote_call_minimum_page_indices
+                    .get(&element)
+                    .copied()
+            })
+            .max();
+        let Some(minimum_page_index) = minimum_page_index else {
+            return;
+        };
+        while self.pages.len() < minimum_page_index {
+            // A constraint can span an otherwise empty fragmentainer when a
+            // preceding forced break already established the destination.
+            // Retain that real fragmentainer rather than letting `push_page`
+            // fold it back into the current page.
+            if !self.current_page_has_content() {
+                self.mark_current_page_flow_content();
+            }
+            self.push_page();
         }
     }
 

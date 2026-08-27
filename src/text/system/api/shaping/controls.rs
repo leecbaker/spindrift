@@ -34,8 +34,7 @@ pub(crate) fn span_boundary_needs_join_control(left: &str, right: &str) -> bool 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::text) enum ShapingContextKind {
     AuthoredJoinControl,
-    SyntheticBoundaryJoinControl,
-    SyntheticEdgeContext,
+    VirtualBoundaryContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +57,7 @@ impl ShapingContextMap {
                 .cloned()
                 .map(|range| ShapingContextRange {
                     range,
-                    kind: ShapingContextKind::SyntheticBoundaryJoinControl,
+                    kind: ShapingContextKind::VirtualBoundaryContext,
                 })
                 .collect(),
         }
@@ -66,17 +65,6 @@ impl ShapingContextMap {
 
     fn push(&mut self, range: Range<usize>, kind: ShapingContextKind) {
         self.ranges.push(ShapingContextRange { range, kind });
-    }
-
-    fn shift_after_insertion(&mut self, index: usize, amount: usize) {
-        for context in &mut self.ranges {
-            if context.range.start >= index {
-                context.range.start += amount;
-                context.range.end += amount;
-            } else if context.range.end >= index {
-                context.range.end += amount;
-            }
-        }
     }
 
     pub(in crate::text) fn add_authored_join_controls(&mut self, text: &str) {
@@ -97,33 +85,12 @@ impl ShapingContextMap {
     pub(in crate::text) fn is_synthetic_at(&self, index: usize) -> bool {
         self.ranges.iter().any(|context| {
             context.range.contains(&index)
-                && matches!(
-                    context.kind,
-                    ShapingContextKind::SyntheticBoundaryJoinControl
-                        | ShapingContextKind::SyntheticEdgeContext
-                )
+                && matches!(context.kind, ShapingContextKind::VirtualBoundaryContext)
         })
-    }
-
-    fn is_synthetic_only(&self, range: Range<usize>) -> bool {
-        range.start < range.end
-            && self.ranges.iter().any(|context| {
-                context.range.start <= range.start
-                    && range.end <= context.range.end
-                    && matches!(
-                        context.kind,
-                        ShapingContextKind::SyntheticBoundaryJoinControl
-                            | ShapingContextKind::SyntheticEdgeContext
-                    )
-            })
-    }
-
-    pub(in crate::text) fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
     }
 }
 
-/// Append a shaping-only ZWJ and remember its byte range for output cleanup.
+/// Append a virtual boundary-control ZWJ and remember its shaping provenance.
 ///
 /// CSS Text shaping may need join controls that are not present in the DOM
 /// text. Tracking synthetic controls separately preserves the original text
@@ -138,148 +105,7 @@ pub(in crate::text) fn push_synthetic_join_control(
     text.push('\u{200d}');
     contexts.push(
         start..text.len(),
-        ShapingContextKind::SyntheticBoundaryJoinControl,
-    );
-}
-
-pub(in crate::text) fn text_needs_edge_join_context(text: &str) -> bool {
-    text_needs_leading_join_context(text) || text_needs_trailing_join_context(text)
-}
-
-pub(in crate::text) fn text_needs_leading_join_context(text: &str) -> bool {
-    let mut characters = text.chars();
-    if characters.next() != Some('\u{200d}') {
-        return false;
-    }
-    characters
-        .find(|character| !character_is_join_control(*character))
-        .is_some_and(|character| {
-            character_can_join_preceding(character)
-                && character_supports_arabic_tatweel_edge_context(character)
-        })
-}
-
-pub(in crate::text) fn text_needs_trailing_join_context(text: &str) -> bool {
-    let mut characters = text.chars().rev();
-    if characters.next() != Some('\u{200d}') {
-        return false;
-    }
-    characters
-        .find(|character| !character_is_join_control(*character))
-        .is_some_and(|character| {
-            character_can_join_following(character)
-                && character_supports_arabic_tatweel_edge_context(character)
-        })
-}
-
-/// Add shaping-only tatweel at run edges requested by explicit ZWJ.
-///
-/// U+200D at the start or end of an isolated shaping run asks the shaper to
-/// form a connection to a neighboring joining context. Some shaping backends
-/// do not apply that edge context without a concrete joining neighbor, so the
-/// renderer supplies U+0640 ARABIC TATWEEL as shaping-only context and removes
-/// it from emitted glyph text:
-/// <https://www.w3.org/TR/css-text-3/#text-encoding> and
-/// <https://www.w3.org/TR/alreq/#h_joining_enforcement>.
-pub(in crate::text) fn push_edge_join_context<T>(
-    text: &mut String,
-    ranges: &mut Vec<(Range<usize>, &T)>,
-    contexts: &mut ShapingContextMap,
-) {
-    let mut insertions = Vec::new();
-    for (range, _) in ranges.iter() {
-        let Some(slice) = text.get(range.clone()) else {
-            continue;
-        };
-        if let Some(index) = leading_join_context_insertion_index(slice) {
-            insertions.push(range.start + index);
-        } else if text[..range.start].ends_with('\u{200d}')
-            && slice.chars().next().is_some_and(|character| {
-                character_can_join_preceding(character)
-                    && character_supports_arabic_tatweel_edge_context(character)
-            })
-        {
-            // A joiner can be owned by a separately styled span (including a
-            // fallback font face selected solely for U+200D).  The adjacent
-            // Arabic span still needs a concrete joining neighbor; retain the
-            // authored joiner and add only the shaping-only tatweel context at
-            // the styled boundary.
-            // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
-            // <https://www.w3.org/TR/alreq/#h_joining-enforcement>
-            insertions.push(range.start);
-        }
-        if let Some(index) = trailing_join_context_insertion_index(slice) {
-            insertions.push(range.start + index);
-        } else if text[range.end..].starts_with('\u{200d}')
-            && slice.chars().next_back().is_some_and(|character| {
-                character_can_join_following(character)
-                    && character_supports_arabic_tatweel_edge_context(character)
-            })
-        {
-            insertions.push(range.end);
-        }
-    }
-    insertions.sort_unstable();
-    insertions.dedup();
-    for index in insertions.into_iter().rev() {
-        insert_synthetic_join_context(text, ranges, contexts, index);
-    }
-}
-
-pub(in crate::text) fn range_is_synthetic_only(
-    range: Range<usize>,
-    contexts: &ShapingContextMap,
-) -> bool {
-    contexts.is_synthetic_only(range)
-}
-
-pub(in crate::text) fn leading_join_context_insertion_index(text: &str) -> Option<usize> {
-    if !text.starts_with('\u{200d}') {
-        return None;
-    }
-    text.char_indices()
-        .find(|(_, character)| !character_is_join_control(*character))
-        .and_then(|(index, character)| {
-            (character_can_join_preceding(character)
-                && character_supports_arabic_tatweel_edge_context(character))
-            .then_some(index)
-        })
-}
-
-pub(in crate::text) fn trailing_join_context_insertion_index(text: &str) -> Option<usize> {
-    if !text.ends_with('\u{200d}') {
-        return None;
-    }
-    text.char_indices()
-        .rev()
-        .find(|(_, character)| !character_is_join_control(*character))
-        .and_then(|(index, character)| {
-            (character_can_join_following(character)
-                && character_supports_arabic_tatweel_edge_context(character))
-            .then_some(index + character.len_utf8())
-        })
-}
-
-pub(in crate::text) fn insert_synthetic_join_context<T>(
-    text: &mut String,
-    ranges: &mut [(Range<usize>, &T)],
-    contexts: &mut ShapingContextMap,
-    index: usize,
-) {
-    let context_len = '\u{0640}'.len_utf8();
-    text.insert(index, '\u{0640}');
-    for (range, _) in ranges.iter_mut() {
-        if range.start >= index {
-            range.start += context_len;
-            range.end += context_len;
-        } else if range.end >= index {
-            range.end += context_len;
-        }
-    }
-    contexts.shift_after_insertion(index, context_len);
-    contexts.push(
-        index..index + context_len,
-        ShapingContextKind::SyntheticEdgeContext,
+        ShapingContextKind::VirtualBoundaryContext,
     );
 }
 

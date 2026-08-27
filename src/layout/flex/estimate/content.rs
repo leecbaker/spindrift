@@ -606,6 +606,37 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
         // <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>
         let child_style = self.style_with_current_viewport_lengths(child_style);
+        let child_inline_size = used_content_box_width_or_auto(
+            &child_style,
+            layout_pt(containing_inline_size.points()),
+            intrinsic_horizontal_non_content(&child_style, containing_inline_size),
+        )
+        .map(LogicalInlineContentSize::new)
+        .unwrap_or(containing_inline_size);
+        if let Some(replaced) = resolve_replaced_element(
+            child_element,
+            &child_style,
+            ReplacedBoxSizingContext {
+                available_width: containing_inline_size.content_box_length(),
+                inline_percentage_basis: PercentageBasis::definite_from(
+                    containing_inline_size.content_box_length(),
+                    IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
+                ),
+                block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
+                    containing_height_basis,
+                ),
+            },
+            self.base_url,
+            self.root_url,
+            self.resource_cache,
+        ) {
+            let geometry = replaced.geometry();
+            return FlexBlockStackContribution::from_outer_extent(layout_pt(
+                child_style.margin.top
+                    + geometry.border_box_size.height
+                    + child_style.margin.bottom,
+            ));
+        }
         let vertical_non_content = non_content_pt(
             child_style.padding.top
                 + child_style.padding.bottom
@@ -617,10 +648,17 @@ impl<'a> LayoutBuilder<'a> {
             vertical_non_content,
         )
         .unwrap_or_else(|| {
-            let inline_width = (containing_inline_size.points()
-                - child_style.padding.left
-                - child_style.padding.right)
-                .max(1.0);
+            if used_property_containment(child_element, &child_style).size {
+                // Size containment makes only an automatic intrinsic content
+                // contribution empty. A specified block size still resolves
+                // above, and this common constraint path still applies the
+                // child's min/max size and box-model edges.
+                // <https://www.w3.org/TR/css-contain-2/#size-containment>
+                return content_box_pt(0.0);
+            }
+            let inline_width =
+                (child_inline_size.points() - child_style.padding.left - child_style.padding.right)
+                    .max(1.0);
             let inline_measurement = self.intrinsic_inline_measurement_for_element(
                 child_element,
                 &child_style,
@@ -634,7 +672,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 child_boxes,
                 FlexMinContentBlockContainingSpace {
-                    inline_size: containing_inline_size,
+                    inline_size: child_inline_size,
                     height_percentage_basis: PercentageBasis::indefinite(),
                 },
                 LogicalBlockContentSize::new(content_box_pt(

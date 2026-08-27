@@ -123,6 +123,9 @@ pub(in crate::layout) fn push_page_margin_primitive(
         PaintPrimitive::OpaqueTextCoverage { line, paths } => {
             page.push_opaque_text_coverage_in_band(band, line, paths)
         }
+        PaintPrimitive::SvgTextOutline { paths, actual_text } => {
+            page.push_svg_text_outline_in_band(band, paths, actual_text)
+        }
     };
 }
 

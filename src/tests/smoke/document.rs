@@ -1,3 +1,5 @@
+use base64::Engine;
+
 use super::*;
 
 #[tokio::test]
@@ -13,6 +15,115 @@ async fn renders_hello_world_pdf() {
     assert!(rendered.contains("/FontFile2"));
     assert!(rendered.contains("/ToUnicode"));
     assert!(rendered.contains("startxref"));
+}
+
+#[tokio::test]
+async fn inline_svg_text_is_a_native_document_text_run() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 160pt 80pt; margin: 0 } body { margin: 0 }</style>
+           <svg width="120" height="30" xmlns="http://www.w3.org/2000/svg">
+             <text x="4" y="20" font-family="sans-serif" font-size="16">SVG shared text</text>
+           </svg>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "SVG shared text"),
+        "lines={:?}",
+        document.pages[0]
+            .lines()
+            .iter()
+            .map(|line| &line.text)
+            .collect::<Vec<_>>()
+    );
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    assert!(rendered.contains("/Subtype /Type0"));
+    assert!(rendered.contains("/ToUnicode"));
+    assert!(rendered.contains("BT\n"));
+}
+
+#[tokio::test]
+async fn gradient_svg_text_uses_one_actual_text_outline_fallback() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 160pt 80pt; margin: 0 } body { margin: 0 }</style>
+           <svg width="120" height="30" xmlns="http://www.w3.org/2000/svg">
+             <linearGradient id="gradient"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient>
+             <text x="4" y="20" font-size="16" fill="url(#gradient)">Gradient text</text>
+           </svg>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .all(|line| line.text != "Gradient text"),
+        "gradient SVG text must not add an invisible native-text duplicate"
+    );
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    assert!(
+        rendered.contains("/ActualText (Gradient text)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("/Shading"), "{rendered}");
+}
+
+#[tokio::test]
+async fn replaced_svg_image_text_uses_the_document_font_system() {
+    let svg = base64::engine::general_purpose::STANDARD.encode(
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="30"><text x="4" y="20" font-size="16">SVG image text</text></svg>"#,
+    );
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 160pt 80pt; margin: 0 }} body {{ margin: 0 }}</style><img src=\"data:image/svg+xml;base64,{svg}\">"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "SVG image text")
+    );
+}
+
+#[tokio::test]
+async fn html_and_svg_text_share_the_same_document_font() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 160pt 100pt; margin: 0 } body { margin: 0; font-family: sans-serif }</style>
+           <p>HTML font</p>
+           <svg width="120" height="30" xmlns="http://www.w3.org/2000/svg">
+             <text x="4" y="20" font-family="sans-serif" font-size="16">SVG font</text>
+           </svg>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let html = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "HTML font")
+        .expect("HTML line");
+    let svg = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "SVG font")
+        .expect("SVG line");
+    assert_eq!(html.runs[0].font_id, svg.runs[0].font_id);
 }
 
 #[tokio::test]
@@ -3037,6 +3148,71 @@ async fn definite_viewport_height_block_fragments_its_background_and_following_f
     );
     assert!(
         document.pages[3]
+            .lines()
+            .iter()
+            .any(|line| line.text.contains("White"))
+    );
+}
+
+#[tokio::test]
+async fn nested_size_contained_visible_overflow_extends_flex_source_without_used_size() {
+    let document = Html::from_string(
+        "<style>\
+         @page { margin: 0 }\
+         body { margin: 0 }\
+         .outer { display: flex; flex-flow: column; background: yellow }\
+         .contained { contain: size; height: 350vh; width: 20pt; background: hotpink }\
+         .clipped { contain: size; height: 0; overflow: hidden }\
+         .clipped > div { height: 350vh }\
+         .out { position: absolute; height: 350vh }\
+         </style>\
+         <div class=\"outer\"><div><div class=\"contained\"></div><div class=\"clipped\"><div></div></div><div class=\"out\"></div>Yellow</div></div>White",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 4);
+    let last_page = &document.pages[3];
+    assert!(
+        last_page
+            .lines()
+            .iter()
+            .any(|line| line.text.contains("Yellow"))
+    );
+    assert!(
+        last_page
+            .lines()
+            .iter()
+            .any(|line| line.text.contains("White"))
+    );
+}
+
+#[tokio::test]
+async fn nested_size_contained_visible_overflow_extends_grid_fragment_source() {
+    let document = Html::from_string(
+        "<style>\
+         @page { margin: 0 }\
+         body { margin: 0 }\
+         .outer { display: grid; background: yellow }\
+         .contained { contain: size; height: 350vh; width: 20pt; background: hotpink }\
+         </style>\
+         <div class=\"outer\"><div><div class=\"contained\"></div>Yellow</div></div>White",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 4);
+    let last_page = &document.pages[3];
+    assert!(
+        last_page
+            .rects()
+            .iter()
+            .any(|rect| { rect.fill == Some(CssColor::new(255, 105, 180)) && rect.height() > 0.0 })
+    );
+    assert!(
+        last_page
             .lines()
             .iter()
             .any(|line| line.text.contains("White"))

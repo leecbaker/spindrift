@@ -4,7 +4,8 @@ use super::super::items::InlineLineSequenceSlice;
 use super::*;
 use crate::layout::assets::{
     ReplacedObjectOverflow, apply_object_fit, native_generated_gradient_primitive,
-    raster_image_sampling, replaced_content_contour, svg_replaced_group_with_overflow_clip,
+    raster_image_sampling, replaced_content_contour,
+    svg_replaced_group_with_overflow_clip_and_font_system,
 };
 use crate::layout::text_paint::{
     TextDecorationLineGeometry, TextDecorationLineGlyphCoverage, TextDecorationLineGlyphSequence,
@@ -220,30 +221,21 @@ impl<'a> LayoutBuilder<'a> {
                 .max(0.0);
         }
         let line_items = measured_inline_items(&line);
-        // Atomic inline baseline metrics are expressed from their logical
-        // margin-box start, while captured atom contents replay from their
-        // border box. Align the shared line anchor with that same margin-box
-        // reference before positioning text and atoms. Line-relative atoms
-        // and inline-table wrappers opt out in the shared helper because
-        // their placement owns the margin at a different boundary.
-        // <https://drafts.csswg.org/css-inline-3/#line-layout>
-        let line_block_start_margin = inline_line_anchor_block_start_margin(&line, block_style);
-        let line_top = if block_style.writing_mode == WritingMode::HorizontalTb {
-            self.cursor_y - line_block_start_margin
-        } else {
-            self.cursor_y
-        };
+        // CSS Inline first aligns every in-flow inline-level box to the
+        // shared line baseline, then sizes the line from each participant's
+        // layout bounds. Atomic inlines contribute their margin boxes, but
+        // their margins must not move sibling text: their own paint path
+        // converts the margin-box baseline back to the border-box origin.
+        // <https://drafts.csswg.org/css-inline-3/#line-boxes>
+        // <https://www.w3.org/TR/CSS22/visudet.html#line-height>
         let mut line_geometry = InlineLineGeometry::new(
             self.content_left,
             self.content_right,
-            line_top,
+            self.cursor_y,
             context.line_block_size,
             context,
         );
         line_geometry.text_box_line_trim = line_fragment.text_box_trim;
-        if block_style.writing_mode.has_vertical_lines() {
-            line_geometry.apply_logical_block_start_margin(line_block_start_margin);
-        }
         // Unicode space separators hang unconditionally at a selected visual
         // line edge. Their advance is excluded from both fitting and
         // alignment, but remains in the paint sequence past that aligned
@@ -256,6 +248,7 @@ impl<'a> LayoutBuilder<'a> {
         let line_align = context.text_align;
         let line_baseline_offset = line_metrics.baseline_offset;
         let parent_fragment_metrics = self.inline_text_box_metrics(block_style, 0.0);
+        let line_top = self.cursor_y;
         let line_layout_baseline_y = line_top - line_baseline_offset;
         // Text groups are positioned explicitly on `line_layout_baseline_y`
         // below. Atomic boxes must use that same CSS baseline; do not infer a
@@ -2105,13 +2098,14 @@ impl<'a> LayoutBuilder<'a> {
                     // asset, however, an embedded SVG's root viewport obeys
                     // the element's computed CSS overflow.
                     if svg_width > 0.0 && svg_height > 0.0 {
-                        let group = svg_replaced_group_with_overflow_clip(
+                        let group = svg_replaced_group_with_overflow_clip_and_font_system(
                             asset,
                             paint_space_rect(svg_x, svg_y, svg_width, svg_height),
                             atom.style().object_fit,
                             atom.style().object_position.clone(),
                             atom.style().object_view_box.clone(),
                             overflow_edge.as_ref(),
+                            &mut self.font_system,
                         );
                         self.push_svg_group_in_band(PaintBand::Inline, group);
                     }
@@ -2508,6 +2502,6 @@ fn inline_atom_preserves_pending_text_shaping(atom: &InlineAtom) -> bool {
     matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
         if edge.advance == 0.0
             && edge.paint_extent == 0.0
-            && !inline_box_edge_breaks_shaping(atom.style())
+            && !inline_box_edge_fragment_breaks_shaping(atom.style(), *edge)
             && !inline_box_bidi_isolation_breaks_shaping(atom.style()))
 }

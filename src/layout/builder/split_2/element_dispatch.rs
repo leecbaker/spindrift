@@ -1343,22 +1343,37 @@ impl<'a> LayoutBuilder<'a> {
         placement_axes: FloatPlacementAxes,
         run: &mut FloatRunState,
         split_inline_block_offset: Option<f32>,
+        pseudo_source: Option<box_tree::CounterEventSource>,
     ) -> bool {
         let pushed_containing_block = self.push_inline_split_positioning_containing_block(context);
         let saved_cursor_y = self.cursor_y;
         if let Some(offset) = split_inline_block_offset {
             self.cursor_y -= offset;
         }
-        let laid_out = self.layout_floating_child(
-            child_element,
-            child_signature,
-            child_style,
-            child_children,
-            table_fragment,
-            stylesheets,
-            placement_axes,
-            run,
-        );
+        let laid_out = if let Some(pseudo_source) = pseudo_source {
+            self.layout_generated_floating_child(
+                child_element,
+                child_signature,
+                child_style,
+                child_children,
+                table_fragment,
+                stylesheets,
+                placement_axes,
+                run,
+                pseudo_source,
+            )
+        } else {
+            self.layout_floating_child(
+                child_element,
+                child_signature,
+                child_style,
+                child_children,
+                table_fragment,
+                stylesheets,
+                placement_axes,
+                run,
+            )
+        };
         if pushed_containing_block {
             self.containing_blocks.pop();
         }

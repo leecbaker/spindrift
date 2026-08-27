@@ -372,7 +372,7 @@ impl<'a> LayoutBuilder<'a> {
                 dom_state.child_node_index += 1;
                 continue;
             }
-            if self.layout_floating_child(
+            let placed_float = self.layout_floating_child(
                 child_element,
                 child_signature.clone(),
                 &child_style,
@@ -381,7 +381,8 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 FloatPlacementAxes::for_style(style),
                 &mut dom_state.float_run,
-            ) {
+            );
+            if placed_float {
                 dom_state.previous_flow_bottom_margin = None;
                 // Preserve an armed normal-flow break candidate across
                 // out-of-flow floats. If a following sibling avoids a

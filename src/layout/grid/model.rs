@@ -13,17 +13,122 @@ pub(super) struct GridLayout {
     pub(super) last_baseline: Option<f32>,
     pub(super) items: Vec<GridItemLayout>,
     pub(super) baseline_resolutions: Vec<GridBaselineResolution>,
-    pub(super) gap_gutters: GapDecorationGridGutters,
-    pub(super) column_line_offsets: Vec<f32>,
-    pub(super) row_line_offsets: Vec<f32>,
+    /// Final physical Grid geometry. Every consumer, including frozen
+    /// feedback, subgrid, Grid Lanes, and gap decoration painting, derives
+    /// its axis-specific view from these canonical records.
+    pub(super) columns: GridAxisTopology,
+    pub(super) rows: GridAxisTopology,
+    /// The resolved physical content-box extents used to project the axis
+    /// topology into aligned gap-decoration bands.
+    pub(super) content_width: f32,
+    pub(super) content_height: f32,
     /// Final Grid line names in physical Taffy order. This carries inherited
     /// and locally-added subgrid names through nested replay.
     pub(super) column_line_names: Vec<css::GridLineNames>,
     pub(super) row_line_names: Vec<css::GridLineNames>,
-    /// Used physical track sizes retained for edge-track consumers such as
-    /// `margin-trim`; zero-sized auto-fit tracks are collapsed tracks.
-    pub(super) column_track_sizes: Vec<f32>,
-    pub(super) row_track_sizes: Vec<f32>,
+}
+
+/// Final topology of one physical Grid axis.
+///
+/// Numeric zero is not sufficient to describe CSS Grid participation: an
+/// occupied zero-sized track remains in the alignment and gap sequence, while
+/// an empty `auto-fit` track is collapsed. Keep that provenance beside the
+/// canonical interior gutters so no consumer can accidentally reconstruct a
+/// paint topology from Taffy's lossy boundary-gutter representation.
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>
+#[derive(Debug, Clone, Default)]
+pub(in crate::layout) struct GridAxisTopology {
+    /// Final physical line positions. These are retained with the canonical
+    /// track topology because startward implicit-track correction can shift a
+    /// line without changing the corresponding used track size.
+    line_offsets: Vec<f32>,
+    track_sizes: Vec<f32>,
+    /// One gutter after each track except the last; boundary gutters are not
+    /// Grid geometry and are deliberately never retained here.
+    interior_gutters: Vec<f32>,
+    collapsed_auto_fit_tracks: Vec<bool>,
+}
+
+impl GridAxisTopology {
+    pub(in crate::layout) fn new(
+        track_sizes: Vec<f32>,
+        interior_gutters: Vec<f32>,
+        collapsed_auto_fit_tracks: Vec<bool>,
+    ) -> Self {
+        let line_offsets = grid_line_offsets_from_track_layout(&track_sizes, &interior_gutters);
+        Self::with_line_offsets(
+            line_offsets,
+            track_sizes,
+            interior_gutters,
+            collapsed_auto_fit_tracks,
+        )
+    }
+
+    pub(in crate::layout) fn with_line_offsets(
+        line_offsets: Vec<f32>,
+        track_sizes: Vec<f32>,
+        interior_gutters: Vec<f32>,
+        collapsed_auto_fit_tracks: Vec<bool>,
+    ) -> Self {
+        debug_assert_eq!(
+            interior_gutters.len(),
+            track_sizes.len().saturating_sub(1),
+            "a Grid axis has one interior gutter between each adjacent track"
+        );
+        debug_assert_eq!(
+            collapsed_auto_fit_tracks.len(),
+            track_sizes.len(),
+            "auto-fit collapse provenance belongs to individual tracks"
+        );
+        debug_assert_eq!(
+            line_offsets.len(),
+            track_sizes.len().saturating_add(1),
+            "a Grid axis has one more line than track"
+        );
+        Self {
+            line_offsets,
+            track_sizes,
+            interior_gutters,
+            collapsed_auto_fit_tracks,
+        }
+    }
+
+    pub(in crate::layout) fn from_line_offsets(
+        line_offsets: Vec<f32>,
+        track_sizes: Vec<f32>,
+        collapsed_auto_fit_tracks: Vec<bool>,
+    ) -> Self {
+        debug_assert_eq!(line_offsets.len(), track_sizes.len().saturating_add(1));
+        let interior_gutters = grid_layout_track_gutters(&line_offsets, &track_sizes);
+        Self::with_line_offsets(
+            line_offsets,
+            track_sizes,
+            interior_gutters,
+            collapsed_auto_fit_tracks,
+        )
+    }
+
+    pub(in crate::layout) fn track_sizes(&self) -> &[f32] {
+        &self.track_sizes
+    }
+
+    pub(in crate::layout) fn interior_gutters(&self) -> &[f32] {
+        &self.interior_gutters
+    }
+
+    pub(in crate::layout) fn collapsed_auto_fit_tracks(&self) -> &[bool] {
+        &self.collapsed_auto_fit_tracks
+    }
+
+    pub(in crate::layout) fn line_offsets(&self) -> Vec<f32> {
+        self.line_offsets.clone()
+    }
+
+    pub(in crate::layout) fn has_collapsed_auto_fit_tracks(&self) -> bool {
+        self.collapsed_auto_fit_tracks
+            .iter()
+            .any(|collapsed| *collapsed)
+    }
 }
 
 impl GridLayout {
@@ -32,10 +137,24 @@ impl GridLayout {
     /// Grid Lanes uses these only while resolving its Level 3 intrinsic
     /// auto-repeat hypothesis, before it performs its distinct packing pass.
     pub(super) fn physical_track_sizes(&self, axis: GridAxis) -> &[f32] {
+        self.axis_topology(axis).track_sizes()
+    }
+
+    pub(super) fn axis_topology(&self, axis: GridAxis) -> &GridAxisTopology {
         match axis {
-            GridAxis::Column => &self.column_track_sizes,
-            GridAxis::Row => &self.row_track_sizes,
+            GridAxis::Column => &self.columns,
+            GridAxis::Row => &self.rows,
         }
+    }
+
+    pub(super) fn gap_decoration_gutters(&self, style: &ComputedStyle) -> GapDecorationGridGutters {
+        grid_gap_decoration_gutters_from_topologies(
+            &self.columns,
+            &self.rows,
+            style,
+            self.content_width,
+            self.content_height,
+        )
     }
 
     /// Replace one physical axis with the final Grid Lanes topology before
@@ -46,23 +165,32 @@ impl GridLayout {
         axis: GridAxis,
         line_offsets: Vec<f32>,
         track_sizes: Vec<f32>,
+        collapsed_tracks: Vec<bool>,
         line_names: Vec<css::GridLineNames>,
     ) {
-        debug_assert_eq!(line_offsets.len(), track_sizes.len().saturating_add(1));
         debug_assert_eq!(line_offsets.len(), line_names.len());
+        let topology =
+            GridAxisTopology::from_line_offsets(line_offsets, track_sizes, collapsed_tracks);
         match axis {
             GridAxis::Column => {
-                self.column_line_offsets = line_offsets;
-                self.column_track_sizes = track_sizes;
+                self.columns = topology;
                 self.column_line_names = line_names;
             }
             GridAxis::Row => {
-                self.row_line_offsets = line_offsets;
-                self.row_track_sizes = track_sizes;
+                self.rows = topology;
                 self.row_line_names = line_names;
             }
         }
     }
+}
+
+fn grid_layout_track_gutters(line_offsets: &[f32], track_sizes: &[f32]) -> Vec<f32> {
+    line_offsets
+        .windows(2)
+        .zip(track_sizes)
+        .map(|(lines, size)| (lines[1] - lines[0] - size).max(0.0))
+        .take(track_sizes.len().saturating_sub(1))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,13 +662,12 @@ mod tests {
             last_baseline: None,
             items: Vec::new(),
             baseline_resolutions: Vec::new(),
-            gap_gutters: GapDecorationGridGutters::default(),
-            column_line_offsets: Vec::new(),
-            row_line_offsets: Vec::new(),
+            columns: GridAxisTopology::default(),
+            rows: GridAxisTopology::default(),
+            content_width: 0.0,
+            content_height: 60.0,
             column_line_names: Vec::new(),
             row_line_names: Vec::new(),
-            column_track_sizes: Vec::new(),
-            row_track_sizes: Vec::new(),
         };
 
         let _: PhysicalContentHeight = layout.height;

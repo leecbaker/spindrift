@@ -1470,6 +1470,32 @@ fn floated_block_inside_positioned_inline_stays_in_inline_run() {
 }
 
 #[test]
+fn floated_block_inside_nowrap_inline_keeps_text_on_both_sides() {
+    let root = dom::parse(
+        "<html><body><span style=\"white-space:nowrap\">S<div style=\"float:right\"></div><span>ome</span></span></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let body = &page.children[0].children()[0];
+
+    let [FormattingBox::Inline(inline)] = body.children() else {
+        panic!("a floated block must not split its nowrap inline ancestor");
+    };
+    let [
+        FormattingBox::Text(before),
+        float,
+        FormattingBox::Inline(after),
+    ] = inline.core.children.as_slice()
+    else {
+        panic!("expected text, float, and continuation inline in source order");
+    };
+    assert_eq!(before.text, "S");
+    assert!(is_floated_box(float));
+    assert!(
+        matches!(after.core.children.as_slice(), [FormattingBox::Text(text)] if text.text == "ome")
+    );
+}
+
+#[test]
 fn block_inside_inline_preserves_empty_fragment_with_owned_inline_start_edge() {
     let root = dom::parse("<html><body><span><div>Block</div>X</span></body></html>");
     let stylesheet = css::parse_stylesheet(&Css::from_string(

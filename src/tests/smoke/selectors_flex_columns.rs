@@ -890,7 +890,6 @@ async fn multicol_auto_fill_advances_definite_blocks_sequentially() {
     .render(&RenderOptions::default())
     .await
     .unwrap();
-
     let rect = |color| {
         document.pages[0]
             .rects()
@@ -985,7 +984,6 @@ async fn layout_containment_allows_forced_column_break_in_shrink_to_fit_multicol
     .render(&RenderOptions::default())
     .await
     .unwrap();
-
     let rect = |color| {
         document.pages[0]
             .rects()

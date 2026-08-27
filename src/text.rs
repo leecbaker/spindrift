@@ -67,6 +67,54 @@ pub(crate) struct FontSystem {
     fallback_cache: HashMap<FallbackRequest, Option<usize>>,
     font_feature_values: FontFeatureValues,
     font_palette_values: FontPaletteValues,
+    /// Bounded cache of complete source shaping results reused by repeated
+    /// intrinsic and final inline layout. Entries retain the whole computed
+    /// style allocation so a hit is exact rather than an approximation over
+    /// a subset of shaping-affecting CSS properties.
+    untracked_inline_line_cache: Vec<UntrackedInlineLineCacheEntry>,
+    /// Bounded ICU/UAX #14 results reused when orthogonal and intrinsic
+    /// passes revisit the same source run under the same complete break
+    /// policy. The cached offsets are source coordinates only; graph-local
+    /// CSS effects remain resolved by inline layout.
+    measured_break_opportunity_cache: Vec<MeasuredBreakOpportunityCacheEntry>,
+    /// Exact source artifacts for a complete logical inline stream. These
+    /// retain every span's style identity, so they may be reused across
+    /// intrinsic and final passes without flattening CSS shaping boundaries.
+    untracked_styled_inline_line_cache: Vec<UntrackedStyledInlineLineCacheEntry>,
+}
+
+/// An exact source-shaping cache entry.
+///
+/// The graph and selected-line stages clone their source artifacts before
+/// adding line-local tracking, bidi context, or edge effects, so cached
+/// untracked lines remain immutable source measurements.
+#[derive(Clone)]
+struct UntrackedInlineLineCacheEntry {
+    text: Rc<str>,
+    style: Rc<ComputedStyle>,
+    line_height_bits: u32,
+    shaped: Option<ShapedInlineLine>,
+}
+
+/// An exact source-only cache entry for ICU-derived line-break offsets.
+#[derive(Clone)]
+struct MeasuredBreakOpportunityCacheEntry {
+    text: Rc<str>,
+    policy: TextBreakPolicy,
+    offsets: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct UntrackedStyledInlineLineCacheEntry {
+    text: Rc<str>,
+    /// A uniform span sequence has no CSS shaping boundary. Retaining its
+    /// complete computed style permits safe reuse when a speculative pass
+    /// rebuilds equal-but-distinct style allocations.
+    uniform_style: Option<ComputedStyle>,
+    span_styles: Vec<Rc<ComputedStyle>>,
+    line_height_bits: u32,
+    tab_metric_style: ComputedStyle,
+    shaped: Option<ShapedInlineLine>,
 }
 
 impl Clone for FontSystem {
@@ -82,6 +130,9 @@ impl Clone for FontSystem {
             fallback_cache: self.fallback_cache.clone(),
             font_feature_values: self.font_feature_values.clone(),
             font_palette_values: self.font_palette_values.clone(),
+            untracked_inline_line_cache: Vec::new(),
+            measured_break_opportunity_cache: Vec::new(),
+            untracked_styled_inline_line_cache: Vec::new(),
         }
     }
 }
@@ -229,6 +280,7 @@ struct UnicodeRangeResolvedSpan {
 }
 
 pub(crate) use artifacts::{ShapedGlyphRun, ShapedInlineGlyph, ShapedInlineLine, ShapedInlineRun};
+pub(crate) use system::TextShapingRequest;
 
 /// U+FFFC OBJECT REPLACEMENT CHARACTER for atomic inline line breaking.
 ///

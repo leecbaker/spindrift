@@ -628,21 +628,28 @@ impl<'a> LayoutBuilder<'a> {
         };
 
         self.with_ancestor_signature(signature.clone(), |layout| {
-            if replaced_element_kind(element) == Some(ReplacedElementKind::Image)
-                && let Some(image) = used_image(
-                    element,
-                    style,
-                    available_width,
-                    block_size_percentage_basis_from_points(
-                        block_basis.points(),
-                        BlockSizeBasisSource::GridItem,
+            let replaced_block_basis = match block_basis {
+                PercentageBasis::Indefinite => IntrinsicBlockBasis::Indefinite,
+                PercentageBasis::Definite { value, .. } => {
+                    IntrinsicBlockBasis::DefiniteFromContainingBlock(value)
+                }
+            };
+            if let Some(replaced) = resolve_replaced_element(
+                element,
+                style,
+                ReplacedBoxSizingContext {
+                    available_width: content_box_pt(available_width),
+                    inline_percentage_basis: PercentageBasis::definite_from(
+                        content_box_pt(available_width),
+                        IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
                     ),
-                    layout.base_url,
-                    layout.root_url,
-                    layout.resource_cache,
-                )
-            {
-                let content_size = image.content_size;
+                    block_basis: replaced_block_basis,
+                },
+                layout.base_url,
+                layout.root_url,
+                layout.resource_cache,
+            ) {
+                let content_size = replaced.geometry().content_size;
                 let (inline_size, block_size) = grid_item_logical_sizes_from_physical(
                     style,
                     content_size.width.max(1.0),
@@ -660,69 +667,6 @@ impl<'a> LayoutBuilder<'a> {
                 estimate.replaced_used_size = Some(ReplacedGridItemUsedSize {
                     width: PhysicalContentWidth::new(content_box_pt(content_size.width)),
                     height: PhysicalContentHeight::new(content_box_pt(content_size.height)),
-                });
-                return estimate;
-            }
-
-            if replaced_element_kind(element) == Some(ReplacedElementKind::Canvas) {
-                let canvas = used_canvas(
-                    element,
-                    style,
-                    available_width,
-                    block_size_percentage_basis_from_points(
-                        block_basis.points(),
-                        BlockSizeBasisSource::GridItem,
-                    ),
-                );
-                let content_size = canvas.content_size;
-                let (inline_size, block_size) = grid_item_logical_sizes_from_physical(
-                    style,
-                    content_size.width.max(1.0),
-                    content_size.height.max(1.0),
-                );
-                let mut estimate = grid_item_estimate_from_intrinsic(
-                    style,
-                    available_width,
-                    inline_basis,
-                    block_basis,
-                    inline_size,
-                    inline_size,
-                    block_size,
-                );
-                estimate.replaced_used_size = Some(ReplacedGridItemUsedSize {
-                    width: PhysicalContentWidth::new(content_box_pt(content_size.width)),
-                    height: PhysicalContentHeight::new(content_box_pt(content_size.height)),
-                });
-                return estimate;
-            }
-
-            if replaced_element_kind(element) == Some(ReplacedElementKind::Svg)
-                && let Some(svg) = used_svg(
-                    element,
-                    style,
-                    available_width,
-                    block_size_percentage_basis_from_points(
-                        block_basis.points(),
-                        BlockSizeBasisSource::GridItem,
-                    ),
-                )
-            {
-                let width = svg.content_size.width;
-                let height = svg.content_size.height;
-                let (inline_size, block_size) =
-                    grid_item_logical_sizes_from_physical(style, width.max(1.0), height.max(1.0));
-                let mut estimate = grid_item_estimate_from_intrinsic(
-                    style,
-                    available_width,
-                    inline_basis,
-                    block_basis,
-                    inline_size,
-                    inline_size,
-                    block_size,
-                );
-                estimate.replaced_used_size = Some(ReplacedGridItemUsedSize {
-                    width: PhysicalContentWidth::new(content_box_pt(width)),
-                    height: PhysicalContentHeight::new(content_box_pt(height)),
                 });
                 return estimate;
             }

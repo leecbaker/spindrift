@@ -1406,6 +1406,20 @@ impl<'a> LayoutBuilder<'a> {
             return None;
         }
         let mut items = frozen_replay_input.selection_items();
+        if let Some(marker) =
+            self.marker_for_list_item(element, style, self.containing_block_direction)
+            && marker.participates_in_first_line()
+            && marker.has_in_flow_content()
+        {
+            // An inside marker is generated content in the list item's
+            // principal inline flow. Include it in the selected sequence so
+            // orthogonal auto sizing and final paint share one line stack.
+            // <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
+            let mut marker_items = Vec::new();
+            self.push_inside_marker_items(&marker, style, None, &mut marker_items);
+            marker_items.append(&mut items);
+            items = marker_items;
+        }
         // A replay-selected inline sequence is only authoritative when it
         // actually represents inline content. An empty sequence would mask
         // block children, whose intrinsic logical block contribution is the

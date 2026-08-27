@@ -20,6 +20,28 @@ enum PostLayoutHeightReplay {
     BorderBox(BorderBoxLength),
 }
 
+/// Classify the one traversal that owns a block's child source.
+///
+/// The facts supplied here come from the normalized formatting-box stream and,
+/// for a direct float-only source, from the direct DOM. The latter is needed
+/// because a float's descendants must remain terminal at the parent's inline
+/// boundary.
+fn classify_child_traversal_mode(
+    ordered_mixed_flow_required: bool,
+    direct_float_children: bool,
+    inline_sequence_required: bool,
+) -> ChildTraversalMode {
+    if ordered_mixed_flow_required {
+        ChildTraversalMode::OrderedMixed
+    } else if direct_float_children {
+        ChildTraversalMode::DirectFloatChildren
+    } else if inline_sequence_required {
+        ChildTraversalMode::InlineSequence
+    } else {
+        ChildTraversalMode::BlockChildren
+    }
+}
+
 impl PostLayoutHeightReplay {
     fn from_specified_length(value: LayoutLength, box_sizing: BoxSizing) -> Self {
         match box_sizing {
@@ -1726,6 +1748,11 @@ impl<'a> LayoutBuilder<'a> {
         // inline/float replay did not carry a frozen child list.
         // <https://www.w3.org/TR/css-pseudo-4/#generated-content>
         let has_generated_content = style.content.is_generated();
+        let has_tree_abiding_generated_children = style
+            .before_style
+            .iter()
+            .chain(style.after_style.iter())
+            .any(|pseudo| pseudo.content.is_generated());
         // A normalized child stream already owns its inline breaks. Inspecting
         // the raw DOM as well would resurrect a `<br>` whose computed display
         // was suppressed during box-tree construction (notably Appendix B's
@@ -1740,7 +1767,7 @@ impl<'a> LayoutBuilder<'a> {
                 .iter()
                 .chain(style.after_style.iter())
                 .any(|pseudo| pseudo.content.is_generated());
-        let use_ordered_mixed_flow = !has_generated_content
+        let ordered_mixed_flow_required = !has_generated_content
             // Root pseudos are tree-abiding children. The ordered DOM path
             // has no pseudo source entries, so it would drop a block-level
             // `html::before` before the propagated principal-flow child
@@ -1777,7 +1804,16 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 &mut self.font_system,
             );
-        let use_box_inline_items = !use_ordered_mixed_flow
+        let direct_float_children = style.display.is_flow()
+            && !has_generated_content
+            && !has_tree_abiding_generated_children
+            && has_direct_float_only_source_with_font_metrics(
+                element,
+                style,
+                stylesheets,
+                &mut self.font_system,
+            );
+        let inline_sequence_required = !ordered_mixed_flow_required
             && !has_generated_content
             && !has_normalized_flow_children
             && child_boxes
@@ -1788,25 +1824,33 @@ impl<'a> LayoutBuilder<'a> {
                             .any(|box_| !formatting_box_can_only_create_phantom_line_boxes(box_))
                 })
                 .unwrap_or(false);
+        let traversal_mode = classify_child_traversal_mode(
+            ordered_mixed_flow_required,
+            direct_float_children,
+            inline_sequence_required,
+        );
         let has_run_in_inline_content = !run_in_children.is_empty();
 
         // If normalization consumed a run-in source's children, do not replay
         // its original DOM text here. Inline pseudo content that survives in
-        // normalized inline boxes is handled through `use_box_inline_items`.
+        // normalized inline boxes is handled through `InlineSequence`.
         let normalized_children_empty = child_boxes.is_some_and(|boxes| boxes.is_empty());
         let detached_normalized_text = normalized_children_empty
             && !has_generated_content
             && !inline_text_for_style(element, style).is_empty();
         let text = if normalized_children_empty
             || has_generated_content
-            || use_ordered_mixed_flow
+            || matches!(traversal_mode, ChildTraversalMode::OrderedMixed)
+            || matches!(traversal_mode, ChildTraversalMode::DirectFloatChildren)
             || has_normalized_flow_children
-            || use_box_inline_items
+            || matches!(traversal_mode, ChildTraversalMode::InlineSequence)
         {
             String::new()
         } else if is_document_canvas {
             own_inline_text_for_style(element, style)
-        } else if has_direct_dom_flow_child {
+        } else if has_direct_dom_flow_child
+            && matches!(traversal_mode, ChildTraversalMode::BlockChildren)
+        {
             // The DOM fallback lays direct block-flow children in its later
             // child traversal. Their descendant text must not be flattened
             // into a synthetic leading anonymous line in this parent.
@@ -1839,14 +1883,16 @@ impl<'a> LayoutBuilder<'a> {
         // inline runs own the descendant inline source. Recollecting the raw
         // DOM solely because it has a styled inline descendant would replay
         // text on the parent before the normalized sequence.
-        let has_styled_inline_descendant = !has_normalized_flow_children
-            && has_styled_inline_descendant_with_font_metrics(
-                element,
-                style,
-                stylesheets,
-                &self.ancestors,
-                &mut self.font_system,
-            );
+        let has_styled_inline_descendant =
+            !matches!(traversal_mode, ChildTraversalMode::DirectFloatChildren)
+                && !has_normalized_flow_children
+                && has_styled_inline_descendant_with_font_metrics(
+                    element,
+                    style,
+                    stylesheets,
+                    &self.ancestors,
+                    &mut self.font_system,
+                );
         // The canvas box has no own text run.  When its direct children are
         // exclusively ordinary inline boxes, collect that one source stream
         // instead of dropping it while preserving all mixed/block fallback
@@ -1913,7 +1959,9 @@ impl<'a> LayoutBuilder<'a> {
         // subtree and place those floats a second time before the ordered
         // traversal reaches their source positions.
         // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
-        } else if has_collectable_inline_content && !use_ordered_mixed_flow {
+        } else if has_collectable_inline_content
+            && !matches!(traversal_mode, ChildTraversalMode::OrderedMixed)
+        {
             let pushed_text_box_trim = self.push_text_box_line_trim_scope(block_line_trim);
             if use_inline_items {
                 let laid_out_multicol_inline_items = self.layout_multicol_inline_items_block(
@@ -2004,7 +2052,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut box_inline_has_flow_effects = false;
         let mut laid_out_box_inline_multicol = false;
         if !has_run_in_inline_content
-            && use_box_inline_items
+            && matches!(traversal_mode, ChildTraversalMode::InlineSequence)
             && !(has_collectable_inline_content && use_inline_items)
             && let Some(child_boxes) = child_boxes
         {
@@ -2129,86 +2177,87 @@ impl<'a> LayoutBuilder<'a> {
             && has_direct_inline_content
             && !vertical_inline_size_is_definite
         {
-            let vertical_inline_height = if use_box_inline_items
-                && let Some(marker) = list_marker.as_ref()
-                && marker.participates_in_first_line()
-            {
-                child_boxes
-                    .map(|child_boxes| {
-                        self.intrinsic_inline_measurement_for_boxes_with_marker(
-                            child_boxes,
-                            style,
-                            marker,
-                            stylesheets,
-                            content_logical_inline_size,
-                        )
-                        .physical_height(style)
-                    })
-                    .unwrap_or(0.0)
-            } else if let Some(sequence) = committed_vertical_inline_sequence.as_ref() {
-                sequence.occupied_physical_inline_extent(style).points()
-            } else if let Some(marker) = list_marker.as_ref()
-                && marker.participates_in_first_line()
-                && !text.is_empty()
-            {
-                // In vertical writing, the physical height consumed by an
-                // inside marker is part of the line's inline-axis advance.
-                // Measuring only the principal text makes successive list
-                // items overlap and ignores marker font-size changes.
-                // <https://drafts.csswg.org/css-writing-modes-4/#vertical-layout>
-                // <https://drafts.csswg.org/css-lists-3/#marker-position>
-                let mut items = Vec::new();
-                self.push_inside_marker_items(marker, style, None, &mut items);
-                self.push_inline_words(
-                    &text,
-                    style,
-                    None,
-                    0.0,
-                    InlineVisualOffset::zero(),
-                    &mut items,
-                );
-                self.intrinsic_inline_measurement_for_items(
-                    items,
-                    style,
-                    content_logical_inline_size,
-                )
-                .physical_height(style)
-            } else if use_box_inline_items {
-                child_boxes
-                    .map(|child_boxes| {
-                        self.intrinsic_inline_measurement_for_boxes(
-                            child_boxes,
-                            style,
-                            stylesheets,
-                            content_logical_inline_size,
-                        )
-                        .physical_height(style)
-                    })
-                    .unwrap_or(0.0)
-            } else if !text.is_empty() {
-                // This fallback still has styled inline descendants in the
-                // DOM-backed collector.  Measuring its flattened text under
-                // the block style would discard an inner atomic inline's
-                // effective layout footprint: in particular a horizontal
-                // text-combine-upright composition must contribute its one-em
-                // square, not its uncompressed horizontal advance.
-                //
-                // Use the same styled item collection and intrinsic graph as
-                // line layout, which forms TCY before measuring its atomic
-                // parent participant.
-                // <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
-                // <https://drafts.csswg.org/css-sizing-3/#intrinsic>
-                self.intrinsic_inline_measurement_for_element(
-                    element,
-                    style,
-                    stylesheets,
-                    child_boxes,
-                    content_logical_inline_size,
-                )
-                .physical_height(style)
-            } else {
-                0.0
-            };
+            let vertical_inline_height =
+                if matches!(traversal_mode, ChildTraversalMode::InlineSequence)
+                    && let Some(marker) = list_marker.as_ref()
+                    && marker.participates_in_first_line()
+                {
+                    child_boxes
+                        .map(|child_boxes| {
+                            self.intrinsic_inline_measurement_for_boxes_with_marker(
+                                child_boxes,
+                                style,
+                                marker,
+                                stylesheets,
+                                content_logical_inline_size,
+                            )
+                            .physical_height(style)
+                        })
+                        .unwrap_or(0.0)
+                } else if let Some(sequence) = committed_vertical_inline_sequence.as_ref() {
+                    sequence.occupied_physical_inline_extent(style).points()
+                } else if let Some(marker) = list_marker.as_ref()
+                    && marker.participates_in_first_line()
+                    && !text.is_empty()
+                {
+                    // In vertical writing, the physical height consumed by an
+                    // inside marker is part of the line's inline-axis advance.
+                    // Measuring only the principal text makes successive list
+                    // items overlap and ignores marker font-size changes.
+                    // <https://drafts.csswg.org/css-writing-modes-4/#vertical-layout>
+                    // <https://drafts.csswg.org/css-lists-3/#marker-position>
+                    let mut items = Vec::new();
+                    self.push_inside_marker_items(marker, style, None, &mut items);
+                    self.push_inline_words(
+                        &text,
+                        style,
+                        None,
+                        0.0,
+                        InlineVisualOffset::zero(),
+                        &mut items,
+                    );
+                    self.intrinsic_inline_measurement_for_items(
+                        items,
+                        style,
+                        content_logical_inline_size,
+                    )
+                    .physical_height(style)
+                } else if matches!(traversal_mode, ChildTraversalMode::InlineSequence) {
+                    child_boxes
+                        .map(|child_boxes| {
+                            self.intrinsic_inline_measurement_for_boxes(
+                                child_boxes,
+                                style,
+                                stylesheets,
+                                content_logical_inline_size,
+                            )
+                            .physical_height(style)
+                        })
+                        .unwrap_or(0.0)
+                } else if !text.is_empty() {
+                    // This fallback still has styled inline descendants in the
+                    // DOM-backed collector.  Measuring its flattened text under
+                    // the block style would discard an inner atomic inline's
+                    // effective layout footprint: in particular a horizontal
+                    // text-combine-upright composition must contribute its one-em
+                    // square, not its uncompressed horizontal advance.
+                    //
+                    // Use the same styled item collection and intrinsic graph as
+                    // line layout, which forms TCY before measuring its atomic
+                    // parent participant.
+                    // <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+                    // <https://drafts.csswg.org/css-sizing-3/#intrinsic>
+                    self.intrinsic_inline_measurement_for_element(
+                        element,
+                        style,
+                        stylesheets,
+                        child_boxes,
+                        content_logical_inline_size,
+                    )
+                    .physical_height(style)
+                } else {
+                    0.0
+                };
             if vertical_inline_height > 0.0 {
                 self.cursor_y = self.cursor_y.min(content_top - vertical_inline_height);
             }
@@ -2216,7 +2265,7 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(marker) = list_marker.as_ref()
             && !inline_text_has_non_phantom_content(&text, inline_style)
             && !has_collectable_inline_content
-            && !use_box_inline_items
+            && !matches!(traversal_mode, ChildTraversalMode::InlineSequence)
             && !laid_out_column_children
         {
             if marker.paints_outside() {
@@ -2317,11 +2366,10 @@ impl<'a> LayoutBuilder<'a> {
                 start_margin_arrangement,
                 starts_at_page_top,
                 laid_out_column_children,
-                use_box_inline_items,
+                traversal_mode,
                 run_in_inline_items_laid_out,
-                use_ordered_mixed_flow,
                 has_preceding_inline_flow_content: has_collectable_inline_content
-                    && !use_ordered_mixed_flow,
+                    && !matches!(traversal_mode, ChildTraversalMode::OrderedMixed),
                 preceding_inline_local_cutoff,
                 preceding_inline_clamp_block_advance,
                 discard_region_limit: None,

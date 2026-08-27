@@ -24,9 +24,9 @@ use crate::css::{
     PhysicalSide, Position, Quotes, SelfAlignmentKeyword, StylesheetOrigin, Stylesheets,
     TableCellVerticalAlign, TableLayout, TargetReference, TextAlign, TextAlignLast, TextAutospace,
     TextDecorationSkipInk, TextDecorationSkipSpaces, TextDecorationStyle, TextDecorationThickness,
-    TextJustify, TextOrientation, TextSpacingTrim, TextTransformCase, TextUnderlineOffset,
-    TextUnderlinePosition, UnicodeBidi, VerticalAlign, Visibility, WhiteSpace, WritingMode,
-    WritingModeAxes, block_end_side, block_start_side, inline_end_side, inline_start_side,
+    TextJustify, TextOrientation, TextTransformCase, TextUnderlineOffset, TextUnderlinePosition,
+    UnicodeBidi, VerticalAlign, Visibility, WhiteSpace, WritingMode, WritingModeAxes,
+    block_end_side, block_start_side, inline_end_side, inline_start_side,
 };
 use crate::document::paint::annotations::RenderedLink;
 use crate::document::paint::contours::{BoxContentContour, ResolvedBoxContentClip};
@@ -168,7 +168,7 @@ mod table;
 mod table_span;
 mod taffy_bridge;
 mod text_helpers;
-mod text_paint;
+pub(crate) mod text_paint;
 
 /// Rasterize one generated CSS image only when the PDF writer needs it.
 pub(crate) fn rasterize_generated_image(

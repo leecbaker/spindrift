@@ -231,6 +231,46 @@ mod tests {
     }
 
     #[test]
+    fn svg_text_presentation_attributes_are_author_zero_declarations() {
+        let stylesheet = crate::css::parse_stylesheet(&Css::from_string(
+            "text { font-weight: 500; font-kerning: none }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
+        let presentation = SvgPresentationAttributeDeclarations::svg_properties(
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[("font-weight", "700"), ("font-kerning", "normal")],
+        );
+        let author_style = style_for_element_with_signature_and_svg_presentation(
+            ElementSignature::new("text", HashMap::new()),
+            None,
+            Some(&presentation),
+            &stylesheets,
+            None,
+            &[],
+        );
+        let inline_style = style_for_element_with_signature_and_svg_presentation(
+            ElementSignature::new("text", HashMap::new()),
+            Some("font-weight: 900 !important"),
+            Some(&presentation),
+            &stylesheets,
+            None,
+            &[],
+        );
+
+        assert_eq!(author_style.font_weight, crate::css::FontWeight(500));
+        assert_eq!(author_style.font_kerning, crate::css::FontKerning::None);
+        assert_eq!(inline_style.font_weight, crate::css::FontWeight(900));
+    }
+
+    #[test]
     fn typed_attr_resolution_uses_function_tokens_not_source_substrings() {
         let element = ElementSignature::new(
             "div",
@@ -490,7 +530,7 @@ impl SvgPresentationAttributeDeclarations {
         transform_origin: Option<&str>,
         transform_box: Option<&str>,
     ) -> Self {
-        Self::svg_properties(transform, transform_origin, transform_box, None, None)
+        Self::svg_properties(transform, transform_origin, transform_box, None, None, &[])
     }
 
     /// Build SVG presentation-attribute declarations that the host cascade
@@ -503,6 +543,7 @@ impl SvgPresentationAttributeDeclarations {
         transform_box: Option<&str>,
         flood_color: Option<&str>,
         lighting_color: Option<&str>,
+        text_presentation_attributes: &[(&str, &str)],
     ) -> Self {
         let mut source = String::new();
         let transform = match transform {
@@ -546,6 +587,12 @@ impl SvgPresentationAttributeDeclarations {
                 source.push_str(value);
                 source.push(';');
             }
+        }
+        for (property, value) in text_presentation_attributes {
+            source.push_str(property);
+            source.push(':');
+            source.push_str(value);
+            source.push(';');
         }
         Self {
             declarations: parse_declarations(&source),

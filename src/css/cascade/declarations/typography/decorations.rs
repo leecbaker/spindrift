@@ -399,7 +399,7 @@ pub(in crate::css) fn parse_text_emphasis_skip(value: &str) -> Option<TextEmphas
     Some(skip)
 }
 
-pub(in crate::css) fn parse_text_shadow(value: &str, font_size: f32) -> Option<Vec<TextShadow>> {
+pub(crate) fn parse_text_shadow(value: &str, font_size: f32) -> Option<Vec<TextShadow>> {
     let value = trim_css_value(value);
     if value.eq_ignore_ascii_case("none") {
         return Some(Vec::new());

@@ -15,8 +15,8 @@ pub(crate) use cascade::{
     apply_pseudo_rules_with_parent_ch_advance, declarations_affect_same_property,
     default_display_is_block_level_for_tag, default_style_for_tag, origin_importance_rank,
     parse_background_image, parse_css_image, parse_individual_rotate, parse_individual_scale,
-    parse_individual_translate, parse_object_view_box, parse_transform, parse_transform_box,
-    parse_transform_origin, style_for_element_with_signature,
+    parse_individual_translate, parse_object_view_box, parse_svg_text_shadow, parse_transform,
+    parse_transform_box, parse_transform_origin, style_for_element_with_signature,
     style_for_element_with_signature_and_parent_ch_advance,
     style_for_element_with_signature_and_svg_presentation,
 };
@@ -45,6 +45,7 @@ pub(crate) use parse::{
     media_rule_applies_in_environment, parse_declarations, parse_stylesheet,
     parse_stylesheet_with_media_environment, supports_condition_applies,
 };
+pub(crate) use parse_svg_text_shadow as parse_text_shadow;
 pub use types::{
     ColorSchemePreference, Css, CssColor, CssViewportSize, ForcedColorPalette, ForcedColorsMode,
     MediaEnvironment, MediaType,

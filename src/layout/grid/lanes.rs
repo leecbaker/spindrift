@@ -799,8 +799,8 @@ impl<'a> LayoutBuilder<'a> {
             GridLanesAxis::Rows => &style.grid_template_rows,
         };
         let taffy_line_offsets = match axis {
-            GridLanesAxis::Columns => &layout.column_line_offsets,
-            GridLanesAxis::Rows => &layout.row_line_offsets,
+            GridLanesAxis::Columns => layout.columns.line_offsets(),
+            GridLanesAxis::Rows => layout.rows.line_offsets(),
         };
         // Taffy's two-dimensional placement can introduce an implicit axis
         // before reporting its track details.  In Grid Lanes that axis is not
@@ -892,9 +892,10 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
             .flatten();
+        let gap_gutters = layout.gap_decoration_gutters(style);
         let taffy_gutters = match axis {
-            GridLanesAxis::Columns => &layout.gap_gutters.columns,
-            GridLanesAxis::Rows => &layout.gap_gutters.rows,
+            GridLanesAxis::Columns => &gap_gutters.columns,
+            GridLanesAxis::Rows => &gap_gutters.rows,
         };
         let geometry = resolved_grid_axis
             .and_then(GridLanesTrackGeometry::from_resolved_subgrid_axis)
@@ -916,7 +917,7 @@ impl<'a> LayoutBuilder<'a> {
                     .or(auto_column_geometry)
                     .or_else(|| {
                         GridLanesTrackGeometry::from_grid_layout_offsets(
-                            taffy_line_offsets,
+                            &taffy_line_offsets,
                             taffy_gutters,
                         )
                     })
@@ -1006,6 +1007,7 @@ impl<'a> LayoutBuilder<'a> {
             },
             final_grid_axis_offsets,
             geometry.track_sizes(),
+            vec![false; geometry.track_count()],
             final_grid_axis_line_names,
         );
 
@@ -1338,7 +1340,9 @@ impl<'a> LayoutBuilder<'a> {
                 layout.height =
                     PhysicalContentHeight::new(content_box_pt(stacking_range.end_points()));
             }
-            layout.row_line_offsets = vec![0.0, layout.height.points()];
+            layout.rows =
+                GridAxisTopology::new(vec![layout.height.points()], Vec::new(), vec![false]);
+            layout.content_height = layout.height.points();
         } else {
             // Row lanes establish the physical block-axis track geometry. A
             // two-dimensional Grid probe may create implicit rows from its
@@ -1357,7 +1361,14 @@ impl<'a> LayoutBuilder<'a> {
                         .cloned()
                         .unwrap_or_else(|| layout.height.points()),
                 ));
-                layout.row_line_offsets = geometry.line_offsets();
+                let line_offsets = geometry.line_offsets();
+                let track_sizes = geometry.track_sizes();
+                layout.rows = GridAxisTopology::from_line_offsets(
+                    line_offsets,
+                    track_sizes.clone(),
+                    vec![false; track_sizes.len()],
+                );
+                layout.content_height = layout.height.points();
             }
         }
         // Content distribution positions the packed stacking range as one
@@ -1427,7 +1438,13 @@ impl<'a> LayoutBuilder<'a> {
         }
         match axis {
             GridLanesAxis::Columns => {
-                layout.column_line_offsets = geometry.line_offsets();
+                let line_offsets = geometry.line_offsets();
+                let track_sizes = geometry.track_sizes();
+                layout.columns = GridAxisTopology::from_line_offsets(
+                    line_offsets,
+                    track_sizes.clone(),
+                    vec![false; track_sizes.len()],
+                );
                 let mut names = resolved_grid_axis
                     .map(|axis| axis.physical_line_names().to_vec())
                     .or_else(|| {
@@ -1441,12 +1458,18 @@ impl<'a> LayoutBuilder<'a> {
                             .map(|template| template.line_names.clone())
                     })
                     .unwrap_or_else(|| layout.column_line_names.clone());
-                names.resize_with(layout.column_line_offsets.len(), Vec::new);
-                names.truncate(layout.column_line_offsets.len());
+                names.resize_with(layout.columns.line_offsets().len(), Vec::new);
+                names.truncate(layout.columns.line_offsets().len());
                 layout.column_line_names = names;
             }
             GridLanesAxis::Rows if !has_auto_row_geometry => {
-                layout.row_line_offsets = geometry.line_offsets();
+                let line_offsets = geometry.line_offsets();
+                let track_sizes = geometry.track_sizes();
+                layout.rows = GridAxisTopology::from_line_offsets(
+                    line_offsets,
+                    track_sizes.clone(),
+                    vec![false; track_sizes.len()],
+                );
                 let mut names = resolved_grid_axis
                     .map(|axis| axis.physical_line_names().to_vec())
                     .or_else(|| {
@@ -1460,8 +1483,8 @@ impl<'a> LayoutBuilder<'a> {
                             .map(|template| template.line_names.clone())
                     })
                     .unwrap_or_else(|| layout.row_line_names.clone());
-                names.resize_with(layout.row_line_offsets.len(), Vec::new);
-                names.truncate(layout.row_line_offsets.len());
+                names.resize_with(layout.rows.line_offsets().len(), Vec::new);
+                names.truncate(layout.rows.line_offsets().len());
                 layout.row_line_names = names;
             }
             GridLanesAxis::Rows => {}
@@ -2214,12 +2237,12 @@ impl<'a> LayoutBuilder<'a> {
         )?;
         let geometry = match axis {
             GridLanesAxis::Columns => GridLanesTrackGeometry::from_grid_layout_offsets(
-                &layout.column_line_offsets,
-                &layout.gap_gutters.columns,
+                &layout.columns.line_offsets(),
+                &layout.gap_decoration_gutters(&materialized_style).columns,
             ),
             GridLanesAxis::Rows => GridLanesTrackGeometry::from_grid_layout_offsets(
-                &layout.row_line_offsets,
-                &layout.gap_gutters.rows,
+                &layout.rows.line_offsets(),
+                &layout.gap_decoration_gutters(&materialized_style).rows,
             ),
         }?;
         Some(geometry)

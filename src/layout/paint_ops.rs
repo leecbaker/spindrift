@@ -755,6 +755,10 @@ impl<'a> LayoutBuilder<'a> {
                 self.current_page
                     .push_opaque_text_coverage_in_band(band, line, paths);
             }
+            PaintPrimitive::SvgTextOutline { paths, actual_text } => {
+                self.current_page
+                    .push_svg_text_outline_in_band(band, paths, actual_text);
+            }
         }
     }
 

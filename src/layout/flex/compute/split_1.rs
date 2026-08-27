@@ -35,6 +35,7 @@ impl FinalNormalFlowMeasurementMode {
         physical_direction: FlexDirection,
         main_size_provenance: FlexMainSizeProvenance,
         is_replaced: bool,
+        cross_size_is_definite: bool,
     ) -> Self {
         if is_replaced {
             return Self::ReplayedUsedGeometry;
@@ -50,10 +51,11 @@ impl FinalNormalFlowMeasurementMode {
         {
             return Self::ColumnContentMainSize;
         }
-        if !final_normal_flow_block_span_replaces_provisional_height(
+        if !final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
             child_style,
             physical_direction,
             main_size_provenance,
+            cross_size_is_definite,
         ) {
             return Self::ReplayedUsedGeometry;
         }
@@ -1042,6 +1044,7 @@ impl<'a> LayoutBuilder<'a> {
             &active_children,
             style,
             physical_direction,
+            available.definite_cross_size(physical_direction).is_some(),
         );
         let mut active_lines = flex_lines_from_items(
             &mut active_items,
@@ -1804,21 +1807,7 @@ pub(in crate::layout::flex) fn assign_flex_item_fragmentation_heights(
     for (state, child) in states.iter_mut().zip(children) {
         let estimate = state.estimate();
         let item = state.allocation_mut();
-        // Size containment suppresses descendant-derived intrinsic source
-        // extent, but not the flex item's independently resolved used box.
-        // A definite `height` therefore remains a monolithic source span for
-        // the outer flex fragment plan; only its children are denied internal
-        // break opportunities.
-        // <https://www.w3.org/TR/css-contain-2/#size-containment>
-        // <https://www.w3.org/TR/css-break-3/#monolithic>
-        if child
-            .element_parts()
-            .is_some_and(|(element, _, _)| used_property_containment(element, &child.style).size)
-        {
-            item.set_fragmentation_height(PhysicalContentHeight::new(content_box_pt(
-                item.height().points(),
-            )));
-        } else if !child.style.overflow_y.is_scrollable() {
+        if !child.style.overflow_y.is_scrollable() {
             // Scrollable overflow remains inside the flex item's scrollport.
             // It may contribute visual/clipped descendant paint, but it must
             // not manufacture additional page-fragment slices beyond the used
@@ -2394,6 +2383,9 @@ impl<'a> LayoutBuilder<'a> {
                 physical_flex_direction(container_style),
                 estimate.main_size_provenance,
                 child.is_replaced_element(),
+                available
+                    .definite_cross_size(physical_flex_direction(container_style))
+                    .is_some(),
             );
             let mut placed_style = placed_flex_item_style(
                 &replay_style,
@@ -2525,12 +2517,14 @@ fn apply_final_normal_flow_item_block_spans(
     children: &[StyledChild<'_>],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
+    cross_size_is_definite: bool,
 ) {
     for ((item, estimate), child) in items.iter_mut().zip(estimates).zip(children) {
-        if !final_normal_flow_block_span_replaces_provisional_height(
+        if !final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
             &child.style,
             physical_direction,
             estimate.main_size_provenance,
+            cross_size_is_definite,
         ) {
             continue;
         }
@@ -2564,25 +2558,25 @@ fn apply_final_normal_flow_item_block_spans(
     }
 }
 
-/// Return whether final normal-flow block geometry replaces Taffy's
-/// provisional physical height for this item.
+/// Determine whether normal-flow measurement may replace Taffy's provisional
+/// row cross size.
 ///
-/// A row item's physical height is its cross-size, so its authored `height`
-/// remains authoritative unless the established automatic-height path needs
-/// the final line-box span. A column item's physical height is its flex main
-/// size and remains the Taffy allocation even when its descendants' normal
-/// flow extends beyond it. The resolved-basis provenance travels with the
-/// estimate to this cross-size correction boundary.
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-basis-property>
-/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
-fn final_normal_flow_block_span_replaces_provisional_height(
+/// A final line's definite cross size must be replayed into an item with a
+/// percentage min/max cross constraint. Measuring that item again as an
+/// unconstrained automatic block box would discard the resolved percentage
+/// and let fragmentainer height become its flex-line contribution.
+/// <https://drafts.csswg.org/css-flexbox-1/#algo-cross-item>
+fn final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
     style: &ComputedStyle,
     physical_direction: FlexDirection,
     main_size_provenance: FlexMainSizeProvenance,
+    cross_size_is_definite: bool,
 ) -> bool {
     physical_direction.is_row_axis()
         && style.box_values.height.is_auto()
         && main_size_provenance.permits_final_normal_flow_block_span()
+        && !(cross_size_is_definite
+            && (!style.box_values.min_height.is_auto() || !style.box_values.max_height.is_auto()))
 }
 
 fn assign_flex_item_percentage_height_bases(
@@ -3388,11 +3382,14 @@ mod tests {
         let mut style = definite_height_style();
         style.flex_basis = css::ComputedFlexBasis::Content;
 
-        assert!(!final_normal_flow_block_span_replaces_provisional_height(
-            &style,
-            FlexDirection::Column,
-            FlexMainSizeProvenance::NormalFlowContent,
-        ));
+        assert!(
+            !final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
+                &style,
+                FlexDirection::Column,
+                FlexMainSizeProvenance::NormalFlowContent,
+                false,
+            )
+        );
     }
 
     #[test]
@@ -3405,11 +3402,14 @@ mod tests {
             FlexMainSizeProvenance::MainSizeProperty,
             FlexMainSizeProvenance::DefiniteFlexBasis,
         ] {
-            assert!(!final_normal_flow_block_span_replaces_provisional_height(
-                &style,
-                FlexDirection::Column,
-                provenance,
-            ));
+            assert!(
+                !final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
+                    &style,
+                    FlexDirection::Column,
+                    provenance,
+                    false,
+                )
+            );
         }
     }
 
@@ -3418,11 +3418,14 @@ mod tests {
         let mut style = definite_height_style();
         style.flex_basis = css::ComputedFlexBasis::Content;
 
-        assert!(!final_normal_flow_block_span_replaces_provisional_height(
-            &style,
-            FlexDirection::Row,
-            FlexMainSizeProvenance::NormalFlowContent,
-        ));
+        assert!(
+            !final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
+                &style,
+                FlexDirection::Row,
+                FlexMainSizeProvenance::NormalFlowContent,
+                false,
+            )
+        );
     }
 
     #[test]
@@ -3430,22 +3433,54 @@ mod tests {
         let mut style = ComputedStyle::initial();
         style.flex_basis = css::ComputedFlexBasis::Content;
 
-        assert!(final_normal_flow_block_span_replaces_provisional_height(
-            &style,
-            FlexDirection::Row,
-            FlexMainSizeProvenance::NormalFlowContent,
-        ));
+        assert!(
+            final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
+                &style,
+                FlexDirection::Row,
+                FlexMainSizeProvenance::NormalFlowContent,
+                false,
+            )
+        );
+    }
+
+    #[test]
+    fn definite_line_cross_size_keeps_percentage_cross_constraints_for_final_replay() {
+        let mut style = ComputedStyle::initial();
+        style.flex_basis = css::ComputedFlexBasis::Content;
+        style.box_values.min_height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(1.0),
+        );
+
+        assert!(
+            final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
+                &style,
+                FlexDirection::Row,
+                FlexMainSizeProvenance::NormalFlowContent,
+                false,
+            )
+        );
+        assert!(
+            !final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
+                &style,
+                FlexDirection::Row,
+                FlexMainSizeProvenance::NormalFlowContent,
+                true,
+            )
+        );
     }
 
     #[test]
     fn row_final_block_span_does_not_replace_aspect_ratio_transfer() {
         let style = ComputedStyle::initial();
 
-        assert!(!final_normal_flow_block_span_replaces_provisional_height(
-            &style,
-            FlexDirection::Row,
-            FlexMainSizeProvenance::AspectRatioTransfer,
-        ));
+        assert!(
+            !final_normal_flow_block_span_replaces_provisional_height_with_cross_definiteness(
+                &style,
+                FlexDirection::Row,
+                FlexMainSizeProvenance::AspectRatioTransfer,
+                false,
+            )
+        );
     }
 
     #[test]
@@ -3470,6 +3505,7 @@ mod tests {
             &source_style,
             FlexDirection::Column,
             FlexMainSizeProvenance::NormalFlowContent,
+            false,
             false,
         );
         mode.prepare_placed_style(&mut placed_style, &source_style);
@@ -3502,6 +3538,7 @@ mod tests {
             FlexDirection::Row,
             FlexMainSizeProvenance::NormalFlowContent,
             false,
+            false,
         );
         mode.prepare_placed_style(&mut placed_style, &source_style);
 
@@ -3526,6 +3563,7 @@ mod tests {
                     FlexDirection::Column,
                     provenance,
                     false,
+                    false,
                 ),
                 FinalNormalFlowMeasurementMode::ReplayedUsedGeometry,
             );
@@ -3543,6 +3581,7 @@ mod tests {
                 FlexDirection::Column,
                 FlexMainSizeProvenance::NormalFlowContent,
                 true,
+                false,
             ),
             FinalNormalFlowMeasurementMode::ReplayedUsedGeometry,
         );

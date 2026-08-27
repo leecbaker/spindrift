@@ -8495,6 +8495,48 @@ async fn inline_float_nowrap_does_not_break_before_float() {
 }
 
 #[tokio::test]
+async fn nested_block_float_in_nowrap_inline_retains_marker_and_continuation() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 120pt; margin: 10pt } body { margin: 0 }\
+         div { width: 10ch; white-space: nowrap; font: 10pt/10pt monospace }\
+         .float { float: right; width: 5ch; height: 5ch; background: blue }</style>\
+         <div><span>S<div class=\"float\"></div><span>ome</span> text that overflows my parent.</span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text_lines = document.pages[0]
+        .lines()
+        .iter()
+        .filter(|line| !line.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_lines.len(),
+        1,
+        "nowrap text must remain one line: {text_lines:?}"
+    );
+    assert!(
+        text_lines[0]
+            .text
+            .contains("Some text that overflows my parent."),
+        "the float marker must retain the text on both sides: {:?}",
+        text_lines[0]
+    );
+
+    let blue = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("nested block float must produce a blue paint rect");
+    assert!(
+        blue.y() + blue.height() <= text_lines[0].y() + 0.01,
+        "the deferred right float must occupy the preceding eligible row: blue={blue:?}, line={:?}",
+        text_lines[0]
+    );
+}
+
+#[tokio::test]
 async fn inline_float_nowrap_collapses_space_after_earlier_marker() {
     let document = Html::from_string(
         "<style>@page { size: 180pt 120pt; margin: 10pt } body { margin: 0 }\
@@ -13336,6 +13378,43 @@ async fn flex_inline_svg_rows_ignore_formatting_whitespace_for_height() {
         (rendered_line_baseline_top(&document, after) - 166.0).abs() < 0.2,
         "After top={}",
         rendered_line_baseline_top(&document, after)
+    );
+}
+
+#[tokio::test]
+async fn column_flex_block_wrappers_reserve_svg_used_height() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 10pt } body { margin: 0 }\
+         .stack { display:flex; flex-direction:column; align-items:flex-start; gap:8pt; width:75pt }\
+         .diagram { width:75pt }</style>\
+         <div class=\"stack\"><div class=\"diagram\"><svg style=\"display:block;width:100%;height:auto\" viewBox=\"0 0 150 30\"><rect width=\"150\" height=\"30\" fill=\"red\"/></svg></div>\
+         <div class=\"diagram\"><svg style=\"display:block;width:100%;height:auto\" viewBox=\"0 0 150 30\"><rect width=\"150\" height=\"30\" fill=\"blue\"/></svg></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let first = document.pages[0]
+        .paths()
+        .iter()
+        .find(|path| path.fill == Some(CssColor::new(255, 0, 0)))
+        .and_then(|path| path.paint_bounds())
+        .unwrap();
+    let second = document.pages[0]
+        .paths()
+        .iter()
+        .find(|path| path.fill == Some(CssColor::new(0, 0, 255)))
+        .and_then(|path| path.paint_bounds())
+        .unwrap();
+
+    assert!((first.size.height - 15.0).abs() < 0.01, "first={first:?}");
+    assert!(
+        (second.size.height - 15.0).abs() < 0.01,
+        "second={second:?}"
+    );
+    assert!(
+        (first.origin.y - second.origin.y).abs() >= 23.0 - 0.01,
+        "the 8pt flex gap must follow the first 15pt SVG box: first={first:?}, second={second:?}"
     );
 }
 

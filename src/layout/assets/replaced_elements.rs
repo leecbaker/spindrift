@@ -217,13 +217,14 @@ impl<'a> LayoutBuilder<'a> {
                 )
             {
                 if let Some(asset) = image.svg {
-                    let mut group = svg_replaced_group(
+                    let mut group = svg_replaced_group_with_font_system(
                         &asset,
                         paint_space_rect(image_x, image_y, content_width, content_height),
                         style.object_fit,
                         style.object_position.clone(),
                         style.object_view_box.clone(),
                         overflow,
+                        &mut self.font_system,
                     );
                     if let Some(clip) = content_contour
                         .as_ref()
@@ -346,17 +347,16 @@ impl<'a> LayoutBuilder<'a> {
                 {
                     self.push_primitive_in_band(PaintBand::InFlowBlock, primitive);
                 } else if let Some(asset) = image.svg {
-                    self.push_svg_group_in_band(
-                        PaintBand::InFlowBlock,
-                        svg_replaced_group(
-                            &asset,
-                            paint_space_rect(image_x, image_y, content_width, content_height),
-                            style.object_fit,
-                            style.object_position.clone(),
-                            style.object_view_box.clone(),
-                            overflow,
-                        ),
+                    let group = svg_replaced_group_with_font_system(
+                        &asset,
+                        paint_space_rect(image_x, image_y, content_width, content_height),
+                        style.object_fit,
+                        style.object_position.clone(),
+                        style.object_view_box.clone(),
+                        overflow,
+                        &mut self.font_system,
                     );
+                    self.push_svg_group_in_band(PaintBand::InFlowBlock, group);
                 } else {
                     let natural_size = image.decoded.natural_layout_size();
                     let mut rendered = RenderedImage::from_paint_rect(
@@ -462,9 +462,10 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/SVG2/coords.html#ViewportSpace>
             let viewport_asset =
                 asset.with_replaced_viewport(content_box_size_pt(content_width, content_height));
-            let mut group = viewport_asset.paint_inline_group(
+            let mut group = viewport_asset.paint_inline_group_with_font_system(
                 paint_space_rect(content_x, content_y, content_width, content_height),
                 false,
+                &mut self.font_system,
             );
             if let Some(clip) = overflow_edge
                 .as_ref()

@@ -318,19 +318,6 @@ impl VerticalAlign {
         self.baseline_shift.requires_root_font_metrics()
     }
 
-    /// Return whether `baseline-shift` positions the aligned subtree relative
-    /// to the resolved line box instead of the parent baseline.
-    ///
-    /// CSS Inline Layout Level 3 defines `top`, `center`, and `bottom` in
-    /// terms of aligning the shifted box with the line box:
-    /// <https://drafts.csswg.org/css-inline-3/#baseline-shift-property>.
-    pub(crate) fn has_line_relative_baseline_shift(self) -> bool {
-        matches!(
-            self.baseline_shift,
-            BaselineShift::Top | BaselineShift::Center | BaselineShift::Bottom
-        )
-    }
-
     /// Resolve the `baseline-shift` longhand against the element's own line-height.
     ///
     /// Positive values raise the box and negative values lower it.

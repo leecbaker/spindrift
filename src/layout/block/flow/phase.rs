@@ -1,5 +1,30 @@
 use super::*;
 
+/// Selects the one child-source traversal that owns a block's direct
+/// descendants.
+///
+/// A float is out of normal flow, but a direct float still has to be emitted
+/// by its parent's block-child traversal when no in-flow inline content
+/// precedes it. Keeping that case distinct from an inline sequence prevents a
+/// floated box's *own* descendant text from manufacturing an anonymous line
+/// box in its parent.
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum ChildTraversalMode {
+    /// Normalized inline source owns the direct descendants, including floats
+    /// that occur beside actual parent inline content.
+    InlineSequence,
+    /// Direct floats are the only non-phantom child source and are emitted by
+    /// ordinary block-child traversal at the parent's current block position.
+    DirectFloatChildren,
+    /// Raw DOM source must preserve the interleaving of inline and block
+    /// children.
+    OrderedMixed,
+    /// Ordinary block-child traversal owns the descendants.
+    BlockChildren,
+}
+
 pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     pub(in crate::layout) fragmentainer_kind: FragmentainerKind,
     pub(in crate::layout) element: &'a Element,
@@ -13,11 +38,10 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     pub(in crate::layout) start_margin_arrangement: BlockStartMarginArrangement,
     pub(in crate::layout) starts_at_page_top: bool,
     pub(in crate::layout) laid_out_column_children: bool,
-    pub(in crate::layout) use_box_inline_items: bool,
+    pub(in crate::layout) traversal_mode: ChildTraversalMode,
     /// Whether the target block already incorporated its normalized run-in
     /// prelude and inline children into one line-item sequence.
     pub(in crate::layout) run_in_inline_items_laid_out: bool,
-    pub(in crate::layout) use_ordered_mixed_flow: bool,
     /// Whether a preceding direct inline run establishes the source side of
     /// the first class-A child boundary.
     pub(in crate::layout) has_preceding_inline_flow_content: bool,

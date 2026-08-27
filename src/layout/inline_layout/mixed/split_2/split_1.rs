@@ -5,6 +5,58 @@ use crate::layout::block::{
     FloatContour, FlowExclusionKind, InitialLetterLayout, LogicalFloatPlacement,
 };
 
+/// Whether a graph's source context can reuse cached advances for a selected
+/// line.
+///
+/// Source shaping is retained across a selected boundary, but CSS line
+/// construction can still replace an edge, trim text, or attach a marker.
+/// This context gate is deliberately shared by normal wrapping, balancing,
+/// clamping, and float-constrained fitting so those selection modes cannot
+/// disagree on when exact materialization is required.
+/// <https://www.w3.org/TR/css-text-3/#line-breaking>
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+fn source_measurement_context_matches_selected_line(
+    graph: &InlineOpportunityGraph,
+    block_style: &ComputedStyle,
+    line_index: usize,
+) -> bool {
+    (line_index != 0 || block_style.first_line_style.is_none())
+        && !block_style.hanging_punctuation.first
+        && !block_style.hanging_punctuation.last
+        && !block_style.hanging_punctuation.force_end
+        && !block_style.hanging_punctuation.allow_end
+        && graph.supports_monotonic_source_measurement()
+}
+
+/// Whether a selected graph boundary leaves the cached source advance as the
+/// selected line's fitting advance.
+fn source_measurement_boundary_matches_selected_line(
+    break_opportunity: Option<InlineBreakOpportunity>,
+) -> bool {
+    break_opportunity.is_none_or(|opportunity| {
+        matches!(
+            opportunity.kind,
+            InlineBreakKind::SoftWrap
+                | InlineBreakKind::ExplicitVirtual
+                | InlineBreakKind::PreservedSpace
+                | InlineBreakKind::Forced
+        ) && !opportunity.hangs_from_fitting_measure()
+            && !opportunity.is_discretionary()
+            && opportunity.discretionary.is_none()
+            && !opportunity.availability.is_fallback()
+    })
+}
+
+fn source_measurement_matches_selected_line(
+    graph: &InlineOpportunityGraph,
+    block_style: &ComputedStyle,
+    line_index: usize,
+    break_opportunity: Option<InlineBreakOpportunity>,
+) -> bool {
+    source_measurement_context_matches_selected_line(graph, block_style, line_index)
+        && source_measurement_boundary_matches_selected_line(break_opportunity)
+}
+
 /// Whether the selected final line must reserve a block ellipsis for source
 /// that lies outside the current inline graph.
 ///
@@ -1376,19 +1428,33 @@ impl<'a> LayoutBuilder<'a> {
                 selected_end.position.min(graph_end)
             };
             end = line_end_extended_over_adjacent_inline_float_markers(graph, end).min(graph_end);
-            // A soft break before a `nowrap` inline does not make the
-            // inline's leading unbreakable prefix a line of its own.  When
-            // that prefix fits with the preceding text, retain it on the
-            // current line and let the following float use the normal
-            // source-order placement path.  Otherwise a float inside `nobr`
-            // is placed against the later line while its prefix was
-            // incorrectly broken before the inline.
+            // A candidate soft wrap before a visible `nowrap` continuation
+            // with a float must remain the preceding line's end. In
+            // particular, the marker-only lookahead below must not absorb the
+            // continuation's prefix. The following source selection takes the
+            // whole continuation, and its ordinary transaction defers the
+            // float below the overflowing line when needed.
             // <https://www.w3.org/TR/css-text-3/#white-space-property>
             // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
-            if let Some(float_position) = graph.first_float_position_in_range(InlineGraphRange {
-                start,
-                end: graph_end,
-            }) && end < float_position
+            let preserve_unbreakable_continuation = graph
+                .unbreakable_inline_float_continuation_after(InlineGraphRange { start, end })
+                .is_some_and(|continuation| {
+                    continuation.source_range.start == end
+                        && continuation.marker < continuation.source_range.end
+                });
+            // Outside a visible `nowrap` continuation, a marker may extend a
+            // fitting ordinary source prefix without becoming a CSS Text wrap
+            // opportunity. The continuation query above deliberately blocks
+            // that marker-only extension for `nowrap` source.
+            // <https://www.w3.org/TR/css-text-3/#white-space-property>
+            // <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+            if !preserve_unbreakable_continuation
+                && let Some(float_position) =
+                    graph.first_float_position_in_range(InlineGraphRange {
+                        start,
+                        end: graph_end,
+                    })
+                && end < float_position
                 && !graph
                     .break_opportunities_after(end)
                     .take_while(|opportunity| opportunity.position <= float_position)
@@ -2538,6 +2604,21 @@ impl<'a> LayoutBuilder<'a> {
         let remaining_allows_last =
             graph_remaining_allows_last_hanging_punctuation(graph, end.position);
         let applies_first_line_style = line_index == 0 && block_style.first_line_style.is_some();
+        // Balance, clamping, and float-marker selection share this exact
+        // fitting entry point. When the graph proves that source advances
+        // already are the selected line advances, let those callers consume
+        // the same source measurement as ordinary `break-all` wrapping.
+        if source_measurement_matches_selected_line(
+            graph,
+            block_style,
+            line_index,
+            end.break_opportunity,
+        ) && let Some(width) = graph.monotonic_source_range_width(range)
+        {
+            return width;
+        }
+        #[cfg(feature = "layout-profile")]
+        let exact_remeasurement_started = std::time::Instant::now();
         // Do not use the graph's borrowed prefix measure here. Materializing
         // the candidate is what applies selected edge trimming, atomic-inline
         // word-spacing ownership, and pseudo-style shaping before both
@@ -2616,7 +2697,14 @@ impl<'a> LayoutBuilder<'a> {
             remaining_allows_last,
             true,
         );
-        (materialized.fitting_width - hanging_widths.start - hanging_widths.end).max(0.0)
+        let width =
+            (materialized.fitting_width - hanging_widths.start - hanging_widths.end).max(0.0);
+        #[cfg(feature = "layout-profile")]
+        crate::layout::layout_profile::record_inline_line_exact_remeasurement(
+            graph.source_byte_len_for_range(range),
+            exact_remeasurement_started.elapsed(),
+        );
+        width
     }
 
     /// Enumerate same-count legal break sequences for one balance group.
@@ -3833,23 +3921,40 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
         let generated_float_children = [];
-        self.layout_floating_child(
-            float
-                .element()
-                .expect("DOM inline float has an element source"),
-            float
-                .signature()
-                .expect("DOM inline float has an element signature")
-                .clone(),
-            float.style(),
-            float
-                .is_generated_content()
-                .then_some(generated_float_children.as_slice()),
-            None,
-            context.stylesheets,
-            placement_axes,
-            run,
-        )
+        let element = float
+            .element()
+            .expect("DOM inline float has an element source");
+        let signature = float
+            .signature()
+            .expect("DOM inline float has an element signature")
+            .clone();
+        let children = float
+            .is_generated_content()
+            .then_some(generated_float_children.as_slice());
+        if let Some(pseudo_source) = float.generated_pseudo_source() {
+            self.layout_generated_floating_child(
+                element,
+                signature,
+                float.style(),
+                children,
+                None,
+                context.stylesheets,
+                placement_axes,
+                run,
+                pseudo_source,
+            )
+        } else {
+            self.layout_floating_child(
+                element,
+                signature,
+                float.style(),
+                children,
+                None,
+                context.stylesheets,
+                placement_axes,
+                run,
+            )
+        }
     }
 
     /// Place and paint an anonymous text float for `::first-letter`.
@@ -4643,24 +4748,23 @@ impl<'a> LayoutBuilder<'a> {
         // wrapping to minimize overflow.
         // <https://drafts.csswg.org/css-text-3/#valdef-white-space-break-spaces>
         let mut overflowing_break_spaces = None::<SelectedInlineLineEnd>;
-        let opportunities = graph.break_opportunities_after(start).collect::<Vec<_>>();
+        let opportunities = graph.break_opportunity_slice_after(start);
         // `::first-line` can change shaping advances (notably
         // `word-spacing`), so its candidate measurements are not the graph's
         // monotonic source measurements. Keep it on the shared materialized
         // measurement path used by balancing and final paint.
         // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
-        if (line_index != 0 || block_style.first_line_style.is_none())
-            && let Some(selected) = self.select_monotonic_regular_line_end(
-                graph,
-                start,
-                block_style,
-                line_available_width,
-                &opportunities,
-            )
-        {
+        if let Some(selected) = self.select_monotonic_regular_line_end(
+            graph,
+            start,
+            block_style,
+            line_index,
+            line_available_width,
+            opportunities,
+        ) {
             return selected;
         }
-        for opportunity in opportunities {
+        for &opportunity in opportunities {
             // A source-order float marker participates in float placement,
             // never in CSS Text line breaking. In particular, selecting it
             // here would split a `white-space: pre`/`nowrap` continuation and
@@ -4834,12 +4938,12 @@ impl<'a> LayoutBuilder<'a> {
     /// Select a line end by binary search when every candidate has a monotonic
     /// used advance.
     ///
-    /// A `word-break: break-all` paragraph can have an opportunity after every
-    /// typographic unit. Re-materializing every prefix makes a long, ordinary
-    /// line quadratic, even though its used width can only grow (or remain
-    /// equal at a trailing trimmed space). Restrict this shortcut to source
-    /// text without discretionary, hanging, spacing-trim, or atomic effects;
-    /// those cases retain the general candidate-by-candidate algorithm below.
+    /// Re-materializing every candidate prefix makes a long paragraph
+    /// quadratic, especially for `word-break: break-all`. Restrict this
+    /// shortcut to source text without discretionary, hanging, spacing-trim,
+    /// or atomic effects; source provenance, rather than ASCII membership,
+    /// establishes whether a particular Unicode range can use this
+    /// measurement.
     /// <https://drafts.csswg.org/css-text-3/#line-breaking>
     /// <https://drafts.csswg.org/css-text-3/#word-break-property>
     fn select_monotonic_regular_line_end(
@@ -4847,86 +4951,19 @@ impl<'a> LayoutBuilder<'a> {
         graph: &InlineOpportunityGraph,
         start: InlineGraphPosition,
         block_style: &ComputedStyle,
+        line_index: usize,
         line_available_width: f32,
         opportunities: &[InlineBreakOpportunity],
     ) -> Option<SelectedInlineLineEnd> {
         if opportunities.is_empty()
-            || opportunities
-                .iter()
-                .any(|opportunity| graph.wrap_inside_avoid_depth(opportunity.position) != 0)
-            || block_style.hanging_punctuation.first
-            || block_style.hanging_punctuation.last
-            || block_style.hanging_punctuation.force_end
-            || block_style.hanging_punctuation.allow_end
-            || !graph.runs.iter().all(|run| {
-                matches!(
-                    &run.item,
-                    InlineLineItem::Fragment(fragment)
-                        if matches!(fragment.style().word_break, css::WordBreak::BreakAll)
-                            && matches!(
-                                fragment.style().text_spacing_trim.resolved(),
-                                TextSpacingTrim::SpaceAll | TextSpacingTrim::Normal
-                            )
-                            && !inline_run_has_nonzero_tracking(run)
-                            && !fragment.text().contains('\t')
-                            && fragment
-                                .text()
-                                .chars()
-                                .all(|character| character.is_ascii_alphanumeric())
-                )
-            })
-            || !opportunities.iter().all(|opportunity| {
-                matches!(
-                    opportunity.kind,
-                    InlineBreakKind::SoftWrap
-                        | InlineBreakKind::ExplicitVirtual
-                        | InlineBreakKind::PreservedSpace
-                        | InlineBreakKind::Forced
-                ) && (opportunity.kind != InlineBreakKind::Forced
-                    || opportunity.position == graph.end_position())
-                    && !opportunity.hangs_from_fitting_measure()
-                    && !opportunity.is_discretionary()
-                    && opportunity.discretionary.is_none()
-                    && !opportunity.availability.is_fallback()
-            })
+            || !source_measurement_context_matches_selected_line(graph, block_style, line_index)
         {
             return None;
         }
-
-        let mut first_too_wide = opportunities.len();
-        let mut lower = 0usize;
-        let mut upper = opportunities.len();
-        while lower < upper {
-            let candidate_index = lower + (upper - lower) / 2;
-            let opportunity = opportunities[candidate_index];
-            let selected_break =
-                (opportunity.position < graph.end_position()).then_some(opportunity);
-            let range = InlineGraphRange {
-                start,
-                end: opportunity.position,
-            };
-            let fitting_width = graph
-                .monotonic_source_range_width(range)
-                .unwrap_or_else(|| {
-                    graph
-                        .materialize_line_for_available_width(
-                            range,
-                            selected_break,
-                            line_available_width,
-                            &mut self.font_system,
-                            block_style,
-                        )
-                        .fitting_width
-                });
-            if fitting_width <= line_available_width + 0.5 {
-                lower = candidate_index + 1;
-            } else {
-                first_too_wide = candidate_index;
-                upper = candidate_index;
-            }
-        }
-
-        let opportunity = opportunities[first_too_wide.saturating_sub(1)];
+        let cursor = graph.monotonic_source_measure_cursor_after(start)?;
+        let opportunity = cursor
+            .last_fitting(line_available_width)
+            .or_else(|| cursor.first())?;
         Some(SelectedInlineLineEnd {
             position: opportunity.position,
             break_opportunity: (opportunity.position < graph.end_position()).then_some(opportunity),

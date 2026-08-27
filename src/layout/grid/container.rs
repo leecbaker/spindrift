@@ -482,7 +482,7 @@ impl<'a> LayoutBuilder<'a> {
                     GridFragmentBlockSize::new(continuation_grid_content_capacity.points()),
                 ),
                 fragmentation_content_height,
-                &grid_layout.row_line_offsets,
+                &grid_layout.rows.line_offsets(),
                 &grid_layout.items,
                 &children,
             )
@@ -584,8 +584,8 @@ impl<'a> LayoutBuilder<'a> {
                     content_height: PhysicalContentHeight::new(content_box_pt(
                         total_content_height,
                     )),
-                    column_line_offsets: &grid_layout.column_line_offsets,
-                    row_line_offsets: &grid_layout.row_line_offsets,
+                    column_line_offsets: &grid_layout.columns.line_offsets(),
+                    row_line_offsets: &grid_layout.rows.line_offsets(),
                 },
                 containing_block,
             ));
@@ -637,8 +637,8 @@ impl<'a> LayoutBuilder<'a> {
                     content_height: PhysicalContentHeight::new(content_box_pt(
                         total_content_height,
                     )),
-                    column_line_offsets: &grid_layout.column_line_offsets,
-                    row_line_offsets: &grid_layout.row_line_offsets,
+                    column_line_offsets: &grid_layout.columns.line_offsets(),
+                    row_line_offsets: &grid_layout.rows.line_offsets(),
                     positioning_containing_block: establishes_positioning_containing_block
                         .then(|| self.containing_blocks.last().copied())
                         .flatten(),
@@ -653,7 +653,7 @@ impl<'a> LayoutBuilder<'a> {
             // pages through a rollback snapshot.
             let mut split_item_replay = std::iter::repeat_with(|| None)
                 .take(grid_layout.items.len())
-                .collect::<Vec<Option<SplitGridItemSourceReplay>>>();
+                .collect::<Vec<Option<ContinuousSourceReplay>>>();
             let mut fragment_cursor = GridFragmentCursor::new(
                 PageTopBlockPosition::new(content_top),
                 GridFragmentBlockOffset::new(0.0),
@@ -900,7 +900,7 @@ impl<'a> LayoutBuilder<'a> {
                                 // this page; pre-clipping item geometry here would
                                 // apply that range a second time at a break.
                                 items: &grid_gap_items,
-                                gutters: &grid_layout.gap_gutters,
+                                gutters: &grid_layout.gap_decoration_gutters(style),
                                 source_block_start,
                                 source_block_end,
                                 ends_at_fragment_break: planned_fragment_record.is_some_and(
@@ -947,20 +947,20 @@ impl<'a> LayoutBuilder<'a> {
                                     inner_x,
                                     content_top,
                                     grid_used_track_extent(
-                                        &grid_layout.column_line_offsets,
+                                        &grid_layout.columns.line_offsets(),
                                         &grid_layout.items,
                                         GridAxis::Column,
                                         inner_width,
                                     ),
                                     grid_used_track_extent(
-                                        &grid_layout.row_line_offsets,
+                                        &grid_layout.rows.line_offsets(),
                                         &grid_layout.items,
                                         GridAxis::Row,
                                         total_content_height,
                                     ),
                                 ),
                                 &grid_gap_items,
-                                &grid_layout.gap_gutters,
+                                &grid_layout.gap_decoration_gutters(style),
                             ),
                         );
                     } else {
@@ -978,7 +978,7 @@ impl<'a> LayoutBuilder<'a> {
                                         )),
                                         total_content_height,
                                         items: &grid_gap_items,
-                                        gutters: &grid_layout.gap_gutters,
+                                        gutters: &grid_layout.gap_decoration_gutters(style),
                                         source_block_start,
                                         source_block_end,
                                         ends_at_fragment_break: matches!(
@@ -1318,7 +1318,8 @@ impl<'a> LayoutBuilder<'a> {
         (!WritingModeAxes::new(style.writing_mode, style.used_direction()).swaps_physical_axes())
             .then(|| {
                 layout
-                    .column_line_offsets
+                    .columns
+                    .line_offsets()
                     .last()
                     .copied()
                     .unwrap_or_default()
@@ -1542,8 +1543,8 @@ impl<'a> LayoutBuilder<'a> {
                     content_height: PhysicalContentHeight::new(content_box_pt(
                         total_content_height,
                     )),
-                    column_line_offsets: &grid_layout.column_line_offsets,
-                    row_line_offsets: &grid_layout.row_line_offsets,
+                    column_line_offsets: &grid_layout.columns.line_offsets(),
+                    row_line_offsets: &grid_layout.rows.line_offsets(),
                 },
                 containing_block,
             ));
@@ -1586,8 +1587,8 @@ impl<'a> LayoutBuilder<'a> {
                     content_height: PhysicalContentHeight::new(content_box_pt(
                         total_content_height,
                     )),
-                    column_line_offsets: &grid_layout.column_line_offsets,
-                    row_line_offsets: &grid_layout.row_line_offsets,
+                    column_line_offsets: &grid_layout.columns.line_offsets(),
+                    row_line_offsets: &grid_layout.rows.line_offsets(),
                     positioning_containing_block: establishes_positioning_containing_block
                         .then(|| self.containing_blocks.last().copied())
                         .flatten(),
@@ -1617,13 +1618,13 @@ impl<'a> LayoutBuilder<'a> {
                         inner_x,
                         content_top,
                         grid_used_track_extent(
-                            &grid_layout.column_line_offsets,
+                            &grid_layout.columns.line_offsets(),
                             &grid_layout.items,
                             GridAxis::Column,
                             inner_width,
                         ),
                         grid_used_track_extent(
-                            &grid_layout.row_line_offsets,
+                            &grid_layout.rows.line_offsets(),
                             &grid_layout.items,
                             GridAxis::Row,
                             total_content_height,
@@ -1634,7 +1635,7 @@ impl<'a> LayoutBuilder<'a> {
                         .iter()
                         .map(GridItemLayout::gap_decoration_item)
                         .collect::<Vec<_>>(),
-                    &grid_layout.gap_gutters,
+                    &grid_layout.gap_decoration_gutters(style),
                 ),
             );
         }

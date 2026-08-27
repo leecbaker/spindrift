@@ -116,6 +116,9 @@ impl FontSystem {
             fallback_cache: HashMap::new(),
             font_feature_values: seed.font_feature_values,
             font_palette_values: seed.font_palette_values,
+            untracked_inline_line_cache: Vec::new(),
+            measured_break_opportunity_cache: Vec::new(),
+            untracked_styled_inline_line_cache: Vec::new(),
         }
     }
 }

@@ -3,7 +3,7 @@ use crate::css::{
     LayoutLength, TextLayoutPolicy, TextOrientation, layout_pt,
 };
 use crate::layout::{
-    InlineAtom, InlineAtomBaseline, LayoutBuilder, inline_atom_logical_block_size,
+    InlineAtom, LayoutBuilder, inline_atom_logical_block_size,
     inline_atom_logical_margin_box_baseline_offset,
 };
 use crate::units::{
@@ -109,11 +109,12 @@ impl<'a> LayoutBuilder<'a> {
         // that same internal coordinate system. Only an atom without a
         // content-derived baseline set uses CSS Inline's margin-edge
         // synthesis rules.
-        let own_metric = if atom_has_content_derived_baseline(atom) {
-            self.content_exported_atom_metric_offset(atom, metric, own_baseline)
-        } else {
-            atomic_baseline_metric_offset(metric, own_block_size, own_baseline)
-        };
+        let own_metric =
+            if let Some(source_metric) = atom.content_derived_baseline_metric(parent_style) {
+                self.content_exported_atom_metric_offset(atom, metric, source_metric, own_baseline)
+            } else {
+                atomic_baseline_metric_offset(metric, own_block_size, own_baseline)
+            };
         self.vertical_align_baseline_shift_for_coordinates(
             style,
             parent_style,
@@ -184,24 +185,25 @@ impl<'a> LayoutBuilder<'a> {
 
     /// Convert an exported atom first baseline into another member of the
     /// same text baseline set. The atom's first baseline is measured from its
-    /// margin-box block start; subtracting the style's alphabetic coordinate
-    /// before adding the requested coordinate preserves that origin.
+    /// margin-box block start; rebasing through its recorded source metric
+    /// preserves that origin for central baselines in vertical writing modes.
     fn content_exported_atom_metric_offset(
         &mut self,
         atom: &InlineAtom,
         metric: BaselineMetric,
-        exported_alphabetic: f32,
+        source_metric: BaselineMetric,
+        exported_source_metric: f32,
     ) -> f32 {
         let style = atom.style();
-        let alphabetic = self
+        let source = self
             .font_system
-            .baseline_offset_for_style(style, BaselineMetric::Alphabetic)
+            .baseline_offset_for_style(style, source_metric)
             .points();
         let requested = self
             .font_system
             .baseline_offset_for_style(style, metric)
             .points();
-        content_exported_metric_offset(exported_alphabetic, requested, alphabetic)
+        content_exported_metric_offset(exported_source_metric, requested, source)
     }
 }
 
@@ -238,13 +240,6 @@ fn atomic_baseline_metric_offset(
         }
         BaselineMetric::Alphabetic => alphabetic_baseline,
     }
-}
-
-fn atom_has_content_derived_baseline(atom: &InlineAtom) -> bool {
-    !matches!(
-        atom.baseline,
-        InlineAtomBaseline::SynthesizedBorderBoxBlockEnd
-    )
 }
 
 /// Rebase a metric from an atom's text content on its exported alphabetic

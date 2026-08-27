@@ -223,6 +223,9 @@ fn record_table_replay_fragment_bottom(
 /// prevents a caller from advancing sibling placement without retaining the
 /// matching source fragment.
 pub(in crate::layout::flex) struct SplitFlexItemReplayState<'a> {
+    /// The one continuous descendant source canvas for visible overflow. This
+    /// remains absent for a child that owns ordinary fragmentation.
+    pub(in crate::layout::flex) source_replay: &'a mut Option<ContinuousSourceReplay>,
     pub(in crate::layout::flex) fragments: &'a mut Vec<PaintFragment>,
     pub(in crate::layout::flex) local_block_ends: &'a mut Vec<Option<f32>>,
     pub(in crate::layout::flex) table_fragment_bottoms: &'a mut Vec<Option<f32>>,
@@ -659,11 +662,10 @@ impl<'a> LayoutBuilder<'a> {
         // the border-box conversion above typed until this projection.
         let border_box_height_points = border_box_height.points();
         let inline_atom_baselines = (!containment.layout).then(|| {
-            let baselines = flex_layout.baselines.into_inline_atom_baselines(
+            flex_layout.baselines.into_inline_atom_baselines(
                 layout_pt(border_widths.top + style.padding.top),
                 layout_pt(border_widths.left + style.padding.left),
-            );
-            self.inline_flex_baselines_as_alphabetic(baselines, style)
+            )
         });
         // The off-page atom capture may lay out descendant lines, but they
         // are not principal lines of an ancestor list item. Keep the
@@ -1134,6 +1136,7 @@ impl<'a> LayoutBuilder<'a> {
         replay: SplitFlexItemReplayState<'_>,
     ) {
         let SplitFlexItemReplayState {
+            source_replay: cached_source_replay,
             fragments: table_replay_fragments,
             local_block_ends: replay_fragment_local_block_ends,
             table_fragment_bottoms: table_replay_fragment_bottoms,
@@ -1164,10 +1167,23 @@ impl<'a> LayoutBuilder<'a> {
                 .height
                 .replace_with_used(css::ComputedLengthPercentageOrAuto::Auto);
         }
+        // The continuous canvas lays out the item's descendants from the
+        // authored source style, with only its frozen inline percentage basis
+        // applied. Reusing the placed style's frozen block height here turns
+        // the source capture back into a page-local used box and discards the
+        // visible overflow that selected the continuation in the first place.
+        let mut continuous_source_style = child.style.clone();
+        if !child_fragment_replay {
+            set_style_used_width(
+                &mut continuous_source_style,
+                context.available_width_for_replay().points(),
+            );
+            continuous_source_style.box_sizing = BoxSizing::ContentBox;
+        }
         let replay_style = if child_fragment_replay {
             &table_replay_style
         } else {
-            placed_style
+            &continuous_source_style
         };
         // The parent flex fragment has already committed the ordinary
         // item's used principal decoration at each materialized slice. This
@@ -1256,12 +1272,47 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
 
+        // Visible descendant overflow is not an independently fragmenting
+        // child. Its first replay captures one continuous source canvas; all
+        // later flex fragments only select a committed interval from that
+        // artifact. In particular, a continuation must not lay the nested
+        // size-contained wrapper out again against a fresh page-height box.
+        // <https://www.w3.org/TR/css-break-3/#box-splitting>
+        if !child_fragment_replay && let Some(source_replay) = cached_source_replay.as_ref() {
+            let source_slice = context.continuation.source_content_slice;
+            if source_replay.source_height.points() >= source_slice.block_start.points() - 0.01
+                && source_replay.source_height.points() <= source_slice.block_end.points() + 0.01
+            {
+                *replay_destination_block_end = Some(
+                    slice_border_box.y() + slice_border_box.height()
+                        - (source_replay.source_height.points()
+                            - source_slice.block_start.points())
+                        .max(0.0),
+                );
+            }
+            let fragment = source_replay
+                .paint
+                .clone()
+                .translated(source_slice_replay_translation(
+                    slice_border_box,
+                    source_item_top,
+                    source_replay.scratch_top,
+                    source_canvas_slice_start,
+                ))
+                .with_primitives_sliced_to_fragmentainer_rect_preserving_structure(replay_clip)
+                .clipped_to_rect(replay_clip);
+            if !replay_owns_principal_decoration || replay_has_descendant_paint {
+                self.append_split_flex_item_replay(placed_style, replay_clip, fragment);
+            }
+            return;
+        }
+
         let snapshot = self.snapshot();
         let positioned_layer_start = self.positioned_layers.len();
         let offpage_top = if child_fragment_replay {
             table_first_capacity.max(1.0)
         } else {
-            10_000.0
+            context.source_height.points().max(1.0)
         };
         // A split-item replay uses a local off-page canvas. Its page context
         // must describe that same zero-inset coordinate system: retaining the
@@ -1275,8 +1326,16 @@ impl<'a> LayoutBuilder<'a> {
             edges: PageBoxEdges::ZERO,
             rotation: snapshot.current_page_context().rotation,
         };
-        self.current_page = page_for_context(replay_page_context);
-        self.current_page_context = replay_page_context;
+        if child_fragment_replay {
+            self.current_page = page_for_context(replay_page_context);
+            self.current_page_context = replay_page_context;
+        } else {
+            // The backing page is a tall paint canvas, while the inherited
+            // page context remains the CSS viewport for `vh`, page-area
+            // percentages, and page-relative descendants.
+            self.current_page = Page::new(context.item_width.points().max(1.0), offpage_top);
+            self.current_page_context = snapshot.current_page_context();
+        }
         if child_fragment_replay {
             let continuation_context = PageContext {
                 size: PageSize::from_points(
@@ -1297,6 +1356,12 @@ impl<'a> LayoutBuilder<'a> {
         }
         self.overflow_clips.clear();
         self.fragment_top_offsets.clear();
+        if !child_fragment_replay {
+            // The source canvas has no page boundary of its own. The outer
+            // flex fragment plan is solely responsible for slicing it.
+            self.fragmentainer_override = None;
+            self.fragmentation_suppression_depth += 1;
+        }
 
         // Replay is laid out in an off-page coordinate system and translated
         // back to the selected source slice below. A positioned descendant of
@@ -1336,11 +1401,16 @@ impl<'a> LayoutBuilder<'a> {
             PlacedFormattingContext {
                 content_left: 0.0,
                 content_width: context.available_width_for_replay(),
-                content_height: Some(Definite::new(if child_fragment_replay {
-                    PhysicalContentHeight::new(content_box_pt(table_first_capacity))
-                } else {
-                    context.available_height_for_replay()
-                })),
+                // The frozen used height remains on `replay_style` and is
+                // still supplied as `percentage_height_basis` below.  A
+                // continuous source canvas itself has no available block-end:
+                // treating its used box as a fragmentainer cap would clip
+                // visible descendant overflow before Flex can select slices.
+                content_height: child_fragment_replay.then(|| {
+                    Definite::new(PhysicalContentHeight::new(content_box_pt(
+                        table_first_capacity,
+                    )))
+                }),
                 table_wrapper_border_box_block_size: (!table_replay)
                     .then(|| {
                         auto_table_wrapper_block_size_override(&child.style, context.item_height)
@@ -1382,6 +1452,10 @@ impl<'a> LayoutBuilder<'a> {
             },
         );
 
+        if !child_fragment_replay {
+            self.fragmentation_suppression_depth -= 1;
+        }
+
         // A descendant-overflow replay lays the complete child tree once on
         // its off-page source canvas, then lets the flex fragment plan select
         // visible slices. Unlike an independently fragmenting child it does
@@ -1399,7 +1473,7 @@ impl<'a> LayoutBuilder<'a> {
                 && source_end <= source_slice.block_end.points() + 0.01
             {
                 *replay_destination_block_end = Some(
-                    slice_border_box.y()
+                    slice_border_box.y() + slice_border_box.height()
                         - (source_end - source_slice.block_start.points()).max(0.0),
                 );
             }
@@ -1463,8 +1537,20 @@ impl<'a> LayoutBuilder<'a> {
                 .cloned()
                 .unwrap_or_else(|| self.current_page.paint_fragment())
         } else {
-            self.current_page.paint_fragment()
+            self.current_page
+                .paint_fragment()
+                .into_fragmentable_source_canvas()
         };
+        if !child_fragment_replay {
+            *cached_source_replay = Some(ContinuousSourceReplay {
+                paint: source_fragment.clone(),
+                effects: self
+                    .take_positioned_scratch_side_effects()
+                    .into_continuous_source_effects(),
+                source_height: context.source_height,
+                scratch_top: offpage_top,
+            });
+        }
         let fragment = source_fragment.translated(fragment_translation);
         // A descendant-overflow source replay contains only the item's
         // independently formatted subtree; its principal flex decoration was
@@ -1577,41 +1663,6 @@ impl<'a> LayoutBuilder<'a> {
                 .style_with_current_used_lengths(&child.style)
                 .clone_for_legacy_used_consumer();
         }
-    }
-
-    /// Resolve a Flex-generated named baseline set to the legacy alphabetic
-    /// coordinate consumed by atomic inline geometry.
-    ///
-    /// Flexbox exports a set generated from an item's alignment baseline.
-    /// That can be central in vertical mixed/upright text, while the generic
-    /// atomic-inline coordinate remains alphabetic.  Projecting the font
-    /// table delta through the flex container's own logical block direction
-    /// keeps line sizing and fragment replay on the same coordinate:
-    /// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>,
-    /// <https://drafts.csswg.org/css-align-3/#baseline-alignment>, and
-    /// <https://www.w3.org/TR/css-inline-3/#baseline-alignment>.
-    fn inline_flex_baselines_as_alphabetic(
-        &mut self,
-        baselines: crate::layout::baseline::PhysicalBaselineSets,
-        style: &ComputedStyle,
-    ) -> crate::layout::baseline::PhysicalBaselineSets {
-        let mut alphabetic_adjustment = |metric| {
-            if metric == BaselineMetric::Alphabetic {
-                return layout_pt(0.0);
-            }
-            let logical_delta = self
-                .font_system
-                .baseline_offset_for_style(style, BaselineMetric::Alphabetic)
-                - self.font_system.baseline_offset_for_style(style, metric);
-            match block_start_side(style.writing_mode) {
-                PhysicalSide::Top | PhysicalSide::Left => logical_delta,
-                PhysicalSide::Bottom | PhysicalSide::Right => -logical_delta,
-            }
-        };
-        baselines.normalized_to_alphabetic(
-            alphabetic_adjustment(baselines.vertical_metric),
-            alphabetic_adjustment(baselines.horizontal_metric),
-        )
     }
 }
 

@@ -95,7 +95,7 @@ fn inline_atom_is_transparent_to_logical_shaping(atom: &InlineAtom) -> bool {
     matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
         if edge.advance == 0.0
             && edge.paint_extent == 0.0
-            && !inline_box_edge_breaks_shaping(atom.style())
+            && !inline_box_edge_fragment_breaks_shaping(atom.style(), *edge)
             && !inline_box_bidi_isolation_breaks_shaping(atom.style()))
 }
 
@@ -726,10 +726,19 @@ impl<'a> LayoutBuilder<'a> {
                 ))
             }
             InlineLineItem::Atom(atom)
-                if mixed_inline_atom_participates_in_bidi_ordering(atom)
+                if (mixed_inline_atom_participates_in_bidi_ordering(atom)
+                    || inline_atom_is_logical_shaping_boundary(atom))
                     && start == ranged.range.start
                     && end == ranged.range.end =>
             {
+                // A nonzero inline edge is transparent to UAX #9 itself,
+                // but its virtual U+200C owns a real visual range so Arabic
+                // joining stops at the same position as the box-model
+                // advance. Emit the original atom at that resolved position;
+                // otherwise the control reorders correctly while the padding,
+                // border, or margin vanishes from the visual line.
+                // <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+                // and <https://www.unicode.org/reports/tr9/#X9>
                 Some(MeasuredInlineItem::new(
                     InlineLineItem::Atom(atom.clone()),
                     inline_atom_logical_inline_size(atom, block_style),

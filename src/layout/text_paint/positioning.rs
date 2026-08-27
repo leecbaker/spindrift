@@ -13,13 +13,13 @@ use crate::text::{TextTypesettingPlan, VerticalUnitTypesetting};
 /// `sideways-lr` can start at the physical bottom edge.
 /// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::layout) struct VerticalInlineAxis {
+pub(crate) struct VerticalInlineAxis {
     logical_start_side: PhysicalSide,
 }
 
 impl VerticalInlineAxis {
     /// Construct the vertical-inline projection selected by CSS logical axes.
-    pub(in crate::layout) fn from_axes(axes: WritingModeAxes) -> Option<Self> {
+    pub(crate) fn from_axes(axes: WritingModeAxes) -> Option<Self> {
         match axes.physical_side(LogicalSide::InlineStart) {
             PhysicalSide::Top | PhysicalSide::Bottom => Some(Self {
                 logical_start_side: axes.physical_side(LogicalSide::InlineStart),
@@ -33,7 +33,7 @@ impl VerticalInlineAxis {
     /// Upright vertical typographic units retain the vertical writing mode's
     /// fixed inline base direction; sideways and mixed-orientation units use
     /// their computed `direction`.
-    pub(in crate::layout) fn for_style(style: &ComputedStyle) -> Option<Self> {
+    pub(crate) fn for_style(style: &ComputedStyle) -> Option<Self> {
         let placement_direction = if matches!(
             style.text_layout_policy(),
             css::TextLayoutPolicy::Vertical(TextOrientation::Upright)
@@ -51,7 +51,7 @@ impl VerticalInlineAxis {
     /// Return the page-paint displacement for one positive logical inline
     /// length.  This is intentionally the sole scalar adapter for PDF text
     /// positioning; all caller-side span math stays logical.
-    pub(in crate::layout) fn advance_sign(self) -> f32 {
+    pub(crate) fn advance_sign(self) -> f32 {
         match self.logical_start_side {
             PhysicalSide::Top => -1.0,
             PhysicalSide::Bottom => 1.0,
@@ -125,7 +125,7 @@ pub(in crate::layout) fn rendered_text_line_width(line: &RenderedLine) -> f32 {
     })
 }
 
-pub(in crate::layout) fn positioned_rendered_runs_for_writing_mode(
+pub(crate) fn positioned_rendered_runs_for_writing_mode(
     shaped: &ShapedInlineLine,
     style: &ComputedStyle,
 ) -> Vec<RenderedTextRun> {

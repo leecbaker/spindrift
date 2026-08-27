@@ -1017,9 +1017,15 @@ fn has_styled_inline_descendant_with_inline_flow_scope(
     parent_style: &ComputedStyle,
     stylesheets: &Stylesheets<'_>,
     ancestors: &[ElementSignature],
-    _inside_inline_flow: bool,
+    inside_inline_flow: bool,
     resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
+    let has_non_phantom_direct_text = element.children.iter().any(|child| {
+        matches!(
+            &child.kind,
+            NodeKind::Text(text) if inline_text_has_non_phantom_content(text, parent_style)
+        )
+    });
     let sibling_tags = element_sibling_signature_list(element);
     let mut element_index = 0usize;
     element.children.iter().any(|child| {
@@ -1053,6 +1059,17 @@ fn has_styled_inline_descendant_with_inline_flow_scope(
         // <https://www.w3.org/TR/css-position-3/#static-position>
         if matches!(child_style.position, Position::Absolute | Position::Fixed) {
             return true;
+        }
+        // A float is blockified for its own layout, but stays at this inline
+        // source position as a zero-width marker. The scalar-text shortcut
+        // would otherwise flatten its surrounding text and lose the marker.
+        // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+        if child_style.float != Float::None {
+            // A direct block float stays in the parent's block-flow child
+            // traversal unless direct text forms an inline source run beside
+            // it. Once an inline flow scope owns the source, its float marker
+            // must likewise be collected with the surrounding text.
+            return inside_inline_flow || has_non_phantom_direct_text;
         }
         if child_style.display.is_block_level() {
             return false;
@@ -1091,7 +1108,7 @@ fn has_styled_inline_descendant_with_inline_flow_scope(
                 &child_style,
                 stylesheets,
                 &child_ancestors,
-                _inside_inline_flow
+                inside_inline_flow
                     || (child_style.display.is_inline_level() && child_style.display.is_flow()),
                 resolver,
             )
@@ -1190,6 +1207,62 @@ pub(in crate::layout) fn has_direct_flow_child_with_font_metrics(
 ) -> bool {
     let mut resolver = DomStyleResolver::with_font_system(font_system);
     has_direct_flow_child_with_resolver(element, parent_style, stylesheets, &mut resolver)
+}
+
+/// Whether a direct DOM source contains floats but no parent inline-line
+/// content or normal-flow child.
+///
+/// A float's descendants belong to its own formatting context. Therefore a
+/// direct floated element is terminal for this parent-source classifier, just
+/// as a floated formatting box is terminal after normalization.
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+pub(in crate::layout) fn has_direct_float_only_source_with_font_metrics(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+    let mut has_float = false;
+
+    for child in &element.children {
+        match &child.kind {
+            NodeKind::Text(text) => {
+                if inline_text_has_non_phantom_content(text, parent_style) {
+                    return false;
+                }
+            }
+            NodeKind::Element(child_element) => {
+                let signature = ElementSignature::with_sibling_list(
+                    child_element.tag.clone(),
+                    child_element.attrs.clone(),
+                    element_index,
+                    sibling_tags.clone(),
+                );
+                element_index += 1;
+                let style = resolver.structural_style_for_element(
+                    child_element,
+                    signature,
+                    stylesheets,
+                    Some(parent_style),
+                    &[],
+                );
+                if style.float != Float::None {
+                    has_float = true;
+                } else if style.display.is_none()
+                    || matches!(style.position, Position::Absolute | Position::Fixed)
+                {
+                    continue;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+
+    has_float
 }
 
 pub(in crate::layout) fn has_direct_flow_child_with_resolver(
@@ -1658,11 +1731,15 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                     has_inline |= child_style.display.is_inline_level();
                     continue;
                 }
-                // Floats need a source boundary in the parent block flow.
-                // <https://www.w3.org/TR/css-position-3/#static-position>
-                let is_flow_child = child_style.float == Float::Footnote
-                    || (child_style.float != Float::None && child_style.display.is_block_level())
-                    || is_normal_block_flow_child(child_element, &child_style)
+                // A float is out of normal flow. Its used display type is
+                // blockified, but that does not make it an in-flow block
+                // boundary for this source-order classifier. A direct float
+                // is handled by the ordinary child traversal, while a float
+                // inside an inline source run is collected as an inline
+                // marker by that run.
+                // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+                let is_float_source = child_style.float != Float::None;
+                let is_normal_flow_child = is_normal_block_flow_child(child_element, &child_style)
                     // HTML table structure still needs source-order traversal
                     // around block siblings, but its computed outer display
                     // decides whether the table itself is dispatched as block
@@ -1672,13 +1749,13 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                         && child_style.display.is_block_level())
                     || (is_replaced_element(child_element)
                         && child_style.display.is_block_level());
-                if is_flow_child {
+                if is_float_source || is_normal_flow_child {
                     has_later_float_after_static_boundary |= has_block_static_boundary_after_flow
                         && matches!(
                             child_style.float,
                             Float::Left | Float::Right | Float::InlineStart | Float::InlineEnd
                         );
-                    has_flow = true;
+                    has_flow |= is_normal_flow_child;
                 } else if child_style.display.is_contents() {
                     let mut child_ancestors = ancestors.to_vec();
                     child_ancestors.push(signature);

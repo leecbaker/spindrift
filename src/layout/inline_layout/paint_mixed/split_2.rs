@@ -432,35 +432,6 @@ pub(in crate::layout) fn opposite_physical_side(side: PhysicalSide) -> PhysicalS
     }
 }
 
-/// Return the shared paint-anchor adjustment for baseline-participating atoms.
-///
-/// Atomic inline baseline metrics are measured from margin-box block start,
-/// while captured atom contents replay from their border-box origin. This
-/// renderer-specific anchor normalization keeps those coordinate systems
-/// aligned after line layout has already enclosed the participating margin
-/// boxes. It is not a substitute for CSS Inline's uppermost/lowermost-edge
-/// line-box calculation; in particular, preserving an all-negative set here
-/// ensures the specified margins still affect final placement:
-/// <https://drafts.csswg.org/css-inline-3/#line-boxes>.
-pub(in crate::layout) fn inline_line_anchor_block_start_margin<T>(
-    line: &[T],
-    containing_style: &ComputedStyle,
-) -> f32
-where
-    T: AsRef<InlineLineItem>,
-{
-    line.iter()
-        .filter_map(|item| match item.as_ref() {
-            InlineLineItem::Atom(atom) => Some(inline_atom_line_anchor_block_start_margin(
-                atom,
-                containing_style,
-            )),
-            InlineLineItem::Fragment(_) | InlineLineItem::Float(_) => None,
-        })
-        .reduce(f32::max)
-        .unwrap_or(0.0)
-}
-
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -489,39 +460,12 @@ mod tests {
                 baseline_adjustment: 0.0,
                 typesetting_plan: TextTypesettingPlan::Horizontal,
                 runs: Vec::new(),
+                monotonic_source_advance_index: Default::default(),
             },
             actual_text: None,
             source: InlineTextSource::Normal,
             source_run: Rc::new(()),
         }
-    }
-
-    fn atom_with_logical_block_start_margin(
-        writing_mode: WritingMode,
-        block_start_margin: f32,
-    ) -> (ComputedStyle, InlineAtom) {
-        let mut style = ComputedStyle::initial();
-        style.writing_mode = writing_mode;
-        match writing_mode {
-            WritingMode::HorizontalTb => style.margin.top = block_start_margin,
-            WritingMode::VerticalRl | WritingMode::SidewaysRl => {
-                style.margin.right = block_start_margin;
-            }
-            WritingMode::VerticalLr | WritingMode::SidewaysLr => {
-                style.margin.left = block_start_margin;
-            }
-        }
-        let atom = InlineAtom::new(
-            InlineAtomContent::Canvas,
-            style.clone(),
-            None,
-            InlineSize::new(20.0, 32.0),
-            16.0,
-            0.0,
-            None,
-            None,
-        );
-        (style, atom)
     }
 
     #[test]
@@ -603,10 +547,9 @@ mod tests {
             },
         );
 
-        // The line baseline is the margin-box baseline (50 + 40).  The
-        // border box therefore begins after the 50px block-start margin,
-        // rather than cancelling that margin during paint placement.
-        assert_eq!(content_bottom, 150.0);
+        // The synthesized line baseline is the margin-box block end (100),
+        // while paint replays the 50px border box from that shared baseline.
+        assert_eq!(content_bottom, 110.0);
     }
 
     #[test]
@@ -656,7 +599,7 @@ mod tests {
         let mut style = ComputedStyle::initial();
         style.margin.top = 50.0;
         let atom = InlineAtom::new(
-            InlineAtomContent::Canvas,
+            InlineAtomContent::Svg { asset: None },
             style.clone(),
             None,
             InlineSize::new(20.0, 100.0),
@@ -692,159 +635,5 @@ mod tests {
         // baseline (40). Captured-fragment replay then uses that table-box
         // baseline directly, so the margin is applied exactly once.
         assert_eq!(content_bottom, 100.0);
-    }
-
-    #[test]
-    fn line_anchor_margin_only_comes_from_baseline_participants() {
-        let mut style = ComputedStyle::initial();
-        style.margin.top = 16.0;
-        let baseline_atom = InlineAtom::new(
-            InlineAtomContent::Canvas,
-            style.clone(),
-            None,
-            InlineSize::new(20.0, 32.0),
-            16.0,
-            0.0,
-            None,
-            None,
-        );
-        assert_eq!(
-            inline_atom_line_anchor_block_start_margin(&baseline_atom, &style),
-            16.0
-        );
-
-        for baseline_shift in [
-            BaselineShift::Top,
-            BaselineShift::Center,
-            BaselineShift::Bottom,
-        ] {
-            let mut aligned_style = style.clone();
-            aligned_style.vertical_align = aligned_style
-                .vertical_align
-                .with_baseline_shift(baseline_shift.clone());
-            let aligned_atom = InlineAtom::new(
-                InlineAtomContent::Canvas,
-                aligned_style.clone(),
-                None,
-                InlineSize::new(20.0, 32.0),
-                16.0,
-                0.0,
-                None,
-                None,
-            );
-            assert_eq!(
-                inline_atom_line_anchor_block_start_margin(&aligned_atom, &aligned_style),
-                0.0,
-                "{baseline_shift:?} aligns its own margin box"
-            );
-        }
-
-        assert_eq!(
-            inline_atom_line_anchor_block_start_margin(
-                &baseline_atom.with_exported_table_box_baseline(),
-                &style,
-            ),
-            0.0
-        );
-    }
-
-    #[test]
-    fn line_anchor_margin_preserves_signed_baseline_participant_maximum() {
-        for writing_mode in [
-            WritingMode::HorizontalTb,
-            WritingMode::VerticalRl,
-            WritingMode::VerticalLr,
-        ] {
-            let (containing_style, positive) =
-                atom_with_logical_block_start_margin(writing_mode, 16.0);
-            let (_, negative) = atom_with_logical_block_start_margin(writing_mode, -16.0);
-            let (_, more_negative) = atom_with_logical_block_start_margin(writing_mode, -24.0);
-            let (_, smaller_positive) = atom_with_logical_block_start_margin(writing_mode, 8.0);
-
-            assert_eq!(
-                inline_line_anchor_block_start_margin::<InlineLineItem>(&[], &containing_style),
-                0.0,
-                "{writing_mode:?} has no atom anchor adjustment without participants"
-            );
-            assert_eq!(
-                inline_line_anchor_block_start_margin(
-                    &[InlineLineItem::Atom(positive.clone())],
-                    &containing_style,
-                ),
-                16.0,
-                "{writing_mode:?} retains a positive block-start margin"
-            );
-            assert_eq!(
-                inline_line_anchor_block_start_margin(
-                    &[InlineLineItem::Atom(negative.clone())],
-                    &containing_style,
-                ),
-                -16.0,
-                "{writing_mode:?} must not clamp a negative margin to zero"
-            );
-            assert_eq!(
-                inline_line_anchor_block_start_margin(
-                    &[
-                        InlineLineItem::Atom(negative.clone()),
-                        InlineLineItem::Atom(more_negative.clone()),
-                    ],
-                    &containing_style,
-                ),
-                -16.0,
-                "{writing_mode:?} keeps the least-negative all-negative margin"
-            );
-            assert_eq!(
-                inline_line_anchor_block_start_margin(
-                    &[
-                        InlineLineItem::Atom(more_negative),
-                        InlineLineItem::Atom(smaller_positive),
-                        InlineLineItem::Atom(negative.clone()),
-                    ],
-                    &containing_style,
-                ),
-                8.0,
-                "{writing_mode:?} keeps the greatest signed margin"
-            );
-
-            let mut top_style = negative.style().clone();
-            top_style.vertical_align = top_style
-                .vertical_align
-                .with_baseline_shift(BaselineShift::Top);
-            let top = InlineAtom::new(
-                InlineAtomContent::Canvas,
-                top_style,
-                None,
-                InlineSize::new(20.0, 32.0),
-                16.0,
-                0.0,
-                None,
-                None,
-            );
-            let table = negative.clone().with_exported_table_box_baseline();
-            let edge = InlineAtom::new(
-                InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(
-                    InlineTextBoundarySpacing::new(layout_pt(1.0)),
-                )),
-                negative.style().clone(),
-                None,
-                InlineSize::new(20.0, 32.0),
-                16.0,
-                0.0,
-                None,
-                None,
-            );
-            assert_eq!(
-                inline_line_anchor_block_start_margin(
-                    &[
-                        InlineLineItem::Atom(top),
-                        InlineLineItem::Atom(table),
-                        InlineLineItem::Atom(edge),
-                    ],
-                    &containing_style,
-                ),
-                0.0,
-                "{writing_mode:?} leaves line-relative, table, and edge atoms to their owners"
-            );
-        }
     }
 }

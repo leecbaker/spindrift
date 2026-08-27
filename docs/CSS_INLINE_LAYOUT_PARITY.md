@@ -1,6 +1,6 @@
 # CSS Inline Layout Parity
 
-Last updated: 2026-08-07
+Last updated: 2026-08-25
 
 CSS Inline Layout Level 3 and CSS Pseudo-Elements Level 4 are the conformance
 targets for inline line construction, typographic pseudo-elements, and initial
@@ -95,11 +95,18 @@ comparisons, but it is not a complete `initial-letter` model.
   box; the shared atomic-inline margin-box adapter accounts for margins once,
   so a block-end margin moves the painted border box without moving its
   margin-box baseline.
-- Baseline-participating atomic inlines derive the line paint anchor from the
-  same logical margin-box start used for their line metrics. Their border-box
-  replay then consumes that margin exactly once; line-relative alignment and
-  inline-table wrapper margins remain at their own placement boundary, across
-  horizontal and vertical writing modes.
+- Baseline-participating atomic inlines contribute their logical margin boxes
+  to line bounds, while every participant remains aligned to the shared line
+  baseline. Each atomic inline alone converts that margin-box coordinate to
+  its border-box paint origin, so its block-axis margins do not displace
+  sibling text or cross a forced line break; this holds in horizontal,
+  `vertical-rl`, and `vertical-lr` writing modes. Inline-table wrapper
+  margins retain their separate CSS 2.2 table-box-baseline boundary.
+- Replaced atomic inlines without a content-derived baseline synthesize their
+  alphabetic baseline at their line-under margin edge. Their margin boxes
+  therefore size the line while authored block-axis margins adjust only that
+  atom’s position relative to sibling text, as required by CSS Inline Layout
+  Level 3 Appendix A.3.
 - Run-in sequences use the normalized formatting tree through block-flow
   traversal. Their inlinified prelude, including in-flow block descendants,
   merges with the target’s inline source exactly once, while intervening

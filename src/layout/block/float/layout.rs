@@ -26,6 +26,65 @@ impl<'a> LayoutBuilder<'a> {
         placement_axes: FloatPlacementAxes,
         run: &mut FloatRunState,
     ) -> bool {
+        self.layout_floating_child_with_pseudo_source(
+            child_element,
+            child_signature,
+            child_style,
+            child_children,
+            table_fragment,
+            stylesheets,
+            placement_axes,
+            run,
+            None,
+        )
+    }
+
+    /// Lay out a tree-abiding generated pseudo float without losing the
+    /// pseudo's counter scope during its isolated float replay.
+    ///
+    /// CSS Pseudo-Elements places generated boxes in the originating
+    /// element's box tree, and CSS 2.2 still applies float layout at that
+    /// source position. <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn layout_generated_floating_child(
+        &mut self,
+        child_element: &Element,
+        child_signature: ElementSignature,
+        child_style: &ComputedStyle,
+        child_children: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+        stylesheets: &Stylesheets<'_>,
+        placement_axes: FloatPlacementAxes,
+        run: &mut FloatRunState,
+        pseudo_source: box_tree::CounterEventSource,
+    ) -> bool {
+        self.layout_floating_child_with_pseudo_source(
+            child_element,
+            child_signature,
+            child_style,
+            child_children,
+            table_fragment,
+            stylesheets,
+            placement_axes,
+            run,
+            Some(pseudo_source),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layout_floating_child_with_pseudo_source(
+        &mut self,
+        child_element: &Element,
+        child_signature: ElementSignature,
+        child_style: &ComputedStyle,
+        child_children: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+        stylesheets: &Stylesheets<'_>,
+        placement_axes: FloatPlacementAxes,
+        run: &mut FloatRunState,
+        pseudo_source: Option<box_tree::CounterEventSource>,
+    ) -> bool {
         if child_style.float == Float::None
             || child_style.display.is_none()
             || matches!(child_style.position, Position::Absolute | Position::Fixed)
@@ -318,13 +377,26 @@ impl<'a> LayoutBuilder<'a> {
         self.float_paint_capture_depth += 1;
         let previous_preserve_scoped_paint_public_order = self.preserve_scoped_paint_public_order;
         self.preserve_scoped_paint_public_order = true;
-        self.layout_element_with_child_boxes_and_table_fragment(
-            child_element,
-            &replay_style,
-            stylesheets,
-            child_children,
-            table_fragment,
-        );
+        if let Some(pseudo_source) = pseudo_source {
+            self.layout_generated_pseudo_box(
+                child_element,
+                &replay_style,
+                pseudo_source,
+                stylesheets,
+                &[],
+                child_children,
+                table_fragment,
+                PrincipalBoxPaintMode::RootPaints,
+            );
+        } else {
+            self.layout_element_with_child_boxes_and_table_fragment(
+                child_element,
+                &replay_style,
+                stylesheets,
+                child_children,
+                table_fragment,
+            );
+        }
         let replayed_border_box_height = (top - placed_style.margin.top - self.cursor_y).max(0.0);
         let actual_bottom = top
             - (placed_style.margin.top + replayed_border_box_height + placed_style.margin.bottom);

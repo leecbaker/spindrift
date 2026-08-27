@@ -20,18 +20,10 @@ pub(in crate::layout::grid) struct SplitGridItemPaintContext {
     /// visible inline overflow such as a relatively positioned descendant.
     pub(in crate::layout::grid) fragment_content_clip: PaintClip,
     pub(in crate::layout::grid) source_item_top: PageTopBlockPosition,
-}
-
-/// Durable source output for a grid item that crosses one or more committed
-/// fragmentainers.
-///
-/// The source subtree is laid out exactly once in continuous item coordinates.
-/// Subsequent fragments only project this owned artifact; they never consult
-/// the mutable builder state that produced it.
-#[derive(Debug)]
-pub(super) struct SplitGridItemSourceReplay {
-    paint: PaintFragment,
-    effects: DeferredLayoutSideEffects,
+    /// Item-local continuous-source offset selected by this destination
+    /// fragment. This is distinct from the grid container's source cursor
+    /// when a row boundary falls after an item-local trailing line.
+    pub(in crate::layout::grid) source_content_start: GridFragmentBlockOffset,
 }
 
 const fn offpage_source_offset() -> f32 {
@@ -60,7 +52,7 @@ impl<'a> LayoutBuilder<'a> {
         inner_x: f32,
         grid_content_inline_span: PageInlineSpan,
         cursor: GridFragmentCursor,
-        split_item_replay: &mut [Option<SplitGridItemSourceReplay>],
+        split_item_replay: &mut [Option<ContinuousSourceReplay>],
     ) {
         for mut item_fragment in fragment_record.item_fragments(items) {
             let child = &children[item_fragment.item_index];
@@ -313,7 +305,7 @@ impl<'a> LayoutBuilder<'a> {
         inner_x: f32,
         cursor: GridFragmentCursor,
         fragment_content_clip: PaintClip,
-        cached_source_replay: &mut Option<SplitGridItemSourceReplay>,
+        cached_source_replay: &mut Option<ContinuousSourceReplay>,
     ) {
         let item = &item_fragment.original;
         let item_width = item.width().max(0.0);
@@ -374,6 +366,7 @@ impl<'a> LayoutBuilder<'a> {
                 item_border_box,
                 fragment_content_clip,
                 source_item_top,
+                source_content_start: item_fragment.content_slice.block_start,
             },
         );
     }
@@ -392,7 +385,7 @@ impl<'a> LayoutBuilder<'a> {
         placed_style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
         replay_dimensions: GridItemReplayDimensions,
-    ) -> SplitGridItemSourceReplay {
+    ) -> ContinuousSourceReplay {
         let transaction = DetachedLayoutReplayTransaction::begin(self);
         let positioned_layer_start = 0;
         let offpage_top = offpage_source_offset();
@@ -439,7 +432,12 @@ impl<'a> LayoutBuilder<'a> {
             .into_continuous_source_effects();
         transaction.restore(self);
 
-        SplitGridItemSourceReplay { paint, effects }
+        ContinuousSourceReplay {
+            paint,
+            effects,
+            source_height: replay_dimensions.physical_content_height_for_replay(placed_style),
+            scratch_top: offpage_top,
+        }
     }
 
     /// Project the source subtree's observable effects onto the committed grid
@@ -557,7 +555,16 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let item_height = context.item_height.points();
         let item_border_box = context.item_border_box;
-        let fragment_content_clip = context.fragment_content_clip;
+        // The container contributes the inline extent of the destination
+        // fragment, while the committed item fragment alone owns its
+        // block-axis source interval. Using the full grid slice here lets a
+        // final short item source overpaint the following anonymous grid row.
+        let fragment_content_clip = PaintClip::new(
+            context.fragment_content_clip.x(),
+            item_border_box.y(),
+            context.fragment_content_clip.width(),
+            item_border_box.height(),
+        );
         let source_item_top = context.source_item_top;
         if item_border_box.width() <= 0.0 || fragment_content_clip.height() <= 0.0 {
             return;
@@ -566,7 +573,14 @@ impl<'a> LayoutBuilder<'a> {
             .clone()
             .translated(PaintTranslation::new(
                 item_border_box.x(),
-                source_item_top.points() - 10_000.0,
+                // The continuous source canvas is item-local. Reconstruct
+                // its destination top from the committed item rectangle and
+                // its own source interval rather than reusing a grid-global
+                // cursor that may include a preceding anonymous line.
+                item_border_box.y()
+                    + item_border_box.height()
+                    + context.source_content_start.points()
+                    - 10_000.0,
             ))
             .clipped_to_rect(fragment_content_clip);
 

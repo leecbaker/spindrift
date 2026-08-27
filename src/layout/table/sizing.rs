@@ -293,6 +293,27 @@ pub(super) fn used_table_wrapper_geometry(
     available_outer_inline: f32,
     collapsed_outer_insets: Option<css::Edges>,
 ) -> UsedTableWrapperGeometry {
+    used_table_wrapper_geometry_with_percentage_basis(
+        style,
+        available_outer_inline,
+        collapsed_outer_insets,
+        PercentageBasis::definite(layout_pt(available_outer_inline)),
+    )
+}
+
+/// Resolve table wrapper geometry for a known or cyclic inline percentage
+/// basis.
+///
+/// Intrinsic callers use an indefinite basis so percentage padding and
+/// min/max constraints follow CSS Sizing's cyclic-percentage rules instead
+/// of resolving against their numeric measurement scratch space.
+/// <https://drafts.csswg.org/css-sizing-3/#intrinsic-contribution>
+pub(super) fn used_table_wrapper_geometry_with_percentage_basis(
+    style: &ComputedStyle,
+    available_outer_inline: f32,
+    collapsed_outer_insets: Option<css::Edges>,
+    percentage_basis: PercentageBasis<LayoutLength>,
+) -> UsedTableWrapperGeometry {
     let collapsed = style.border_collapse == css::BorderCollapse::Collapse;
     let wrapper_insets = if collapsed {
         ResolvedTableWrapperInsets {
@@ -307,11 +328,7 @@ pub(super) fn used_table_wrapper_geometry(
     let padding = if collapsed {
         css::Edges::ZERO
     } else {
-        used_padding_edges(
-            style,
-            PercentageBasis::definite(layout_pt(available_outer_inline)),
-        )
-        .to_css_edges()
+        used_padding_edges(style, percentage_basis).to_css_edges()
     };
     let geometry = UsedTableWrapperGeometry {
         grid_inline: LogicalInlineContentSize::new(content_box_pt(0.0)),
@@ -324,7 +341,7 @@ pub(super) fn used_table_wrapper_geometry(
     let requested_inline = table_root_inline_content_box_size(
         table_root_inline_size(style),
         style.box_sizing,
-        PercentageBasis::definite(content_box_pt(available_outer_inline)),
+        percentage_basis.map_value(|basis| content_box_pt(basis.points())),
         inline_non_content,
     )
     .unwrap_or_else(|| {
@@ -333,7 +350,7 @@ pub(super) fn used_table_wrapper_geometry(
     let grid_inline = constrain_table_root_inline_size(
         style,
         requested_inline,
-        PercentageBasis::definite(content_box_pt(available_outer_inline)),
+        percentage_basis.map_value(|basis| content_box_pt(basis.points())),
         inline_non_content,
     );
 
@@ -1359,11 +1376,16 @@ fn table_cell_inline_intrinsic_contribution(
     // margin-box contribution explicitly.
     let mut contribution = measurement.contribution;
     if let Some(children) = children {
-        let (float_min, float_max) = layout.inline_float_run_intrinsic_widths_for_boxes(
-            children,
-            style,
-            stylesheets,
-            available_inline_size,
+        let (float_min, float_max) = layout.with_intrinsic_inline_percentage_basis(
+            PercentageBasis::indefinite(),
+            |layout| {
+                layout.inline_float_run_intrinsic_widths_for_boxes(
+                    children,
+                    style,
+                    stylesheets,
+                    available_inline_size,
+                )
+            },
         );
         contribution.min_content = contribution
             .min_content
@@ -1566,12 +1588,17 @@ fn table_cell_formatting_box_intrinsic_width(
     // <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
     let style = layout.style_with_current_viewport_lengths(style);
     if let box_tree::FormattingBox::Table(box_) = child {
-        return layout.table_outer_intrinsic_widths_from_fragment(
+        let available_outer_width = layout.current_content_logical_inline_size();
+        return layout.table_outer_intrinsic_widths_with_indefinite_percentage_basis_from_fragment(
             box_.core.element,
             &style,
             stylesheets,
             &box_.fragment,
-            10_000.0,
+            // This supports non-percentage table mechanics such as
+            // `fit-content`, but is not a cell percentage basis. The real
+            // containing block is the outer cell, whose track width is being
+            // measured here, so cyclic inline percentages remain indefinite.
+            available_outer_width,
         );
     }
 

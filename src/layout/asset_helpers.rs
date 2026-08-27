@@ -983,17 +983,82 @@ impl IntrinsicBlockBasis {
     }
 }
 
-/// Geometry inputs for replaced sizing during intrinsic inline collection.
+/// Geometry inputs for one CSS replaced-element sizing operation.
 ///
 /// The physical available width constrains paint geometry independently from
 /// the logical percentage basis, which may be indefinite when that width is
 /// cyclic. Image, canvas, and SVG share this context so their percentage
 /// height behavior cannot diverge.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ReplacedIntrinsicSizingContext {
+pub(super) struct ReplacedBoxSizingContext {
     pub(super) available_width: ContentBoxLength,
     pub(super) inline_percentage_basis: IntrinsicInlinePercentageBasis,
     pub(super) block_basis: IntrinsicBlockBasis,
+}
+
+/// A fully sized replaced element, retaining its format-specific paint
+/// resource while exposing one shared CSS box geometry to every layout
+/// consumer.
+///
+/// CSS replaced-element sizing is independent from the later painting format.
+/// Keeping the dispatch here prevents Flexbox, tables, and positioned layout
+/// from accidentally treating an SVG or canvas as an empty ordinary block.
+/// <https://www.w3.org/TR/css-images-3/#sizing>
+pub(super) enum ResolvedReplacedElement {
+    Canvas(UsedReplacedBox),
+    Image(UsedImage),
+    Svg(UsedReplacedBox),
+}
+
+impl ResolvedReplacedElement {
+    pub(super) fn geometry(&self) -> UsedReplacedBox {
+        match self {
+            Self::Canvas(geometry) | Self::Svg(geometry) => *geometry,
+            Self::Image(image) => UsedReplacedBox {
+                content_size: image.content_size,
+                border_box_size: image.border_box_size,
+            },
+        }
+    }
+
+    pub(super) fn into_image(self) -> Option<UsedImage> {
+        match self {
+            Self::Image(image) => Some(image),
+            Self::Canvas(_) | Self::Svg(_) => None,
+        }
+    }
+}
+
+/// Resolve any replaced element through the one typed CSS sizing boundary.
+///
+/// The caller supplies percentage-basis provenance; the resolver owns the
+/// exhaustive format dispatch and returns the resulting content- and
+/// border-box geometry. Paint callers may retain the returned image resource,
+/// while sizing callers use [`ResolvedReplacedElement::geometry`].
+pub(super) fn resolve_replaced_element(
+    element: &Element,
+    style: &ComputedStyle,
+    sizing: ReplacedBoxSizingContext,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    resource_cache: &ResourceCache,
+) -> Option<ResolvedReplacedElement> {
+    match replaced_element_kind(element)? {
+        ReplacedElementKind::Canvas => Some(ResolvedReplacedElement::Canvas(
+            used_canvas_with_intrinsic_sizing_context(element, style, sizing),
+        )),
+        ReplacedElementKind::Image => used_image_with_intrinsic_sizing_context(
+            element,
+            style,
+            sizing,
+            base_url,
+            root_url,
+            resource_cache,
+        )
+        .map(ResolvedReplacedElement::Image),
+        ReplacedElementKind::Svg => used_svg_with_intrinsic_sizing_context(element, style, sizing)
+            .map(ResolvedReplacedElement::Svg),
+    }
 }
 
 /// Resolve an image while preserving whether the inline percentage basis is
@@ -1003,7 +1068,7 @@ pub(super) struct ReplacedIntrinsicSizingContext {
 pub(super) fn used_image_with_intrinsic_sizing_context(
     element: &Element,
     style: &ComputedStyle,
-    sizing: ReplacedIntrinsicSizingContext,
+    sizing: ReplacedBoxSizingContext,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
@@ -1971,7 +2036,7 @@ pub(super) fn used_canvas(
 pub(super) fn used_canvas_with_intrinsic_sizing_context(
     element: &Element,
     style: &ComputedStyle,
-    sizing: ReplacedIntrinsicSizingContext,
+    sizing: ReplacedBoxSizingContext,
 ) -> UsedReplacedBox {
     used_replaced_box_with_inline_percentage_basis(
         intrinsic_canvas_size(element),
@@ -1987,7 +2052,7 @@ pub(super) fn used_canvas_with_intrinsic_sizing_context(
 pub(super) fn used_svg_with_intrinsic_sizing_context(
     element: &Element,
     style: &ComputedStyle,
-    sizing: ReplacedIntrinsicSizingContext,
+    sizing: ReplacedBoxSizingContext,
 ) -> Option<UsedReplacedBox> {
     intrinsic_svg_size(element).map(|intrinsic| {
         used_replaced_box_with_inline_percentage_basis(
@@ -2562,22 +2627,6 @@ pub(super) fn used_background_position_axis(
 pub(super) fn svg_rect(element: &Element) -> Option<(f32, f32, CssColor)> {
     crate::svg::svg_intrinsic_size(element)
         .map(|size| (size.width, size.height, CssColor::TRANSPARENT))
-}
-
-pub(super) fn estimate_svg_height(
-    element: &Element,
-    style: &ComputedStyle,
-    available_width: f32,
-) -> f32 {
-    let height = used_svg(
-        element,
-        style,
-        available_width,
-        BlockSizePercentageBasis::indefinite(),
-    )
-    .map(|svg| svg.border_box_size.height)
-    .unwrap_or(style.line_height);
-    style.margin.top + height + style.margin.bottom
 }
 
 pub(super) fn parse_html_length(value: &str) -> Option<f32> {
@@ -3190,7 +3239,7 @@ mod tests {
                 css::ComputedLengthPercentage::from_percent(1.0),
             ),
         );
-        let context = ReplacedIntrinsicSizingContext {
+        let context = ReplacedBoxSizingContext {
             available_width: content_box_pt(500.0),
             inline_percentage_basis: PercentageBasis::indefinite(),
             block_basis: IntrinsicBlockBasis::from_flex_layout(
@@ -3215,7 +3264,7 @@ mod tests {
                 css::ComputedLengthPercentage::from_percent(1.0),
             ),
         );
-        let context = ReplacedIntrinsicSizingContext {
+        let context = ReplacedBoxSizingContext {
             available_width: content_box_pt(500.0),
             inline_percentage_basis: PercentageBasis::indefinite(),
             block_basis: IntrinsicBlockBasis::from_flex_layout(

@@ -16,6 +16,6 @@ mod tests;
 mod text_layout;
 
 pub(in crate::layout) use self::decoration::*;
-pub(in crate::layout) use self::effects::*;
+pub(crate) use self::effects::*;
 pub(in crate::layout) use self::model::*;
-pub(in crate::layout) use self::positioning::*;
+pub(crate) use self::positioning::*;

@@ -945,6 +945,10 @@ pub(super) struct StartwardImplicitTrackAdjustment {
 }
 
 impl StartwardImplicitTrackAdjustment {
+    pub(super) fn has_startward_tracks(&self) -> bool {
+        self.before_count > 0
+    }
+
     fn line_shift(&self) -> i32 {
         i32::try_from(self.before_count).unwrap_or(0)
     }
@@ -1428,14 +1432,13 @@ fn expanded_grid_template_component_with_auto_repeat_count(
     }
 }
 
-pub(super) fn startward_adjusted_auto_fit_track_range(
+/// Resolve the physical range occupied by an `auto-fit` repeat after any
+/// startward implicit tracks have been prepended for Taffy.
+pub(super) fn auto_fit_track_range_with_startward_adjustment(
     style: &ComputedStyle,
     axis: GridAxis,
     adjustment: &StartwardImplicitTrackAdjustment,
 ) -> Option<std::ops::Range<usize>> {
-    if adjustment.before_count == 0 {
-        return None;
-    }
     let auto_repeat_count = adjustment.auto_repeat_count?;
     let (tracks, _, _) = grid_template_axis_inputs(style, axis);
     let css::GridTrackList::Tracks { components, .. } = tracks else {
@@ -1880,7 +1883,7 @@ pub(super) fn taffy_grid_line_with_startward_adjustment(
     end: &css::GridPlacement,
     adjustment: &StartwardImplicitTrackAdjustment,
 ) -> taffy_layout::Line<taffy_layout::GridPlacement<String>> {
-    if adjustment.before_count == 0 {
+    if !adjustment.has_startward_tracks() {
         return taffy_grid_line(start, end);
     }
     if let Some(range) =

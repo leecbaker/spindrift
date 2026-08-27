@@ -3,7 +3,10 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 
 use super::super::*;
-use super::{BlockFlowChildTraversalState, BlockFlowChildrenPhaseInput, DiscardRegionLimit};
+use super::{
+    BlockFlowChildTraversalState, BlockFlowChildrenPhaseInput, ChildTraversalMode,
+    DiscardRegionLimit,
+};
 use crate::css::Edges;
 use crate::layout::block::DefinitePhysicalContentHeight;
 use crate::layout::block::flow::children::BlockFlowMarginCollapseContext;
@@ -775,9 +778,8 @@ impl<'a> LayoutBuilder<'a> {
                         },
                         starts_at_page_top: self.cursor_is_at_page_top(),
                         laid_out_column_children: false,
-                        use_box_inline_items: false,
+                        traversal_mode: ChildTraversalMode::BlockChildren,
                         run_in_inline_items_laid_out: false,
-                        use_ordered_mixed_flow: false,
                         has_preceding_inline_flow_content: false,
                         preceding_inline_local_cutoff: false,
                         preceding_inline_clamp_block_advance: content_box_pt(0.0),
@@ -1666,9 +1668,8 @@ impl<'a> LayoutBuilder<'a> {
                     // and must not manufacture an empty decorated column.
                     starts_at_page_top: false,
                     laid_out_column_children: false,
-                    use_box_inline_items: false,
+                    traversal_mode: ChildTraversalMode::BlockChildren,
                     run_in_inline_items_laid_out: false,
-                    use_ordered_mixed_flow: false,
                     has_preceding_inline_flow_content: false,
                     preceding_inline_local_cutoff: false,
                     preceding_inline_clamp_block_advance: content_box_pt(0.0),
@@ -3061,9 +3062,8 @@ impl<'a> LayoutBuilder<'a> {
                 },
                 starts_at_page_top: false,
                 laid_out_column_children: false,
-                use_box_inline_items: false,
+                traversal_mode: ChildTraversalMode::BlockChildren,
                 run_in_inline_items_laid_out: false,
-                use_ordered_mixed_flow: false,
                 has_preceding_inline_flow_content: false,
                 preceding_inline_local_cutoff: false,
                 preceding_inline_clamp_block_advance: content_box_pt(0.0),

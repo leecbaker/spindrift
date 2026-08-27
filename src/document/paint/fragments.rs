@@ -761,6 +761,22 @@ impl PaintFragment {
         self.display_list.bands.contains_overflow_clip()
     }
 
+    /// Reclassify captured source paint so an enclosing fragmentation plan can
+    /// select consecutive physical slices from it.
+    ///
+    /// This is intentionally a capture-time operation. A size-contained
+    /// descendant remains monolithic for its ordinary used box, but once its
+    /// visible in-flow paint has been committed as a larger source extent,
+    /// later container fragments must not discard that retained paint merely
+    /// because the source formatting context originally treated the used box
+    /// as atomic. Authored overflow, clip-path, mask, filter, and transform
+    /// effects remain on the tree unchanged.
+    /// <https://www.w3.org/TR/css-break-3/#box-splitting>
+    pub(crate) fn into_fragmentable_source_canvas(mut self) -> Self {
+        self.display_list.bands.make_fragmentable_source_canvas();
+        self
+    }
+
     /// Slice geometry at a fragmentainer boundary without flattening the
     /// retained paint tree. CSS visual-overflow clips must remain owner-space
     /// effects: rewriting descendant bounds before a transform would clip in

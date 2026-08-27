@@ -866,7 +866,8 @@ fn filter_lowering_capable_item(
             PaintOperation::Image(_)
             | PaintOperation::ImagePattern(_)
             | PaintOperation::SvgPattern(_)
-            | PaintOperation::OpaqueTextCoverage(_) => false,
+            | PaintOperation::OpaqueTextCoverage(_)
+            | PaintOperation::SvgTextOutline(_) => false,
         },
         PaintDisplayItem::Primitive(primitive) => match primitive {
             PaintPrimitive::Rect(_)
@@ -878,7 +879,8 @@ fn filter_lowering_capable_item(
             PaintPrimitive::Image(_)
             | PaintPrimitive::ImagePattern(_)
             | PaintPrimitive::SvgPattern(_)
-            | PaintPrimitive::OpaqueTextCoverage { .. } => false,
+            | PaintPrimitive::OpaqueTextCoverage { .. }
+            | PaintPrimitive::SvgTextOutline { .. } => false,
         },
         PaintDisplayItem::StackingContext(context) => {
             context.effects.blend_mode == PaintBlendMode::Normal
@@ -2661,6 +2663,32 @@ fn write_page_operation(
                 }
             }
         }
+        crate::document::paint::page::PaintOperation::SvgTextOutline(index) => {
+            let Some(outline) = page.svg_text_outlines.get(*index) else {
+                return;
+            };
+            {
+                let mut marked_content =
+                    content.begin_marked_content_with_properties(Name(b"Span"));
+                marked_content
+                    .properties()
+                    .actual_text(TextStr(outline.actual_text.as_ref()));
+            }
+            for path_index in &outline.path_indices {
+                if let Some(path) = page.paths.get(*path_index) {
+                    write_path(
+                        content,
+                        path,
+                        state.vector_paints,
+                        state.resources,
+                        state.page_size,
+                        state.color_mode,
+                        state.active_filter_color_transform,
+                    );
+                }
+            }
+            content.end_marked_content();
+        }
     }
 }
 
@@ -3826,6 +3854,24 @@ fn write_svg_pattern_scene(
                     color_mode,
                     image_uses,
                 )
+            }
+            // Pattern resources are emitted before page font-resource plans
+            // are available. SVG text in a pattern therefore takes the
+            // outline fallback path; it must not be serialized through a
+            // separate font subset here.
+            crate::svg::SvgPaintItem::Text(_) => {}
+            crate::svg::SvgPaintItem::OutlinedText(outlined) => {
+                for path in &outlined.paths {
+                    write_path(
+                        content,
+                        path,
+                        vector_paints,
+                        resources,
+                        tile_size,
+                        color_mode,
+                        crate::css::BoundedSrgbColorTransform::IDENTITY,
+                    );
+                }
             }
         }
     }

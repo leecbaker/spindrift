@@ -1636,6 +1636,40 @@ async fn nested_table_fragment_contributes_to_cell_intrinsic_width() {
 }
 
 #[tokio::test]
+async fn nested_percentage_table_does_not_expand_outer_intrinsic_columns() {
+    let document = Html::from_string(
+        "<style>@page { size: 360pt 120pt; margin: 10pt } \
+         body, table, td { margin:0; font-size:10pt; line-height:10pt; border-spacing:0; padding:0 } \
+         table { width:100% } .inner td { width:50pt }</style>\
+         <table class=\"outer\"><tr>\
+           <td><table class=\"inner\"><tr><td>Alpha</td></tr></table></td>\
+           <td><table class=\"inner\"><tr><td>Bravo</td></tr></table></td>\
+           <td><table class=\"inner\"><tr><td>Charlie</td></tr></table></td>\
+         </tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let labels = ["Alpha", "Bravo", "Charlie"].map(|label| {
+        page.lines()
+            .iter()
+            .find(|line| line.text == label)
+            .unwrap_or_else(|| panic!("expected nested table label {label:?}"))
+    });
+
+    assert!(
+        labels.windows(2).all(|pair| pair[0].x() < pair[1].x()),
+        "nested-table labels must remain in source-order columns: {labels:?}"
+    );
+    assert!(
+        labels.iter().all(|label| label.x() < 350.0),
+        "nested percentage tables must not create off-page intrinsic columns: {labels:?}"
+    );
+}
+
+#[tokio::test]
 async fn table_row_groups_use_css_visual_order() {
     let document = Html::from_string(
         "<style>body { margin: 0; font-size: 10pt; line-height: 10pt } table { margin: 0; border-spacing: 0 } th, td { padding: 0; text-align: left }</style>\

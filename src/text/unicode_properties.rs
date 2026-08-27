@@ -284,15 +284,6 @@ pub(super) fn character_can_join_preceding(character: char) -> bool {
     )
 }
 
-/// Return whether Arabic tatweel may supply missing edge context.
-///
-/// U+0640 is an Arabic joining letter, not a generic cursive-script control.
-/// It must therefore never be inserted to complete Mongolian, Phags Pa, or
-/// another CSS Text cursive script's shaping context.
-pub(super) fn character_supports_arabic_tatweel_edge_context(character: char) -> bool {
-    matches!(cursive_script(character), Some(CursiveScript::Arabic))
-}
-
 /// Return whether a character is a Unicode join-control format character.
 ///
 /// CSS Text requires shaping behavior to honor the Unicode join controls
@@ -1317,9 +1308,5 @@ mod tests {
         for character in ['\u{1810}', '\u{1801}', '\u{a874}'] {
             assert_eq!(cursive_script(character), None);
         }
-
-        assert!(character_supports_arabic_tatweel_edge_context('ع'));
-        assert!(!character_supports_arabic_tatweel_edge_context('\u{1828}'));
-        assert!(!character_supports_arabic_tatweel_edge_context('\u{a840}'));
     }
 }

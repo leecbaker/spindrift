@@ -15,6 +15,7 @@ use crate::layout::table::{
     table_grid, table_metrics, table_root_distributes_extra_inline_space,
     table_root_inline_content_box_size, table_root_inline_size, used_empty_table_grid_width,
     used_table_width, used_table_wrapper_geometry,
+    used_table_wrapper_geometry_with_percentage_basis,
 };
 use crate::layout::{
     AtomicInlineFragmentReplayCoordinates, InlineAtom, InlineAtomContent, InlineSize,
@@ -24,7 +25,7 @@ use crate::layout::{
     used_content_box_height_or_auto_with_basis, used_max_height, used_min_height,
     used_property_containment,
 };
-use crate::units::{content_box_pt, non_content_pt};
+use crate::units::{LayoutLength, content_box_pt, non_content_pt};
 
 impl<'a> LayoutBuilder<'a> {
     /// Collect the single table-wrapper sizing contract consumed by Flexbox.
@@ -110,6 +111,34 @@ impl<'a> LayoutBuilder<'a> {
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> (f32, f32) {
+        self.table_intrinsic_widths_from_fragment_with_declared_cell_width_minimum(
+            element,
+            style,
+            stylesheets,
+            fragment,
+            available_outer_width,
+            true,
+        )
+    }
+
+    /// Compute table intrinsic widths, selecting whether declared cell widths
+    /// can form a min-content floor for this measurement context.
+    ///
+    /// When a nested table's percentage width is cyclic with its containing
+    /// cell, CSS Sizing treats that preferred width as `auto`. Its child-cell
+    /// widths remain max-content preferences, but cannot make the cyclic
+    /// table's min-content contribution depend on the unresolved outer track.
+    /// <https://drafts.csswg.org/css-sizing-3/#intrinsic-contribution>
+    /// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
+    fn table_intrinsic_widths_from_fragment_with_declared_cell_width_minimum(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        fragment: &box_tree::TableFragment<'_>,
+        available_outer_width: f32,
+        include_declared_cell_width_in_min_content: bool,
+    ) -> (f32, f32) {
         let input = TableLayoutInput::from_fragment(fragment);
         let rows = input.row_ordering.rows.as_slice();
         let available_table_width =
@@ -159,6 +188,7 @@ impl<'a> LayoutBuilder<'a> {
             table_cellpadding,
             table_metrics,
             collapsed_geometry.as_ref(),
+            include_declared_cell_width_in_min_content,
         );
         let min_content = measures.table_min_content_width().max(0.0);
         let max_content = measures.table_max_content_width().max(min_content);
@@ -181,13 +211,15 @@ impl<'a> LayoutBuilder<'a> {
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> (f32, f32) {
+        let available_table_width =
+            (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
         self.table_parent_intrinsic_content_widths_with_percentage_resolution(
             element,
             style,
             stylesheets,
             fragment,
             available_outer_width,
-            true,
+            PercentageBasis::definite(layout_pt(available_table_width)),
         )
     }
 
@@ -214,7 +246,7 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             fragment,
             available_outer_width,
-            false,
+            PercentageBasis::indefinite(),
         )
     }
 
@@ -233,10 +265,16 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
-        resolve_percentage: bool,
+        percentage_basis: PercentageBasis<LayoutLength>,
     ) -> (f32, f32) {
+        let intrinsic_edges = crate::layout::intrinsic_box_edges(style);
+        let margins = if percentage_basis.is_definite() {
+            style.margin
+        } else {
+            intrinsic_edges.margin.to_css_edges()
+        };
         let available_table_width =
-            (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
+            (available_outer_width - margins.left - margins.right).max(style.font_size);
         let input = TableLayoutInput::from_fragment(fragment);
         let rows = input.row_ordering.rows.as_slice();
         let collapsed_outer_insets =
@@ -256,17 +294,17 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 None
             };
-        let table_geometry =
-            used_table_wrapper_geometry(style, available_table_width, collapsed_outer_insets);
+        let table_geometry = used_table_wrapper_geometry_with_percentage_basis(
+            style,
+            available_table_width,
+            collapsed_outer_insets,
+            percentage_basis,
+        );
         let inline_non_content = table_geometry.inline_non_content();
-        let percentage_basis = resolve_percentage
-            .then(|| content_box_pt(available_table_width))
-            .map(PercentageBasis::definite)
-            .unwrap_or_else(PercentageBasis::indefinite);
         let authored_inline = table_root_inline_content_box_size(
             table_root_inline_size(style),
             style.box_sizing,
-            percentage_basis,
+            percentage_basis.map_value(|basis| content_box_pt(basis.points())),
             inline_non_content,
         )
         .map(SemanticLengthExt::points);
@@ -286,22 +324,22 @@ impl<'a> LayoutBuilder<'a> {
             let inline = constrain_table_root_inline_size(
                 style,
                 content_box_pt(inline),
-                PercentageBasis::definite(content_box_pt(
-                    available_table_width.max(style.font_size),
-                )),
+                percentage_basis.map_value(|basis| content_box_pt(basis.points())),
                 inline_non_content,
             )
             .points();
             return (inline, inline);
         }
 
-        let (min_content, max_content) = self.table_intrinsic_widths_from_fragment(
-            element,
-            style,
-            stylesheets,
-            fragment,
-            available_outer_width,
-        );
+        let (min_content, max_content) = self
+            .table_intrinsic_widths_from_fragment_with_declared_cell_width_minimum(
+                element,
+                style,
+                stylesheets,
+                fragment,
+                available_outer_width,
+                percentage_basis.is_definite(),
+            );
         let resolved_inline = authored_inline
             .or_else(|| {
                 intrinsic::intrinsic_content_box_width_keyword(
@@ -317,9 +355,7 @@ impl<'a> LayoutBuilder<'a> {
                 constrain_table_root_inline_size(
                     style,
                     content_box_pt(inline),
-                    PercentageBasis::definite(content_box_pt(
-                        available_table_width.max(style.font_size),
-                    )),
+                    percentage_basis.map_value(|basis| content_box_pt(basis.points())),
                     inline_non_content,
                 )
                 .points()
@@ -352,6 +388,54 @@ impl<'a> LayoutBuilder<'a> {
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
     ) -> (f32, f32) {
+        let available_table_width =
+            (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
+        self.table_outer_intrinsic_widths_from_fragment_with_percentage_basis(
+            element,
+            style,
+            stylesheets,
+            fragment,
+            available_outer_width,
+            PercentageBasis::definite(layout_pt(available_table_width)),
+        )
+    }
+
+    /// Return parent-facing table intrinsic widths when the table's inline
+    /// percentage basis is not yet known.
+    ///
+    /// A table nested in an auto-layout cell cannot resolve `width: 100%`
+    /// while that cell is contributing its own intrinsic width. CSS Sizing
+    /// treats the cyclic preferred size as `auto`; CSS Tables applies the
+    /// resulting margin-box contribution to the outer column instead.
+    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution>
+    /// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
+    pub(in crate::layout) fn table_outer_intrinsic_widths_with_indefinite_percentage_basis_from_fragment(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        fragment: &box_tree::TableFragment<'_>,
+        available_outer_width: f32,
+    ) -> (f32, f32) {
+        self.table_outer_intrinsic_widths_from_fragment_with_percentage_basis(
+            element,
+            style,
+            stylesheets,
+            fragment,
+            available_outer_width,
+            PercentageBasis::indefinite(),
+        )
+    }
+
+    fn table_outer_intrinsic_widths_from_fragment_with_percentage_basis(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        fragment: &box_tree::TableFragment<'_>,
+        available_outer_width: f32,
+        percentage_basis: PercentageBasis<LayoutLength>,
+    ) -> (f32, f32) {
         if style.writing_mode.has_vertical_lines() {
             return self.table_vertical_outer_intrinsic_widths_from_fragment(
                 element,
@@ -361,15 +445,24 @@ impl<'a> LayoutBuilder<'a> {
                 available_outer_width,
             );
         }
-        let (min_content, max_content) = self.table_parent_intrinsic_content_widths_from_fragment(
-            element,
-            style,
-            stylesheets,
-            fragment,
-            available_outer_width,
-        );
+        let (min_content, max_content) = self
+            .table_parent_intrinsic_content_widths_with_percentage_resolution(
+                element,
+                style,
+                stylesheets,
+                fragment,
+                available_outer_width,
+                percentage_basis,
+            );
+        let intrinsic_edges = crate::layout::intrinsic_box_edges(style);
+        let intrinsic_margins = intrinsic_edges.margin.to_css_edges();
+        let margins = if percentage_basis.is_definite() {
+            style.margin
+        } else {
+            intrinsic_margins
+        };
         let available_table_width =
-            (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
+            (available_outer_width - margins.left - margins.right).max(style.font_size);
         let input = TableLayoutInput::from_fragment(fragment);
         let rows = input.row_ordering.rows.as_slice();
         let collapsed_outer_insets =
@@ -390,9 +483,16 @@ impl<'a> LayoutBuilder<'a> {
                 None
             };
         let table_width = used_table_width(style, available_table_width, collapsed_outer_insets);
-        let horizontal_extras = table_horizontal_non_content_width(table_width)
-            + style.margin.left
-            + style.margin.right;
+        let horizontal_extras = if percentage_basis.is_definite() {
+            table_horizontal_non_content_width(table_width) + margins.left + margins.right
+        } else {
+            table_width.border_widths.left
+                + table_width.border_widths.right
+                + intrinsic_edges.padding.left.points()
+                + intrinsic_edges.padding.right.points()
+                + margins.left
+                + margins.right
+        };
         (
             min_content + horizontal_extras,
             max_content + horizontal_extras,

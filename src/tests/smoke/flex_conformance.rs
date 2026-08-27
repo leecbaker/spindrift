@@ -67,6 +67,27 @@ fn page_rect_with_fill(
 }
 
 #[tokio::test]
+async fn size_contained_flex_descendants_keep_definite_sizes_and_auto_constraints() {
+    let document = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body { margin: 0 }\
+         #flex { display: flex; flex-direction: column; width: 40pt }\
+         #definite { background: green } #automatic { background: blue }\
+         #definite > div { contain: size; height: 30pt }\
+         #automatic > div { contain: size; min-height: 12pt; padding: 2pt 0 3pt }\
+         </style><div id=flex><div id=definite><div></div></div><div id=automatic><div></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let definite = page_rect_with_fill(page, CssColor::new(0, 128, 0));
+    let automatic = page_rect_with_fill(page, CssColor::new(0, 0, 255));
+    assert_eq!(definite.height(), 30.0);
+    assert_eq!(automatic.height(), 17.0);
+}
+
+#[tokio::test]
 async fn rtl_row_justify_content_left_uses_the_physical_left_edge() {
     let document = Html::from_string(RTL_JUSTIFY_CONTENT_LEFT_WPT)
         .render(&RenderOptions::default())

@@ -1538,6 +1538,72 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn direct_float_uses_ordinary_child_traversal_without_reclassifying_normal_flow() {
+        let stylesheet = css::parse_stylesheet(&css::Css::from_string(
+            ".float { display: inline-block; float: left } \
+             .inline { display: inline-block }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
+        let parent_style = test_parent_style();
+        let mut font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(&stylesheets)
+            .finish()
+            .await;
+
+        let floated = dom::parse("<div><span class=\"float\">float</span></div>");
+        let floated_parent = first_element_by_tag(&floated, "div").expect("expected float parent");
+        assert!(!has_ordered_mixed_flow_content_with_font_metrics(
+            floated_parent,
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        ));
+        assert!(!has_direct_flow_child_with_font_metrics(
+            floated_parent,
+            &parent_style,
+            &stylesheets,
+            &mut font_system,
+        ));
+        assert!(has_direct_float_only_source_with_font_metrics(
+            floated_parent,
+            &parent_style,
+            &stylesheets,
+            &mut font_system,
+        ));
+
+        let mixed = dom::parse("<div>prefix<span class=\"float\">float</span></div>");
+        let mixed_parent = first_element_by_tag(&mixed, "div").expect("expected mixed parent");
+        assert!(!has_ordered_mixed_flow_content_with_font_metrics(
+            mixed_parent,
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        ));
+        assert!(!has_direct_float_only_source_with_font_metrics(
+            mixed_parent,
+            &parent_style,
+            &stylesheets,
+            &mut font_system,
+        ));
+
+        let inline = dom::parse("<div><span class=\"inline\">inline</span></div>");
+        let inline_parent = first_element_by_tag(&inline, "div").expect("expected inline parent");
+        assert!(!has_ordered_mixed_flow_content_with_font_metrics(
+            inline_parent,
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        ));
+    }
+
     #[test]
     fn margin_collapse_keeps_signed_layout_lengths_typed() {
         let mixed: LayoutLength = collapse_margins(layout_pt(12.0), layout_pt(-4.0));

@@ -100,6 +100,7 @@ impl<'a> LayoutBuilder<'a> {
             measured_footnotes: HashSet::new(),
             committed_inline_floats: HashMap::new(),
             footnote_reservations: HashMap::new(),
+            footnote_call_minimum_page_indices: HashMap::new(),
             footnote_layout_mode: FootnoteLayoutMode::Measure,
             footnote_measurement_depth: 0,
             rendered_footnotes: std::collections::HashSet::new(),

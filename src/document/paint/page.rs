@@ -1,10 +1,11 @@
 use std::borrow::Cow;
+use std::rc::Rc;
 
 use super::annotations::RenderedLink;
 use super::display_list::{PagePaintTree, PaintBand, PaintDisplayItem, PaintDisplayList};
 use super::effects::{PaintEffectScope, PaintEffects};
 use super::fragments::{PaintFragment, RecordedPaintFragment};
-use super::geometry::{PaintClip, PaintTransform, PaintTranslation, rect_bounds};
+use super::geometry::{PaintBounds, PaintClip, PaintTransform, PaintTranslation, rect_bounds};
 use super::images::RenderedImage;
 use super::paths::{RenderedPath, path_bounds};
 use super::patterns::{RenderedGradientPattern, RenderedImagePattern, RenderedSvgPattern};
@@ -96,6 +97,7 @@ impl Page {
             gradient_patterns: self.gradient_patterns.clone(),
             svg_patterns: self.svg_patterns.clone(),
             opaque_text_coverages: self.opaque_text_coverages.clone(),
+            svg_text_outlines: self.svg_text_outlines.clone(),
             lines: self.lines.clone(),
             links: self.links.clone(),
         }
@@ -117,6 +119,7 @@ impl Page {
         self.gradient_patterns = checkpoint.gradient_patterns;
         self.svg_patterns = checkpoint.svg_patterns;
         self.opaque_text_coverages = checkpoint.opaque_text_coverages;
+        self.svg_text_outlines = checkpoint.svg_text_outlines;
         self.lines = checkpoint.lines;
         self.links = checkpoint.links;
         fragment
@@ -299,6 +302,7 @@ impl Page {
         self.gradient_patterns.clear();
         self.svg_patterns.clear();
         self.opaque_text_coverages.clear();
+        self.svg_text_outlines.clear();
         self.lines.clear();
         self.links.clear();
         fragment
@@ -352,6 +356,13 @@ impl Page {
                 crate::svg::SvgPaintItem::RasterImage(image) => {
                     let operation = self.record_image(*image).1;
                     PaintDisplayItem::Operation(operation)
+                }
+                crate::svg::SvgPaintItem::Text(line) => {
+                    let operation = self.record_line(*line).1;
+                    PaintDisplayItem::Operation(operation)
+                }
+                crate::svg::SvgPaintItem::OutlinedText(outlined) => {
+                    PaintDisplayItem::Operation(self.record_svg_text_outline(*outlined).1)
                 }
                 crate::svg::SvgPaintItem::Group(group)
                 | crate::svg::SvgPaintItem::NestedSvg(group) => {
@@ -496,6 +507,18 @@ impl Page {
         line_index
     }
 
+    pub(crate) fn push_svg_text_outline_in_band(
+        &mut self,
+        band: PaintBand,
+        paths: Vec<RenderedPath>,
+        actual_text: Rc<str>,
+    ) -> usize {
+        let (index, operation) =
+            self.record_svg_text_outline(crate::svg::SvgOutlinedText { paths, actual_text });
+        self.push_paint_tree_operation_in_band(band, operation);
+        index
+    }
+
     /// Record ordered PDF text-paint slices without changing the CSS line's
     /// layout or decoration ownership.
     pub(crate) fn push_text_paint_segments_in_band(
@@ -571,6 +594,7 @@ impl Page {
         let mut svg_patterns_seen = vec![false; self.svg_patterns.len()];
         let mut lines_seen = vec![false; self.lines.len()];
         let mut opaque_text_coverages_seen = vec![false; self.opaque_text_coverages.len()];
+        let mut svg_text_outlines_seen = vec![false; self.svg_text_outlines.len()];
 
         for (operation_index, operation) in self.paint_operations().iter().enumerate() {
             match operation {
@@ -682,6 +706,34 @@ impl Page {
                         )?;
                     }
                 }
+                PaintOperation::SvgTextOutline(index) => {
+                    mark_operation_index(
+                        &mut svg_text_outlines_seen,
+                        *index,
+                        self.svg_text_outlines.len(),
+                        page_index,
+                        operation_index,
+                        "SVG text outline",
+                    )?;
+                    let outline = self.svg_text_outlines.get(*index).ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "page {} paint operation {} references missing SVG text outline {}",
+                            page_index + 1,
+                            operation_index,
+                            index
+                        ))
+                    })?;
+                    for path_index in &outline.path_indices {
+                        mark_operation_index(
+                            &mut paths_seen,
+                            *path_index,
+                            self.paths.len(),
+                            page_index,
+                            operation_index,
+                            "path",
+                        )?;
+                    }
+                }
             }
         }
 
@@ -712,6 +764,7 @@ impl Page {
             page_index,
             "opaque text coverage",
         )?;
+        ensure_all_operations_referenced(&svg_text_outlines_seen, page_index, "SVG text outline")?;
         Ok(())
     }
 
@@ -768,6 +821,25 @@ impl Page {
         let index = self.lines.len();
         self.lines.push(line);
         (index, PaintOperation::Line(index))
+    }
+
+    /// Record SVG text lowered to outlines while preserving its authored text
+    /// for PDF extraction with one `/ActualText` marked-content sequence.
+    fn record_svg_text_outline(
+        &mut self,
+        outlined: crate::svg::SvgOutlinedText,
+    ) -> (usize, PaintOperation) {
+        let path_indices = outlined
+            .paths
+            .into_iter()
+            .map(|path| self.record_path(path).0)
+            .collect();
+        let index = self.svg_text_outlines.len();
+        self.svg_text_outlines.push(SvgTextOutline {
+            path_indices,
+            actual_text: outlined.actual_text,
+        });
+        (index, PaintOperation::SvgTextOutline(index))
     }
 
     pub(crate) fn record_image(&mut self, image: RenderedImage) -> (usize, PaintOperation) {
@@ -838,6 +910,10 @@ impl Page {
                     path_indices,
                 });
                 PaintOperation::OpaqueTextCoverage(index)
+            }
+            PaintPrimitive::SvgTextOutline { paths, actual_text } => {
+                self.record_svg_text_outline(crate::svg::SvgOutlinedText { paths, actual_text })
+                    .1
             }
         }
     }
@@ -960,6 +1036,18 @@ impl Page {
                     .collect::<Option<Vec<_>>>()?;
                 Some(PaintPrimitive::OpaqueTextCoverage { line, paths })
             }
+            PaintOperation::SvgTextOutline(index) => {
+                let outline = self.svg_text_outlines.get(*index)?;
+                let paths = outline
+                    .path_indices
+                    .iter()
+                    .map(|index| self.paths.get(*index).cloned())
+                    .collect::<Option<Vec<_>>>()?;
+                Some(PaintPrimitive::SvgTextOutline {
+                    paths,
+                    actual_text: Rc::clone(&outline.actual_text),
+                })
+            }
         }
     }
 
@@ -1042,12 +1130,19 @@ pub enum PaintOperation {
     SvgPattern(usize),
     Line(usize),
     OpaqueTextCoverage(usize),
+    SvgTextOutline(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpaqueTextCoverage {
     pub(crate) line_index: usize,
     pub(crate) path_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SvgTextOutline {
+    pub(crate) path_indices: Vec<usize>,
+    pub(crate) actual_text: Rc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1064,6 +1159,7 @@ pub(crate) struct PaintCheckpoint {
     pub(in crate::document) svg_patterns: Vec<RenderedSvgPattern>,
     pub(in crate::document) lines: Vec<RenderedLine>,
     pub(in crate::document) opaque_text_coverages: Vec<OpaqueTextCoverage>,
+    pub(in crate::document) svg_text_outlines: Vec<SvgTextOutline>,
     pub(in crate::document) links: Vec<RenderedLink>,
 }
 
@@ -1081,6 +1177,10 @@ pub(crate) enum PaintPrimitive {
     OpaqueTextCoverage {
         line: RenderedLine,
         paths: Vec<RenderedPath>,
+    },
+    SvgTextOutline {
+        paths: Vec<RenderedPath>,
+        actual_text: Rc<str>,
     },
 }
 
@@ -1102,6 +1202,13 @@ impl PaintPrimitive {
                     .into_iter()
                     .map(|path| path.translated(offset))
                     .collect(),
+            },
+            Self::SvgTextOutline { paths, actual_text } => Self::SvgTextOutline {
+                paths: paths
+                    .into_iter()
+                    .map(|path| path.translated(offset))
+                    .collect(),
+                actual_text,
             },
         }
     }
@@ -1145,6 +1252,9 @@ impl PaintPrimitive {
                 .paint_bounds()
                 .intersect(clip)
                 .map(|_| Self::OpaqueTextCoverage { line, paths }),
+            Self::SvgTextOutline { paths, actual_text } => svg_text_outline_bounds(&paths)
+                .and_then(|bounds| bounds.intersect(clip))
+                .map(|_| Self::SvgTextOutline { paths, actual_text }),
         }
     }
 
@@ -1159,9 +1269,21 @@ impl PaintPrimitive {
             Self::Stroke(stroke) => Some(stroke.paint_bounds()),
             Self::Line(line) => Some(line.paint_bounds()),
             Self::OpaqueTextCoverage { line, .. } => Some(line.paint_bounds()),
+            Self::SvgTextOutline { paths, .. } => svg_text_outline_bounds(paths),
             Self::Path(path) => path_bounds(path),
         }
     }
+}
+
+fn svg_text_outline_bounds(paths: &[RenderedPath]) -> Option<PaintClip> {
+    let mut bounds: Option<PaintBounds> = None;
+    for path_bounds in paths.iter().filter_map(path_bounds) {
+        match &mut bounds {
+            Some(bounds) => bounds.include_paint_rect(path_bounds.paint_rect()),
+            None => bounds = Some(PaintBounds::from_paint_rect(path_bounds.paint_rect())),
+        }
+    }
+    bounds.map(PaintBounds::into_paint_clip)
 }
 
 #[cfg(test)]

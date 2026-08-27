@@ -1,6 +1,7 @@
 use std::num::NonZeroUsize;
 
 use super::*;
+use crate::layout::grid::GridAxisTopology;
 
 pub(in crate::layout) const GAP_RULE_EPSILON: f32 = 0.01;
 
@@ -419,35 +420,28 @@ pub(in crate::layout) fn grid_gap_rule_segment_primitives(
     )
 }
 
-/// Builds grid gutter bands from Taffy's detailed track sizes.
+/// Projects Grid's final canonical track topology into paintable gutter bands.
 ///
-/// Taffy models gutters as zero or positive tracks between grid tracks. CSS gap
-/// decorations paint those gutter tracks, while any distributed free space from
-/// `align-content`/`justify-content` remains outside the decorated gutter.
-pub(in crate::layout) fn grid_gap_decoration_gutters_from_tracks(
-    column_sizes: &[f32],
-    column_gutters: &[f32],
-    row_sizes: &[f32],
-    row_gutters: &[f32],
+/// The Grid layout owns `auto-fit` collapse provenance. Keeping this as a
+/// projection rather than accepting Taffy's detailed gutter record ensures
+/// gap-rule assignment happens after collapsed tracks and their gutters have
+/// been removed from the used Grid topology.
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>
+pub(in crate::layout) fn grid_gap_decoration_gutters_from_topologies(
+    columns: &GridAxisTopology,
+    rows: &GridAxisTopology,
     style: &ComputedStyle,
     content_width: f32,
     content_height: f32,
 ) -> GapDecorationGridGutters {
     GapDecorationGutters {
-        columns: grid_axis_gutters_from_tracks(
-            column_sizes,
-            column_gutters,
+        columns: grid_axis_gutters_from_topology(
+            columns,
             content_width,
             style.justify_content,
             style.direction == Direction::Rtl,
         ),
-        rows: grid_axis_gutters_from_tracks(
-            row_sizes,
-            row_gutters,
-            content_height,
-            style.align_content,
-            false,
-        ),
+        rows: grid_axis_gutters_from_topology(rows, content_height, style.align_content, false),
     }
 }
 
@@ -1122,21 +1116,27 @@ impl From<GapDecorationGutter> for GapBand {
     }
 }
 
-pub(in crate::layout) fn grid_axis_gutters_from_tracks(
-    sizes: &[f32],
-    gutters: &[f32],
+pub(in crate::layout) fn grid_axis_gutters_from_topology(
+    topology: &GridAxisTopology,
     axis_size: f32,
     alignment: AlignContent,
     axis_is_reversed: bool,
 ) -> Vec<GapDecorationGutter> {
-    if sizes.is_empty() || gutters.len() != sizes.len() + 1 {
+    let sizes = topology.track_sizes();
+    let gutters = topology.interior_gutters();
+    let collapsed_tracks = topology.collapsed_auto_fit_tracks();
+    if sizes.is_empty()
+        || gutters.len() != sizes.len().saturating_sub(1)
+        || collapsed_tracks.len() != sizes.len()
+    {
         return Vec::new();
     }
     let used_size = sizes.iter().chain(gutters.iter()).sum::<f32>();
     let free_space = axis_size - used_size;
     let track_count = sizes
         .iter()
-        .filter(|size| **size > GAP_RULE_EPSILON)
+        .enumerate()
+        .filter(|(index, _)| !collapsed_tracks[*index])
         .count();
     let alignment = grid_alignment_fallback(free_space, track_count, alignment);
     let alignment = if axis_is_reversed {
@@ -1149,7 +1149,12 @@ pub(in crate::layout) fn grid_axis_gutters_from_tracks(
     let mut seen_track = false;
     let mut bands = Vec::new();
     for (index, size) in sizes.iter().cloned().enumerate() {
-        let gutter_size = gutters[index].max(0.0);
+        let gutter_size = index
+            .checked_sub(1)
+            .and_then(|gutter_index| gutters.get(gutter_index))
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
         if index > 0 && gutter_size > GAP_RULE_EPSILON {
             bands.push(GapDecorationGutter::with_grid_line(
                 cursor,
@@ -1159,7 +1164,7 @@ pub(in crate::layout) fn grid_axis_gutters_from_tracks(
         }
         cursor += gutter_size;
 
-        let is_track = size > GAP_RULE_EPSILON;
+        let is_track = !collapsed_tracks[index];
         if is_track {
             cursor += grid_alignment_offset(free_space, track_count, alignment, !seen_track);
             seen_track = true;
@@ -1869,6 +1874,104 @@ mod tests {
             NonZeroUsize::new(sequence_len).expect("test rule sequence is non-empty"),
         )
         .expect("test rule index is in range")
+    }
+
+    fn auto_fit_topology(
+        track_sizes: Vec<f32>,
+        interior_gutters: Vec<f32>,
+        collapsed_tracks: Vec<bool>,
+    ) -> GridAxisTopology {
+        GridAxisTopology::new(track_sizes, interior_gutters, collapsed_tracks)
+    }
+
+    fn topology_gap_spans(topology: &GridAxisTopology) -> Vec<GapAxisSpan> {
+        grid_axis_gutters_from_topology(
+            topology,
+            260.0,
+            css::ContentAlignment::new(css::ContentAlignmentKeyword::Start),
+            false,
+        )
+        .into_iter()
+        .map(|gutter| gutter.span)
+        .collect()
+    }
+
+    #[test]
+    fn auto_fit_collapse_reindexes_gap_rules_after_leading_middle_and_trailing_runs() {
+        let cases = [
+            (
+                auto_fit_topology(
+                    vec![0.0, 0.0, 0.0, 0.0, 20.0, 20.0, 20.0, 20.0, 20.0],
+                    vec![0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0],
+                    vec![true, true, true, true, false, false, false, false, false],
+                ),
+                vec![
+                    GapAxisSpan::new(20.0, 30.0),
+                    GapAxisSpan::new(50.0, 60.0),
+                    GapAxisSpan::new(80.0, 90.0),
+                    GapAxisSpan::new(110.0, 120.0),
+                ],
+            ),
+            (
+                auto_fit_topology(
+                    vec![20.0, 20.0, 20.0, 0.0, 0.0, 0.0, 0.0, 20.0, 20.0],
+                    vec![10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 10.0],
+                    vec![false, false, false, true, true, true, true, false, false],
+                ),
+                vec![
+                    GapAxisSpan::new(20.0, 30.0),
+                    GapAxisSpan::new(50.0, 60.0),
+                    GapAxisSpan::new(80.0, 90.0),
+                    GapAxisSpan::new(110.0, 120.0),
+                ],
+            ),
+            (
+                auto_fit_topology(
+                    vec![20.0, 20.0, 20.0, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    vec![10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    vec![false, false, false, false, true, true, true, true, true],
+                ),
+                vec![
+                    GapAxisSpan::new(20.0, 30.0),
+                    GapAxisSpan::new(50.0, 60.0),
+                    GapAxisSpan::new(80.0, 90.0),
+                ],
+            ),
+        ];
+
+        for (topology, expected_spans) in cases {
+            let gaps = topology_gap_spans(&topology);
+            assert_eq!(gaps, expected_spans);
+            let slots = assign_gap_bands(
+                &gaps
+                    .iter()
+                    .copied()
+                    .map(|span| GapBand {
+                        start: span.start,
+                        end: span.end,
+                        grid_line: None,
+                        segment_range: None,
+                        rule_index: None,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                slots
+                    .iter()
+                    .map(|gap| gap.slot.index.get())
+                    .collect::<Vec<_>>(),
+                (0..expected_spans.len()).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn occupied_zero_sized_track_remains_a_gap_participant() {
+        let topology = auto_fit_topology(vec![0.0, 20.0], vec![10.0], vec![false, false]);
+        assert_eq!(
+            topology_gap_spans(&topology),
+            vec![GapAxisSpan::new(0.0, 10.0)]
+        );
     }
 
     #[test]

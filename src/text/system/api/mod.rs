@@ -17,5 +17,5 @@ mod shaping;
 
 pub(in crate::text) use font::*;
 use metrics::*;
-pub(crate) use shaping::span_boundary_needs_join_control;
 use shaping::*;
+pub(crate) use shaping::{TextShapingRequest, span_boundary_needs_join_control};

@@ -196,6 +196,7 @@ impl DocumentFontRegistry {
             .is_ok_and(|face| face.is_outline_embedding_allowed())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn document_font_from_query(
         &mut self,
         collection: &mut fontique::Collection,

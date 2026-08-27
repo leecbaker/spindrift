@@ -307,6 +307,7 @@ impl<'a> LayoutBuilder<'a> {
                 measured_footnotes: self.measured_footnotes.clone(),
                 committed_inline_floats: self.committed_inline_floats.clone(),
                 rendered_footnotes: self.rendered_footnotes.clone(),
+                footnote_call_minimum_page_indices: self.footnote_call_minimum_page_indices.clone(),
                 footnote_measurement_depth: self.footnote_measurement_depth,
                 fragmentation_suppression_depth: self.fragmentation_suppression_depth,
                 multicol_spanner_fragmentation_depth: self.multicol_spanner_fragmentation_depth,
@@ -451,6 +452,7 @@ impl<'a> LayoutBuilder<'a> {
         self.measured_footnotes = snapshot.measured_footnotes;
         self.committed_inline_floats = snapshot.committed_inline_floats;
         self.rendered_footnotes = snapshot.rendered_footnotes;
+        self.footnote_call_minimum_page_indices = snapshot.footnote_call_minimum_page_indices;
         self.footnote_measurement_depth = snapshot.footnote_measurement_depth;
         self.fragmentation_suppression_depth = snapshot.fragmentation_suppression_depth;
         self.multicol_spanner_fragmentation_depth = snapshot.multicol_spanner_fragmentation_depth;
@@ -890,6 +892,13 @@ impl<'a> LayoutBuilder<'a> {
                                 paths,
                             );
                         }
+                        PaintPrimitive::SvgTextOutline { paths, actual_text } => {
+                            page.push_svg_text_outline_in_band(
+                                PaintBand::PageBackground,
+                                paths,
+                                actual_text,
+                            );
+                        }
                     }
                 }
 
@@ -930,7 +939,8 @@ impl<'a> LayoutBuilder<'a> {
                         | PaintPrimitive::GradientPattern(_)
                         | PaintPrimitive::SvgPattern(_)
                         | PaintPrimitive::Line(_)
-                        | PaintPrimitive::OpaqueTextCoverage { .. } => {}
+                        | PaintPrimitive::OpaqueTextCoverage { .. }
+                        | PaintPrimitive::SvgTextOutline { .. } => {}
                     }
                 }
             }
@@ -1063,6 +1073,13 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 PaintPrimitive::OpaqueTextCoverage { line, paths } => {
                     page.push_opaque_text_coverage_in_band(PaintBand::PageBackground, line, paths);
+                }
+                PaintPrimitive::SvgTextOutline { paths, actual_text } => {
+                    page.push_svg_text_outline_in_band(
+                        PaintBand::PageBackground,
+                        paths,
+                        actual_text,
+                    );
                 }
             }
         }

@@ -43,12 +43,10 @@ use crate::units::{NonContentLength, content_box_pt};
 
 /// The intrinsic state contributed to one CSS table track distribution.
 ///
-/// CSS Tables keeps a declared non-percentage width as a preferred track
+/// CSS Tables keeps a declared non-percentage width as a table-track
 /// contribution in addition to intrinsic min/max-content and percentage
-/// contributions. A preferred cell width must not become a hard min-content
-/// floor: an empty `width: 100px` cell may still shrink into a narrower float
-/// exclusion band. Keeping these four values together also prevents `width:
-/// 0` (or a small fixed width) from replacing an unbreakable cell's intrinsic
+/// contributions. Keeping these four values together prevents `width: 0` (or
+/// a small fixed width) from replacing an unbreakable cell's intrinsic
 /// minimum:
 /// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>.
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +92,22 @@ struct TableCellColumnContribution {
 /// <https://www.w3.org/TR/CSS22/tables.html#fixed-table-layout>
 fn fixed_table_layout_algorithm_applies(table_style: &ComputedStyle) -> bool {
     table_style.table_layout == TableLayout::Fixed && !table_root_inline_size(table_style).is_auto()
+}
+
+/// Whether the table root's inline size depends on its containing block.
+///
+/// A percentage-width nested table receives its real cell width only after
+/// the outer table tracks have been committed. Its child-cell widths remain
+/// preferred track measures at that point; using them as a minimum would
+/// force the nested table back to the pre-resolution intrinsic width.
+/// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
+fn table_root_inline_size_has_percentage_component(table_style: &ComputedStyle) -> bool {
+    match table_root_inline_size(table_style) {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
+            value.percentage_coefficient_or_zero() != 0.0
+        }
+        _ => false,
+    }
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -199,6 +213,7 @@ impl<'a> LayoutBuilder<'a> {
         table_cellpadding: Option<TableCellPadding>,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
+        include_declared_cell_width_in_min_content: bool,
     ) -> TableColumnMeasures {
         let column_count = grid.column_count;
         let collapsed_columns =
@@ -348,7 +363,12 @@ impl<'a> LayoutBuilder<'a> {
                     measure: TableTrackMeasure {
                         min_content,
                         max_content,
-                        declared_non_percentage_minimum: width_floor,
+                        declared_non_percentage_minimum:
+                            if include_declared_cell_width_in_min_content {
+                                width_floor
+                            } else {
+                                0.0
+                            },
                         percentage,
                     },
                     explicit_non_percentage_width: explicit_width
@@ -469,6 +489,7 @@ impl<'a> LayoutBuilder<'a> {
             table_cellpadding,
             table_metrics,
             collapsed_geometry,
+            !table_root_inline_size_has_percentage_component(table_style),
         );
         let min_content = measures.table_min_content_width().max(0.0);
         let max_content = measures.table_max_content_width().max(min_content);
@@ -545,6 +566,7 @@ impl<'a> LayoutBuilder<'a> {
             table_cellpadding,
             table_metrics.clone(),
             collapsed_geometry,
+            !table_root_inline_size_has_percentage_component(table_style),
         );
         let table_min_content_width = measures.table_min_content_width();
         let table_max_content_width = measures

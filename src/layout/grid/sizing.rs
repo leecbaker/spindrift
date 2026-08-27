@@ -366,7 +366,7 @@ impl<'a> LayoutBuilder<'a> {
                     item_containing_block_bases: Some(initial_bases),
                     frozen_tracks: GridFrozenTrackTopology {
                         columns: None,
-                        rows: Some(layout.row_track_sizes.clone()),
+                        rows: Some(GridFrozenTrackAxis::from_layout(&layout, GridAxis::Row)),
                     },
                     row_gap_basis: grid_percentage_basis(
                         height.map(PhysicalContentHeight::content_box_length),
@@ -416,7 +416,7 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                     item_containing_block_bases: Some(column_bases),
                     frozen_tracks: GridFrozenTrackTopology {
-                        columns: Some(layout.column_track_sizes.clone()),
+                        columns: Some(GridFrozenTrackAxis::from_layout(&layout, GridAxis::Column)),
                         rows: None,
                     },
                     row_gap_basis: grid_percentage_basis(
@@ -451,8 +451,8 @@ impl<'a> LayoutBuilder<'a> {
                 ),
                 item_containing_block_bases: Some(final_bases),
                 frozen_tracks: GridFrozenTrackTopology {
-                    columns: Some(layout.column_track_sizes.clone()),
-                    rows: Some(layout.row_track_sizes.clone()),
+                    columns: Some(GridFrozenTrackAxis::from_layout(&layout, GridAxis::Column)),
+                    rows: Some(GridFrozenTrackAxis::from_layout(&layout, GridAxis::Row)),
                 },
                 row_gap_basis: grid_percentage_basis(
                     height.map(PhysicalContentHeight::content_box_length),
@@ -1049,8 +1049,8 @@ impl<'a> LayoutBuilder<'a> {
                     grid_template_columns: config
                         .frozen_tracks
                         .columns
-                        .as_deref()
-                        .map(taffy_fixed_grid_tracks)
+                        .as_ref()
+                        .map(|axis| taffy_fixed_grid_tracks(axis.topology.track_sizes()))
                         .or_else(|| physical_column_subgrid.map(ResolvedSubgridAxis::taffy_tracks))
                         .unwrap_or_else(|| {
                             if swaps_physical_grid_axes {
@@ -1070,8 +1070,8 @@ impl<'a> LayoutBuilder<'a> {
                     grid_template_rows: config
                         .frozen_tracks
                         .rows
-                        .as_deref()
-                        .map(taffy_fixed_grid_tracks)
+                        .as_ref()
+                        .map(|axis| taffy_fixed_grid_tracks(axis.topology.track_sizes()))
                         .or_else(|| physical_row_subgrid.map(ResolvedSubgridAxis::taffy_tracks))
                         .unwrap_or_else(|| {
                             if swaps_physical_grid_axes {
@@ -1203,12 +1203,10 @@ impl<'a> LayoutBuilder<'a> {
         .ok()?;
         let root_layout = tree.layout(root).ok()?;
         let mut grid_item_areas = Vec::new();
-        let mut column_line_offsets = Vec::new();
-        let mut row_line_offsets = Vec::new();
-        let mut column_track_sizes = Vec::new();
-        let mut row_track_sizes = Vec::new();
+        let mut columns = GridAxisTopology::default();
+        let mut rows = GridAxisTopology::default();
         let mut track_corrections = GridTrackLayoutCorrections::default();
-        let mut gap_gutters = match tree.detailed_layout_info(root) {
+        match tree.detailed_layout_info(root) {
             taffy::tree::DetailedLayoutInfo::Grid(info) => {
                 grid_item_areas = info
                     .items
@@ -1220,22 +1218,41 @@ impl<'a> LayoutBuilder<'a> {
                         column_end: item.column_end,
                     })
                     .collect();
-                let column_correction = startward_auto_fit_track_correction(
-                    style,
-                    GridAxis::Column,
-                    &column_adjustment,
-                    &info.columns.sizes,
-                    &info.columns.gutters,
-                    &grid_item_areas,
-                );
-                let row_correction = startward_auto_fit_track_correction(
-                    style,
-                    GridAxis::Row,
-                    &row_adjustment,
-                    &info.rows.sizes,
-                    &info.rows.gutters,
-                    &grid_item_areas,
-                );
+                // A frozen feedback axis carries the corrected auto-fit
+                // topology from its preceding pass. Its later semantic
+                // correction rebases the fixed Taffy result against that
+                // topology, so applying a fresh startward correction here
+                // would distribute the same collapse twice.
+                let column_correction = config
+                    .frozen_tracks
+                    .columns
+                    .is_none()
+                    .then(|| {
+                        startward_auto_fit_track_correction(
+                            style,
+                            GridAxis::Column,
+                            &column_adjustment,
+                            &info.columns.sizes,
+                            &info.columns.gutters,
+                            &grid_item_areas,
+                        )
+                    })
+                    .flatten();
+                let row_correction = config
+                    .frozen_tracks
+                    .rows
+                    .is_none()
+                    .then(|| {
+                        startward_auto_fit_track_correction(
+                            style,
+                            GridAxis::Row,
+                            &row_adjustment,
+                            &info.rows.sizes,
+                            &info.rows.gutters,
+                            &grid_item_areas,
+                        )
+                    })
+                    .flatten();
                 let column_sizes = column_correction
                     .as_ref()
                     .map(|correction| correction.sizes.as_slice())
@@ -1252,9 +1269,56 @@ impl<'a> LayoutBuilder<'a> {
                     .as_ref()
                     .map(|correction| correction.gutters.as_slice())
                     .unwrap_or(&info.rows.gutters);
-                column_track_sizes = column_sizes.to_vec();
-                row_track_sizes = row_sizes.to_vec();
-                column_line_offsets = column_correction
+                let column_collapsed_tracks = auto_fit_collapsed_track_mask(
+                    style,
+                    GridAxis::Column,
+                    &column_adjustment,
+                    column_sizes.len(),
+                    &grid_item_areas,
+                );
+                let row_collapsed_tracks = auto_fit_collapsed_track_mask(
+                    style,
+                    GridAxis::Row,
+                    &row_adjustment,
+                    row_sizes.len(),
+                    &grid_item_areas,
+                );
+                // Both Taffy's detailed record and the startward correction
+                // retain synthetic boundary gutters. Canonical Grid topology
+                // retains only interior gutters, so normalize exactly once at
+                // this backend boundary before any frozen or paint consumer
+                // can observe the axis.
+                let column_track_gutters = column_correction.as_ref().map_or_else(
+                    || {
+                        collapse_grid_track_gutters(
+                            &taffy_grid_track_gutters(column_gutters, column_sizes.len()),
+                            &column_collapsed_tracks,
+                        )
+                    },
+                    |correction| {
+                        collapse_grid_track_gutters(
+                            &taffy_grid_track_gutters(&correction.gutters, column_sizes.len()),
+                            &column_collapsed_tracks,
+                        )
+                    },
+                );
+                let row_track_gutters = row_correction.as_ref().map_or_else(
+                    || {
+                        collapse_grid_track_gutters(
+                            &taffy_grid_track_gutters(row_gutters, row_sizes.len()),
+                            &row_collapsed_tracks,
+                        )
+                    },
+                    |correction| {
+                        collapse_grid_track_gutters(
+                            &taffy_grid_track_gutters(&correction.gutters, row_sizes.len()),
+                            &row_collapsed_tracks,
+                        )
+                    },
+                );
+                let column_sizes = column_sizes.to_vec();
+                let row_sizes = row_sizes.to_vec();
+                let column_line_offsets = column_correction
                     .as_ref()
                     .map(|correction| correction.offsets.clone())
                     .unwrap_or_else(|| {
@@ -1263,53 +1327,94 @@ impl<'a> LayoutBuilder<'a> {
                             &info.columns.gutters,
                         )
                     });
-                row_line_offsets = row_correction
+                let row_line_offsets = row_correction
                     .as_ref()
                     .map(|correction| correction.offsets.clone())
                     .unwrap_or_else(|| {
                         grid_line_offsets_from_track_layout(&info.rows.sizes, &info.rows.gutters)
                     });
-                let gap_gutters = grid_gap_decoration_gutters_from_tracks(
+                columns = GridAxisTopology::with_line_offsets(
+                    column_line_offsets,
                     column_sizes,
-                    column_gutters,
+                    column_track_gutters,
+                    column_collapsed_tracks,
+                );
+                rows = GridAxisTopology::with_line_offsets(
+                    row_line_offsets,
                     row_sizes,
-                    row_gutters,
-                    style,
-                    width,
-                    root_layout.size.height,
+                    row_track_gutters,
+                    row_collapsed_tracks,
                 );
                 track_corrections = GridTrackLayoutCorrections {
                     columns: column_correction,
                     rows: row_correction,
                 };
-                gap_gutters
             }
-            taffy::tree::DetailedLayoutInfo::None => GapDecorationGridGutters::default(),
+            taffy::tree::DetailedLayoutInfo::None => {}
         };
         // Taffy is used to resolve placement topology, but it has no subgrid
         // model. Once placement is known, inherited axes must retain the
         // parent-owned track and gutter geometry exactly.
         // <https://www.w3.org/TR/css-grid-2/#subgrids>
         if let Some(axis) = physical_column_subgrid {
-            column_line_offsets = axis.line_offsets().to_vec();
-            column_track_sizes = axis
+            let track_sizes: Vec<f32> = axis
                 .track_starts()
                 .iter()
                 .zip(axis.track_ends())
                 .map(|(start, end)| (end - start).max(0.0))
                 .collect();
-            gap_gutters.columns = axis.gap_gutters();
+            columns = GridAxisTopology::from_line_offsets(
+                axis.line_offsets().to_vec(),
+                track_sizes.clone(),
+                vec![false; track_sizes.len()],
+            );
         }
         if let Some(axis) = physical_row_subgrid {
-            row_line_offsets = axis.line_offsets().to_vec();
-            row_track_sizes = axis
+            let track_sizes: Vec<f32> = axis
                 .track_starts()
                 .iter()
                 .zip(axis.track_ends())
                 .map(|(start, end)| (end - start).max(0.0))
                 .collect();
-            gap_gutters.rows = axis.gap_gutters();
+            rows = GridAxisTopology::from_line_offsets(
+                axis.line_offsets().to_vec(),
+                track_sizes.clone(),
+                vec![false; track_sizes.len()],
+            );
         }
+        // Startward implicit expansion already produces an explicit corrected
+        // track-layout record below. Retain that established source/target
+        // correction until it can share the same area model; ordinary frozen
+        // axes use the semantic collapsed topology directly.
+        let frozen_column_correction =
+            track_corrections
+                .columns
+                .is_none()
+                .then(|| {
+                    config.frozen_tracks.columns.as_ref().and_then(|axis| {
+                        FrozenGridAxisCorrection::new(axis, &columns.line_offsets())
+                    })
+                })
+                .flatten();
+        let frozen_row_correction = track_corrections
+            .rows
+            .is_none()
+            .then(|| {
+                config
+                    .frozen_tracks
+                    .rows
+                    .as_ref()
+                    .and_then(|axis| FrozenGridAxisCorrection::new(axis, &rows.line_offsets()))
+            })
+            .flatten();
+        if let Some(correction) = &frozen_column_correction {
+            columns = correction.topology.clone();
+        }
+        if let Some(correction) = &frozen_row_correction {
+            rows = correction.topology.clone();
+        }
+        let column_line_offsets = columns.line_offsets();
+        let row_line_offsets = rows.line_offsets();
         let column_line_names = physical_column_subgrid.map_or_else(
             || physical_grid_line_names(style, GridAxis::Column, column_line_offsets.len()),
             |axis| axis.physical_line_names().to_vec(),
@@ -1347,6 +1452,26 @@ impl<'a> LayoutBuilder<'a> {
             &mut items,
         );
         apply_resolved_subgrid_axis_item_geometry(physical_row_subgrid, GridAxis::Row, &mut items);
+        apply_frozen_grid_axis_correction(
+            frozen_column_correction.as_ref(),
+            style.justify_content,
+            content_width.points(),
+            GridAxis::Column,
+            style,
+            Some(children),
+            Some(&estimates),
+            &mut items,
+        );
+        apply_frozen_grid_axis_correction(
+            frozen_row_correction.as_ref(),
+            style.align_content,
+            root_layout.size.height,
+            GridAxis::Row,
+            style,
+            Some(children),
+            Some(&estimates),
+            &mut items,
+        );
         let final_grid_height = physical_row_subgrid
             .map(ResolvedSubgridAxis::outer_extent)
             .unwrap_or(root_layout.size.height);
@@ -1374,8 +1499,24 @@ impl<'a> LayoutBuilder<'a> {
             content_width,
             final_grid_height,
             &track_corrections,
+            frozen_column_correction.is_none(),
+            frozen_row_correction.is_none(),
             &mut items,
         );
+        // Taffy's Grid placement remains physical-left-to-right even when it
+        // receives `direction: rtl`. CSS Grid's inline-start line is the
+        // right edge in horizontal RTL, so project the physical item boxes
+        // before Quire applies physical `left`/`right` self-alignment.
+        if !swaps_physical_grid_axes && style.used_direction() == Direction::Rtl {
+            for item in &mut items {
+                let width = item.width();
+                item.set_axis_geometry(
+                    GridAxis::Column,
+                    (content_width.points() - item.axis_start(GridAxis::Column) - width).max(0.0),
+                    width,
+                );
+            }
+        }
         apply_grid_self_alignment_corrections(
             style,
             children,
@@ -1453,13 +1594,12 @@ impl<'a> LayoutBuilder<'a> {
             last_baseline,
             items,
             baseline_resolutions,
-            gap_gutters,
-            column_line_offsets,
-            row_line_offsets,
+            columns,
+            rows,
+            content_width: content_width.points(),
+            content_height: final_grid_height,
             column_line_names,
             row_line_names,
-            column_track_sizes,
-            row_track_sizes,
         })
     }
 }
@@ -1495,8 +1635,8 @@ fn grid_margin_trim_plan(style: &ComputedStyle, layout: &GridLayout) -> MarginTr
                 .iter()
                 .map(|area| (area.column_start, area.column_end))
                 .collect::<Vec<_>>(),
-            layout.row_track_sizes.as_slice(),
-            layout.column_track_sizes.as_slice(),
+            layout.rows.track_sizes(),
+            layout.columns.track_sizes(),
         )
     } else {
         (
@@ -1508,8 +1648,8 @@ fn grid_margin_trim_plan(style: &ComputedStyle, layout: &GridLayout) -> MarginTr
                 .iter()
                 .map(|area| (area.row_start, area.row_end))
                 .collect::<Vec<_>>(),
-            layout.column_track_sizes.as_slice(),
-            layout.row_track_sizes.as_slice(),
+            layout.columns.track_sizes(),
+            layout.rows.track_sizes(),
         )
     };
     let (inline_first, inline_last) =
@@ -1775,8 +1915,296 @@ pub(super) struct GridItemContainingBlockBases {
 /// point, so the fixed axis is represented as exact fixed track functions.
 #[derive(Debug, Clone, Default)]
 pub(super) struct GridFrozenTrackTopology {
-    columns: Option<Vec<f32>>,
-    rows: Option<Vec<f32>>,
+    columns: Option<GridFrozenTrackAxis>,
+    rows: Option<GridFrozenTrackAxis>,
+}
+
+/// The final physical geometry retained while a feedback pass holds an axis
+/// fixed. `collapsed_tracks` keeps CSS auto-fit topology that Taffy's fixed
+/// length template cannot represent.
+#[derive(Debug, Clone)]
+pub(super) struct GridFrozenTrackAxis {
+    topology: GridAxisTopology,
+    item_geometry: Vec<FrozenGridItemAxisGeometry>,
+}
+
+/// One already-resolved physical Grid item axis retained across a bounded
+/// opposite-axis feedback pass. The frozen pass must not re-run its
+/// self-alignment against Taffy's lossy fixed-track representation.
+#[derive(Debug, Clone, Copy)]
+struct FrozenGridItemAxisGeometry {
+    start: f32,
+    size: f32,
+}
+
+impl GridFrozenTrackAxis {
+    fn from_layout(layout: &GridLayout, axis: GridAxis) -> Self {
+        Self {
+            topology: layout.axis_topology(axis).clone(),
+            item_geometry: layout
+                .items
+                .iter()
+                .map(|item| FrozenGridItemAxisGeometry {
+                    start: item.axis_start(axis),
+                    size: item.axis_size(axis),
+                })
+                .collect(),
+        }
+    }
+
+    fn has_collapsed_tracks(&self) -> bool {
+        self.topology.has_collapsed_auto_fit_tracks()
+    }
+}
+
+/// The source geometry produced by Taffy's fixed-track replay and the target
+/// geometry mandated by the preserved auto-fit topology.
+struct FrozenGridAxisCorrection {
+    source_offsets: Vec<f32>,
+    topology: GridAxisTopology,
+    item_geometry: Vec<FrozenGridItemAxisGeometry>,
+}
+
+impl FrozenGridAxisCorrection {
+    fn new(axis: &GridFrozenTrackAxis, source_offsets: &[f32]) -> Option<Self> {
+        (axis.has_collapsed_tracks()
+            && source_offsets.len() == axis.topology.track_sizes().len().saturating_add(1))
+        .then(|| Self {
+            source_offsets: source_offsets.to_vec(),
+            topology: axis.topology.clone(),
+            item_geometry: axis.item_geometry.clone(),
+        })
+    }
+}
+
+/// Rebase final Taffy item geometry from its fixed-track alignment subject to
+/// the CSS auto-fit subject. Taffy cannot mark a fixed zero-length track as
+/// collapsed, so it distributes space through every frozen track; CSS Grid
+/// distributes only through the non-collapsed tracks.
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>
+#[allow(clippy::too_many_arguments)] // The two feedback axes share this exact placement adapter.
+fn apply_frozen_grid_axis_correction(
+    correction: Option<&FrozenGridAxisCorrection>,
+    content_alignment: css::ContentAlignment,
+    container_size: f32,
+    axis: GridAxis,
+    container_style: &ComputedStyle,
+    children: Option<&[GridChild<'_>]>,
+    estimates: Option<&[GridItemEstimate]>,
+    items: &mut [GridItemLayout],
+) {
+    let Some(correction) = correction else {
+        return;
+    };
+    let source_collapsed_tracks = vec![false; correction.topology.track_sizes().len()];
+    for (index, item) in items.iter_mut().enumerate() {
+        if let Some(geometry) = correction.item_geometry.get(index) {
+            item.set_axis_geometry(axis, geometry.start, geometry.size);
+            continue;
+        }
+        let Some(area) = item.area else {
+            continue;
+        };
+        let (start_line, end_line) = match axis {
+            GridAxis::Column => (area.column_start, area.column_end),
+            GridAxis::Row => (area.row_start, area.row_end),
+        };
+        let start_line = usize::from(start_line).saturating_sub(1);
+        let end_line = usize::from(end_line).saturating_sub(1);
+        let Some((source_start, source_end)) = frozen_grid_area_span(
+            content_alignment,
+            container_size,
+            &correction.source_offsets,
+            end_line,
+            Some(&source_collapsed_tracks),
+            correction.topology.track_sizes(),
+            start_line,
+        ) else {
+            continue;
+        };
+        let Some((target_start, target_end)) = frozen_grid_area_span(
+            content_alignment,
+            container_size,
+            &correction.topology.line_offsets(),
+            end_line,
+            Some(correction.topology.collapsed_auto_fit_tracks()),
+            correction.topology.track_sizes(),
+            start_line,
+        ) else {
+            continue;
+        };
+        let source_area_size = (source_end - source_start).max(0.0);
+        let target_area_size = (target_end - target_start).max(0.0);
+        let size = item.axis_size(axis);
+        let source_offset = item.axis_start(axis) - source_start;
+        let source_free_space = source_area_size - size;
+        let target_free_space = target_area_size - size;
+        let stretches = children
+            .zip(estimates)
+            .and_then(|(children, estimates)| children.get(index).zip(estimates.get(index)))
+            .map(|(child, estimate)| {
+                frozen_grid_item_stretches_axis(container_style, child, estimate, axis)
+            })
+            // Unit-level topology checks have no item styles. Their source
+            // geometry intentionally describes an already-stretched item.
+            .unwrap_or((size - source_area_size).abs() < 0.01);
+        let (start, size) = if stretches {
+            (target_start, target_area_size)
+        } else if source_free_space.abs() >= 0.01 {
+            (
+                target_start + source_offset / source_free_space * target_free_space,
+                size,
+            )
+        } else {
+            // A zero-free-space source cannot reveal a self-alignment
+            // fraction. Preserve its start-side offset; later Quire-owned
+            // self-alignment corrections handle writing-mode-specific cases.
+            (target_start + source_offset, size)
+        };
+        item.set_axis_geometry(axis, start, size);
+    }
+}
+
+/// Resolve a final grid area from physical track starts. The right/bottom
+/// boundary ends at the final occupied track's edge, rather than at the next
+/// track start: a single-track grid area must not stretch into its following
+/// gutter.
+fn frozen_grid_area_span(
+    content_alignment: css::ContentAlignment,
+    container_size: f32,
+    line_offsets: &[f32],
+    end_line: usize,
+    collapsed_tracks: Option<&[bool]>,
+    sizes: &[f32],
+    start_line: usize,
+) -> Option<(f32, f32)> {
+    let start = content_aligned_grid_line_offset_with_collapsed_tracks(
+        content_alignment,
+        container_size,
+        line_offsets,
+        start_line,
+        collapsed_tracks,
+    )?;
+    let last_track = end_line.checked_sub(1)?;
+    let end = content_aligned_grid_line_offset_with_collapsed_tracks(
+        content_alignment,
+        container_size,
+        line_offsets,
+        last_track,
+        collapsed_tracks,
+    )? + sizes.get(last_track).copied().unwrap_or(0.0).max(0.0);
+    Some((start, end.max(start)))
+}
+
+/// Whether the final grid-area sizing step stretches this physical item axis.
+/// A frozen pass has already converted collapsed tracks to numeric zeroes, so
+/// its reported source area can be wider than the actual CSS area. Determine
+/// stretch from the item style instead of inferring it from that source size.
+/// <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>
+fn frozen_grid_item_stretches_axis(
+    container_style: &ComputedStyle,
+    child: &GridChild<'_>,
+    estimate: &GridItemEstimate,
+    axis: GridAxis,
+) -> bool {
+    let swaps_axes = WritingModeAxes::new(container_style.writing_mode, container_style.direction)
+        .swaps_physical_axes();
+    let (alignment, size_is_auto) = match (axis, swaps_axes) {
+        (GridAxis::Column, false) => (
+            effective_grid_justify_self(&child.style, container_style).keyword,
+            child.style.box_values.width.is_auto(),
+        ),
+        (GridAxis::Row, false) => (
+            effective_grid_align_self(&child.style, container_style).keyword,
+            child.style.box_values.height.value().is_auto(),
+        ),
+        (GridAxis::Column, true) => (
+            effective_grid_align_self(&child.style, container_style).keyword,
+            child.style.box_values.width.is_auto(),
+        ),
+        (GridAxis::Row, true) => (
+            effective_grid_justify_self(&child.style, container_style).keyword,
+            child.style.box_values.height.value().is_auto(),
+        ),
+    };
+    if !size_is_auto {
+        return false;
+    }
+    if alignment == SelfAlignmentKeyword::Stretch {
+        return true;
+    }
+    alignment == SelfAlignmentKeyword::Normal
+        && estimate.replaced_used_size.is_none()
+        && child
+            .style
+            .aspect_ratio
+            .preferred_ratio_for_non_replaced(false)
+            .is_none()
+}
+
+/// Convert Taffy's alternating grid-track representation to the interior
+/// gutters used by Quire's line geometry. Taffy includes a collapsed leading
+/// and trailing gutter; CSS grid-line offsets only use gutters between tracks.
+fn taffy_grid_track_gutters(taffy_gutters: &[f32], track_count: usize) -> Vec<f32> {
+    let interior_gutter_count = track_count.saturating_sub(1);
+    if taffy_gutters.len() == track_count.saturating_add(1) {
+        taffy_gutters
+            .iter()
+            .skip(1)
+            .take(interior_gutter_count)
+            .copied()
+            .collect()
+    } else {
+        // Preserve compatibility with the older detailed-layout shape, which
+        // already exposed only interior gutters.
+        taffy_gutters
+            .iter()
+            .take(interior_gutter_count)
+            .copied()
+            .collect()
+    }
+}
+
+/// Canonicalize gutters around collapsed `auto-fit` tracks.
+///
+/// The grid-track sequence stores each gutter after its preceding track. A
+/// collapsed track removes that following gutter; a trailing run additionally
+/// removes the gutter after the last live track. A preceding gutter remains
+/// between the adjacent live tracks after the collapsed run is elided.
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>
+fn collapse_grid_track_gutters(gutters: &[f32], collapsed_tracks: &[bool]) -> Vec<f32> {
+    let mut canonical_gutters = gutters.to_vec();
+    for (index, collapsed) in collapsed_tracks.iter().enumerate() {
+        if *collapsed && let Some(gutter) = canonical_gutters.get_mut(index) {
+            *gutter = 0.0;
+        }
+    }
+    let trailing_gutter_start = collapsed_tracks
+        .iter()
+        .rposition(|collapsed| !collapsed)
+        .unwrap_or(0);
+    for gutter in canonical_gutters.iter_mut().skip(trailing_gutter_start) {
+        *gutter = 0.0;
+    }
+    canonical_gutters
+}
+
+fn auto_fit_collapsed_track_mask(
+    style: &ComputedStyle,
+    axis: GridAxis,
+    adjustment: &StartwardImplicitTrackAdjustment,
+    track_count: usize,
+    item_areas: &[GridItemArea],
+) -> Vec<bool> {
+    let mut collapsed = vec![false; track_count];
+    let Some(range) = auto_fit_track_range_with_startward_adjustment(style, axis, adjustment)
+    else {
+        return collapsed;
+    };
+    for track_index in range.filter(|index| *index < track_count) {
+        collapsed[track_index] = !grid_track_has_item(axis, track_index, item_areas);
+    }
+    collapsed
 }
 
 /// Derive the physical percentage containing blocks from resolved grid-area
@@ -1810,7 +2238,7 @@ fn grid_item_containing_block_bases(
             GridItemContainingBlockBases {
                 width: grid_percentage_basis(
                     grid_area_axis_extent(
-                        &layout.column_line_offsets,
+                        &layout.columns.line_offsets(),
                         area.column_start,
                         area.column_end,
                     )
@@ -1818,8 +2246,12 @@ fn grid_item_containing_block_bases(
                     width_source,
                 ),
                 height: grid_percentage_basis(
-                    grid_area_axis_extent(&layout.row_line_offsets, area.row_start, area.row_end)
-                        .map(content_box_pt),
+                    grid_area_axis_extent(
+                        &layout.rows.line_offsets(),
+                        area.row_start,
+                        area.row_end,
+                    )
+                    .map(content_box_pt),
                     height_source,
                 ),
             }
@@ -1919,7 +2351,10 @@ fn startward_auto_fit_track_correction(
     gutters: &[f32],
     item_areas: &[GridItemArea],
 ) -> Option<GridTrackLayoutCorrection> {
-    let range = startward_adjusted_auto_fit_track_range(style, axis, adjustment)?;
+    if !adjustment.has_startward_tracks() {
+        return None;
+    }
+    let range = auto_fit_track_range_with_startward_adjustment(style, axis, adjustment)?;
     if range.end > sizes.len() {
         return None;
     }
@@ -1971,13 +2406,15 @@ fn apply_startward_auto_fit_track_corrections(
     container_width: PhysicalContentWidth,
     container_height: f32,
     corrections: &GridTrackLayoutCorrections,
+    apply_column_correction: bool,
+    apply_row_correction: bool,
     items: &mut [GridItemLayout],
 ) {
     for item in items {
         let Some(area) = item.area else {
             continue;
         };
-        if let Some(correction) = &corrections.columns {
+        if apply_column_correction && let Some(correction) = &corrections.columns {
             apply_track_layout_correction_axis(
                 correction,
                 style.justify_content,
@@ -1988,7 +2425,7 @@ fn apply_startward_auto_fit_track_corrections(
                 GridAxis::Column,
             );
         }
-        if let Some(correction) = &corrections.rows {
+        if apply_row_correction && let Some(correction) = &corrections.rows {
             apply_track_layout_correction_axis(
                 correction,
                 style.align_content,
@@ -2109,14 +2546,21 @@ mod tests {
                 Some(area),
             )],
             baseline_resolutions: Vec::new(),
-            gap_gutters: GapDecorationGridGutters::default(),
-            // These offsets deliberately include unequal crossed gutters.
-            column_line_offsets: vec![3.0, 13.0, 29.0, 51.0],
-            row_line_offsets: vec![5.0, 19.0, 40.0, 68.0],
+            // These topologies deliberately include unequal crossed gutters.
+            columns: GridAxisTopology::from_line_offsets(
+                vec![3.0, 13.0, 29.0, 51.0],
+                vec![10.0, 12.0, 15.0],
+                vec![false; 3],
+            ),
+            rows: GridAxisTopology::from_line_offsets(
+                vec![5.0, 19.0, 40.0, 68.0],
+                vec![14.0, 16.0, 20.0],
+                vec![false; 3],
+            ),
+            content_width: 48.0,
+            content_height: 63.0,
             column_line_names: Vec::new(),
             row_line_names: Vec::new(),
-            column_track_sizes: vec![10.0, 12.0, 15.0],
-            row_track_sizes: vec![14.0, 16.0, 20.0],
         }
     }
 
@@ -2207,12 +2651,12 @@ mod tests {
         });
         let placement = grid_item_placement_overrides(&layout);
         let columns = GridFrozenTrackTopology {
-            columns: Some(layout.column_track_sizes.clone()),
+            columns: Some(GridFrozenTrackAxis::from_layout(&layout, GridAxis::Column)),
             rows: None,
         };
         let rows = GridFrozenTrackTopology {
             columns: None,
-            rows: Some(layout.row_track_sizes.clone()),
+            rows: Some(GridFrozenTrackAxis::from_layout(&layout, GridAxis::Row)),
         };
 
         let preserved_area = placement[0].expect("placed item retains its grid area");
@@ -2221,20 +2665,164 @@ mod tests {
         assert_eq!(preserved_area.column_start, 2);
         assert_eq!(preserved_area.column_end, 4);
         assert_eq!(
-            columns.columns.as_deref(),
-            Some(layout.column_track_sizes.as_slice())
+            columns
+                .columns
+                .as_ref()
+                .map(|axis| axis.topology.track_sizes()),
+            Some(layout.columns.track_sizes())
         );
         assert_eq!(
-            rows.rows.as_deref(),
-            Some(layout.row_track_sizes.as_slice())
+            rows.rows.as_ref().map(|axis| axis.topology.track_sizes()),
+            Some(layout.rows.track_sizes())
         );
         assert_eq!(
-            taffy_fixed_grid_tracks(columns.columns.as_deref().unwrap()).len(),
+            taffy_fixed_grid_tracks(columns.columns.as_ref().unwrap().topology.track_sizes()).len(),
             3
         );
         assert_eq!(
-            taffy_fixed_grid_tracks(rows.rows.as_deref().unwrap()).len(),
+            taffy_fixed_grid_tracks(rows.rows.as_ref().unwrap().topology.track_sizes()).len(),
             3
+        );
+    }
+
+    #[test]
+    fn frozen_auto_fit_rebases_space_around_using_only_active_tracks() {
+        let correction = FrozenGridAxisCorrection::new(
+            &GridFrozenTrackAxis {
+                topology: GridAxisTopology::new(
+                    vec![15.0, 15.0, 0.0, 0.0, 15.0, 0.0, 15.0, 0.0, 0.0, 0.0],
+                    vec![0.0; 9],
+                    vec![
+                        false, false, true, true, false, true, false, true, true, true,
+                    ],
+                ),
+                item_geometry: Vec::new(),
+            },
+            &[
+                0.0, 15.0, 30.0, 30.0, 30.0, 45.0, 45.0, 60.0, 60.0, 60.0, 60.0,
+            ],
+        )
+        .expect("collapsed auto-fit tracks need a frozen correction");
+        let mut items = [
+            GridItemLayout::new(
+                GridRect::new(GridPoint::new(4.5, 0.0), GridSize::new(15.0, 15.0)),
+                Some(GridItemArea {
+                    row_start: 1,
+                    row_end: 2,
+                    column_start: 1,
+                    column_end: 2,
+                }),
+            ),
+            GridItemLayout::new(
+                GridRect::new(GridPoint::new(28.5, 0.0), GridSize::new(15.0, 15.0)),
+                Some(GridItemArea {
+                    row_start: 1,
+                    row_end: 2,
+                    column_start: 2,
+                    column_end: 3,
+                }),
+            ),
+            GridItemLayout::new(
+                GridRect::new(GridPoint::new(70.5, 0.0), GridSize::new(15.0, 15.0)),
+                Some(GridItemArea {
+                    row_start: 1,
+                    row_end: 2,
+                    column_start: 5,
+                    column_end: 6,
+                }),
+            ),
+            GridItemLayout::new(
+                GridRect::new(GridPoint::new(103.5, 0.0), GridSize::new(15.0, 15.0)),
+                Some(GridItemArea {
+                    row_start: 1,
+                    row_end: 2,
+                    column_start: 7,
+                    column_end: 8,
+                }),
+            ),
+        ];
+
+        apply_frozen_grid_axis_correction(
+            Some(&correction),
+            css::ContentAlignment::new(css::ContentAlignmentKeyword::SpaceAround),
+            150.0,
+            GridAxis::Column,
+            &ComputedStyle::initial(),
+            None,
+            None,
+            &mut items,
+        );
+
+        assert_eq!(
+            items.iter().map(GridItemLayout::x).collect::<Vec<_>>(),
+            vec![11.25, 48.75, 86.25, 123.75]
+        );
+    }
+
+    #[test]
+    fn frozen_topology_keeps_occupied_zero_tracks_and_collapses_only_auto_fit_gutters() {
+        let collapsed_tracks = vec![false, true, false, false, true];
+        assert_eq!(
+            collapse_grid_track_gutters(&[7.0, 8.0, 9.0, 10.0], &collapsed_tracks),
+            vec![7.0, 0.0, 9.0, 0.0]
+        );
+
+        // The first zero-sized track is occupied (or outside the auto-fit
+        // repeat), so it continues to participate and retains its following
+        // gutter. Only the explicit collapse mask controls this topology.
+        let axis = GridFrozenTrackAxis {
+            topology: GridAxisTopology::new(
+                vec![0.0, 0.0, 15.0, 15.0, 0.0],
+                vec![7.0, 0.0, 9.0, 0.0],
+                vec![false, true, false, false, true],
+            ),
+            item_geometry: Vec::new(),
+        };
+        assert_eq!(
+            axis.topology.line_offsets(),
+            vec![0.0, 7.0, 7.0, 31.0, 46.0, 46.0]
+        );
+    }
+
+    #[test]
+    fn taffy_gutter_adapter_discards_boundary_gutters() {
+        assert_eq!(
+            taffy_grid_track_gutters(&[0.0, 7.5, 0.0, 7.5, 0.0], 4),
+            vec![7.5, 0.0, 7.5]
+        );
+        assert_eq!(taffy_grid_track_gutters(&[7.5, 0.0], 3), vec![7.5, 0.0]);
+    }
+
+    #[test]
+    fn frozen_topology_distributes_only_non_collapsed_tracks() {
+        let offsets = vec![0.0, 22.5, 22.5, 45.0, 60.0, 60.0, 60.0, 60.0];
+        let collapsed = vec![false, true, false, false, true, true, true];
+        let positions = |keyword| {
+            [0, 2, 3]
+                .into_iter()
+                .map(|line| {
+                    content_aligned_grid_line_offset_with_collapsed_tracks(
+                        css::ContentAlignment::new(keyword),
+                        150.0,
+                        &offsets,
+                        line,
+                        Some(&collapsed),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            positions(css::ContentAlignmentKeyword::SpaceBetween),
+            vec![0.0, 67.5, 135.0]
+        );
+        assert_eq!(
+            positions(css::ContentAlignmentKeyword::SpaceAround),
+            vec![15.0, 67.5, 120.0]
+        );
+        assert_eq!(
+            positions(css::ContentAlignmentKeyword::SpaceEvenly),
+            vec![22.5, 67.5, 112.5]
         );
     }
 

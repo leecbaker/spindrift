@@ -4,6 +4,23 @@ use std::rc::Rc;
 use super::*;
 use crate::layout::assets::FragmentainerOrdinal;
 
+/// One unfragmented item source canvas retained for later projection through
+/// committed container fragments.
+///
+/// The frozen used item box determines the formatting context used to produce
+/// this capture; `source_height` instead records the physical content extent
+/// occupied by its visible in-flow source.  Keeping both facts in one owned
+/// artifact prevents continuation replay from re-running layout against a
+/// page-local fragmentainer.
+/// <https://www.w3.org/TR/css-break-3/#box-splitting>
+#[derive(Debug)]
+pub(in crate::layout) struct ContinuousSourceReplay {
+    pub(in crate::layout) paint: PaintFragment,
+    pub(in crate::layout) effects: DeferredLayoutSideEffects,
+    pub(in crate::layout) source_height: PhysicalContentHeight,
+    pub(in crate::layout) scratch_top: f32,
+}
+
 /// A committed source-to-destination mapping for one container fragment.
 ///
 /// A source slice and its destination fragmentainer are inseparable once

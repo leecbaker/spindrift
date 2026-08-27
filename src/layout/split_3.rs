@@ -86,28 +86,6 @@ impl InlineLineGeometry {
         }
     }
 
-    /// Move this line's physical block-start anchor by a logical block-start
-    /// margin while retaining the logical-to-physical projection at one
-    /// boundary.
-    ///
-    /// Page-top coordinates increase upward, so horizontal-tb's physical top
-    /// direction is negative `y`; vertical writing modes project the same
-    /// logical adjustment through their physical block-start side:
-    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
-    pub(in crate::layout) fn apply_logical_block_start_margin(&mut self, margin: f32) {
-        if margin == 0.0 {
-            return;
-        }
-        match WritingModeAxes::new(self.writing_mode, self.direction)
-            .physical_side(LogicalSide::BlockStart)
-        {
-            PhysicalSide::Top => self.block_start -= margin,
-            PhysicalSide::Bottom => self.block_start += margin,
-            PhysicalSide::Left => self.block_start += margin,
-            PhysicalSide::Right => self.block_start -= margin,
-        }
-    }
-
     pub(in crate::layout) fn alignment_offset(
         self,
         content_inline_size: f32,
@@ -401,7 +379,24 @@ pub(in crate::layout) enum InlineAtomBaseline {
     FlexExported {
         baselines: crate::layout::baseline::PhysicalBaselineSets,
     },
-    SynthesizedBorderBoxBlockEnd,
+    /// An atom without a content-derived baseline defers synthesis until its
+    /// enclosing alignment context selects a baseline metric.
+    ///
+    /// CSS Inline synthesizes atomic-inline baselines from margin edges,
+    /// while Flexbox synthesizes a flex item's missing alignment baseline
+    /// from border edges:
+    /// <https://drafts.csswg.org/css-inline-3/#synthesize-baselines>
+    /// <https://drafts.csswg.org/css-flexbox-1/#align-items-property>.
+    Synthesized {
+        source: AtomicInlineBaselineSynthesisSource,
+    },
+}
+
+/// The box edges used when an atomic inline baseline must be synthesized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum AtomicInlineBaselineSynthesisSource {
+    MarginBox,
+    BorderBox,
 }
 
 /// The box from which an atomic inline exports its baseline.
@@ -438,6 +433,28 @@ impl InlineAtom {
         link_target: Option<String>,
         alt_text: Option<String>,
     ) -> Self {
+        let baseline = match &content {
+            InlineAtomContent::Canvas
+            | InlineAtomContent::Iframe(_)
+            | InlineAtomContent::Image(_)
+            | InlineAtomContent::Gradient { .. }
+            | InlineAtomContent::Svg { asset: Some(_) } => InlineAtomBaseline::Synthesized {
+                source: AtomicInlineBaselineSynthesisSource::MarginBox,
+            },
+            InlineAtomContent::Leader(_)
+            | InlineAtomContent::StaticPositionPlaceholder
+            | InlineAtomContent::InlineBox { .. }
+            | InlineAtomContent::TextCombineUpright { .. }
+            | InlineAtomContent::InlineFragment { .. }
+            | InlineAtomContent::Ruby { .. }
+            | InlineAtomContent::InlineEdge(_)
+            | InlineAtomContent::Svg { asset: None } => InlineAtomBaseline::Exported {
+                source: InlineAtomBaselineSource::BorderBox,
+                offset_from_source_box_block_start: atomic_inline_baseline_source_pt(
+                    baseline_offset,
+                ),
+            },
+        };
         Self {
             data: Rc::new(InlineAtomData {
                 content,
@@ -452,12 +469,7 @@ impl InlineAtom {
                 current_color_override: None,
             }),
             size,
-            baseline: InlineAtomBaseline::Exported {
-                source: InlineAtomBaselineSource::BorderBox,
-                offset_from_source_box_block_start: atomic_inline_baseline_source_pt(
-                    baseline_offset,
-                ),
-            },
+            baseline,
             baseline_shift,
             visual_offset: InlineVisualOffset::zero(),
             ruby_placement: None,
@@ -597,20 +609,43 @@ impl InlineAtom {
     ) -> AtomicInlineBaselineSourceOffset {
         match self.baseline {
             InlineAtomBaseline::Exported {
+                source: InlineAtomBaselineSource::BorderBox | InlineAtomBaselineSource::TableBox,
                 offset_from_source_box_block_start,
-                ..
             } => offset_from_source_box_block_start,
             InlineAtomBaseline::FlexExported { baselines } => baselines
-                .first_from_logical_block_start(
+                .first_from_logical_block_start_with_metric(
                     block_start_side(containing_style.writing_mode),
                     layout_pt(border_box_block_size),
                 )
+                .map(|(baseline, _)| baseline)
                 .map(LayoutLength::points)
                 .map(atomic_inline_baseline_source_pt)
                 .unwrap_or_else(|| atomic_inline_baseline_source_pt(border_box_block_size)),
-            InlineAtomBaseline::SynthesizedBorderBoxBlockEnd => {
+            InlineAtomBaseline::Synthesized { .. } => {
                 atomic_inline_baseline_source_pt(border_box_block_size)
             }
+        }
+    }
+
+    /// Return the source metric of this atom's content-derived baseline in
+    /// the containing inline axis. `None` means that CSS must synthesize a
+    /// baseline from the selected edge model in that alignment context.
+    pub(in crate::layout) fn content_derived_baseline_metric(
+        &self,
+        containing_style: &ComputedStyle,
+    ) -> Option<BaselineMetric> {
+        match self.baseline {
+            InlineAtomBaseline::Exported { .. } => Some(BaselineMetric::Alphabetic),
+            InlineAtomBaseline::FlexExported { baselines } => baselines
+                .first_from_logical_block_start_with_metric(
+                    block_start_side(containing_style.writing_mode),
+                    layout_pt(inline_atom_logical_border_block_size(
+                        self,
+                        containing_style,
+                    )),
+                )
+                .map(|(_, metric)| metric),
+            InlineAtomBaseline::Synthesized { .. } => None,
         }
     }
 
@@ -619,46 +654,56 @@ impl InlineAtom {
     ///
     /// Every atomic inline contributes a baseline measured from its logical
     /// margin-box start to line sizing, including an `inline-table` whose
-    /// exported source is its table box. The captured inline-table fragment
-    /// begins at that table box, so its paint coordinate intentionally omits
-    /// the wrapper's block-start margin.
+    /// exported source is its table box. Painting replays each atom from its
+    /// own alignment-source box, so the margin-box coordinate is converted
+    /// back to that border- or table-box coordinate instead of moving sibling
+    /// line participants.
+    /// <https://drafts.csswg.org/css-inline-3/#line-boxes>
     /// <https://www.w3.org/TR/CSS22/tables.html#table-display>
     pub(in crate::layout) fn resolve_baseline_coordinates(
         &self,
         border_box_block_size: f32,
+        margin_box_block_size: f32,
         block_start_margin: f32,
+        block_end_margin: f32,
         containing_style: &ComputedStyle,
     ) -> AtomicInlineBaselineCoordinates {
+        let synthesized_source = match self.baseline {
+            InlineAtomBaseline::Synthesized { source } => Some(source),
+            InlineAtomBaseline::FlexExported { .. }
+                if self
+                    .content_derived_baseline_metric(containing_style)
+                    .is_none() =>
+            {
+                // Flexbox deliberately withholds a baseline set for an empty
+                // container. It is an atomic inline here, so CSS Inline owns
+                // the deferred margin-box synthesis.
+                Some(AtomicInlineBaselineSynthesisSource::MarginBox)
+            }
+            InlineAtomBaseline::Exported { .. } | InlineAtomBaseline::FlexExported { .. } => None,
+        };
         let source = self.baseline_offset_from_alignment_source_block_start(
             border_box_block_size,
             containing_style,
         );
-        let margin_box = atomic_inline_margin_box_baseline_pt(block_start_margin + source.points());
-        let paint_placement = match self.baseline {
-            InlineAtomBaseline::Exported {
-                source: InlineAtomBaselineSource::TableBox,
-                ..
-            } => atomic_inline_paint_placement_baseline_pt(source.points()),
-            InlineAtomBaseline::Exported { .. }
-            | InlineAtomBaseline::FlexExported { .. }
-            | InlineAtomBaseline::SynthesizedBorderBoxBlockEnd => {
-                atomic_inline_paint_placement_baseline_pt(margin_box.points())
-            }
+        let (margin_box, paint_placement) = match synthesized_source {
+            Some(AtomicInlineBaselineSynthesisSource::MarginBox) => (
+                atomic_inline_margin_box_baseline_pt(margin_box_block_size),
+                // The synthesized baseline is at the margin-box line-under
+                // edge. Replaying the border box crosses that atom's own
+                // block-end margin; the block-start margin remains in the
+                // margin-box alignment coordinate above.
+                atomic_inline_paint_placement_baseline_pt(border_box_block_size + block_end_margin),
+            ),
+            Some(AtomicInlineBaselineSynthesisSource::BorderBox) | None => (
+                atomic_inline_margin_box_baseline_pt(block_start_margin + source.points()),
+                atomic_inline_paint_placement_baseline_pt(source.points()),
+            ),
         };
         AtomicInlineBaselineCoordinates {
             margin_box,
             paint_placement,
         }
-    }
-
-    pub(in crate::layout) fn exports_from_table_box(&self) -> bool {
-        matches!(
-            self.baseline,
-            InlineAtomBaseline::Exported {
-                source: InlineAtomBaselineSource::TableBox,
-                ..
-            }
-        )
     }
 
     /// Mark an exported baseline as originating from an inline-table's table
@@ -696,7 +741,25 @@ impl InlineAtom {
     }
 
     pub(in crate::layout) fn with_synthesized_border_box_block_end_baseline(mut self) -> Self {
-        self.baseline = InlineAtomBaseline::SynthesizedBorderBoxBlockEnd;
+        self.baseline = InlineAtomBaseline::Synthesized {
+            source: AtomicInlineBaselineSynthesisSource::BorderBox,
+        };
+        self
+    }
+
+    /// Mark an atomic inline that has no content-derived baseline to
+    /// synthesize its alphabetic baseline from its line-under margin edge.
+    ///
+    /// CSS Inline Layout Level 3 Appendix A.3 makes this the fallback for an
+    /// atomic inline whose contents cannot supply a baseline.  Keeping it
+    /// distinct from the legacy border-box synthesis is important: the former
+    /// changes only this atom's placement for authored block-axis margins,
+    /// whereas the latter remains for internal non-content inline artifacts.
+    /// <https://drafts.csswg.org/css-inline-3/#synthesize-baselines>
+    pub(in crate::layout) fn with_synthesized_margin_box_block_end_baseline(mut self) -> Self {
+        self.baseline = InlineAtomBaseline::Synthesized {
+            source: AtomicInlineBaselineSynthesisSource::MarginBox,
+        };
         self
     }
 
@@ -766,6 +829,7 @@ pub(in crate::layout) enum InlineFloatContents {
         element: Element,
         signature: ElementSignature,
         generated_content: bool,
+        generated_pseudo_source: Option<box_tree::CounterEventSource>,
     },
     /// The complete stream-selected `::first-letter` text.  This remains a
     /// text payload instead of impersonating a DOM element so punctuation and
@@ -850,6 +914,7 @@ impl InlineFloat {
         signature: ElementSignature,
         style: ComputedStyle,
         generated_content: bool,
+        generated_pseudo_source: Option<box_tree::CounterEventSource>,
         positioning_containing_block: Option<InlinePositioningContainingBlockSource>,
     ) -> Self {
         Self {
@@ -858,6 +923,7 @@ impl InlineFloat {
                     element,
                     signature,
                     generated_content,
+                    generated_pseudo_source,
                 },
                 style,
 
@@ -919,6 +985,23 @@ impl InlineFloat {
                 ..
             }
         )
+    }
+
+    /// Returns the counter-event source when this float is a tree-abiding
+    /// generated pseudo-element rather than an originating principal box.
+    ///
+    /// Generated boxes retain their own source position and counter scope
+    /// during float replay. <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+    pub(in crate::layout) fn generated_pseudo_source(
+        &self,
+    ) -> Option<box_tree::CounterEventSource> {
+        match &self.data.contents {
+            InlineFloatContents::Element {
+                generated_pseudo_source,
+                ..
+            } => *generated_pseudo_source,
+            InlineFloatContents::FirstLetterText { .. } => None,
+        }
     }
 
     pub(in crate::layout) fn first_letter_fragments(&self) -> Option<&[InlineFragment]> {
@@ -1351,6 +1434,7 @@ pub(in crate::layout) struct SpeculativeLayoutState {
     pub(in crate::layout) measured_footnotes: HashSet<ElementId>,
     pub(in crate::layout) committed_inline_floats: HashMap<InlineFloatId, CommittedInlineFloat>,
     pub(in crate::layout) rendered_footnotes: HashSet<ElementId>,
+    pub(in crate::layout) footnote_call_minimum_page_indices: HashMap<ElementId, usize>,
     pub(in crate::layout) footnote_measurement_depth: usize,
     pub(in crate::layout) fragmentation_suppression_depth: usize,
     pub(in crate::layout) multicol_spanner_fragmentation_depth: usize,

@@ -1,7 +1,9 @@
 use super::super::*;
 use crate::document::PaintStrokeWidth;
 use crate::document::paint::geometry::{PaintPoint, PaintSpace, PaintTransform};
-use crate::document::paint::paths::{RenderedPath, RenderedPathCommand, RenderedPathFillRule};
+use crate::document::paint::paths::{
+    RenderedPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathPaint,
+};
 use crate::document::paint::text::OpaqueTextGlyphCoverage;
 
 ///
@@ -15,6 +17,71 @@ pub(super) type GlyphOutlinePoint = euclid::Point2D<f32, GlyphOutlineSpace>;
 pub(super) type GlyphOutlineToPaint = euclid::ScaleOffset2D<f32, GlyphOutlineSpace, PaintSpace>;
 
 impl FontSystem {
+    /// Lower already-shaped document glyphs to vector paths without selecting
+    /// or shaping a second time.
+    ///
+    /// SVG uses this for paint servers and other text paints that native PDF
+    /// text cannot express. The caller owns any tagged-PDF `/ActualText`
+    /// wrapper because it knows the complete SVG text-content element.
+    pub(crate) fn glyph_outline_paths(
+        &self,
+        origin: PaintPoint,
+        runs: &[RenderedTextRun],
+        fill: RenderedPathPaint,
+    ) -> Vec<RenderedPath> {
+        let mut paths = Vec::new();
+        for run in runs {
+            let Some(font_id) = run.font_id else {
+                continue;
+            };
+            let Some(font) = self.document_fonts.get(font_id) else {
+                continue;
+            };
+            let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
+                continue;
+            };
+            let Some(glyphs) = run.glyphs.as_ref() else {
+                continue;
+            };
+            let units_per_em = font.units_per_em.max(1) as f32;
+            let scale = run.font_size / units_per_em;
+            let [a, b, c, d] = run.text_matrix.pdf_components();
+            let transform =
+                PaintTransform::new(a, b, c, d, origin.x + run.x_offset, origin.y + run.y_offset);
+            let mut cursor = 0.0;
+            for glyph in glyphs {
+                let Some(glyph_id) = glyph.painted_id().map(ttf_parser::GlyphId) else {
+                    cursor += glyph.x_advance;
+                    continue;
+                };
+                let mut builder = GlyphPathBuilder::new(GlyphOutlineToPaint::new(
+                    scale,
+                    scale,
+                    cursor + glyph.x_offset,
+                    glyph.y_offset,
+                ));
+                if face.outline_glyph(glyph_id, &mut builder).is_some()
+                    && !builder.commands.is_empty()
+                {
+                    paths.push(
+                        RenderedPath::new(
+                            builder.commands,
+                            None,
+                            RenderedPathFillRule::NonZero,
+                            None,
+                            PaintStrokeWidth::ZERO,
+                            None,
+                        )
+                        .with_paints(Some(fill.clone()), None)
+                        .with_transform(transform),
+                    );
+                }
+                cursor += glyph.x_advance;
+            }
+        }
+        paths
+    }
+
     /// Return one owned opaque-coverage path for each qualifying glyph.
     ///
     /// Callers must retain the returned run/glyph indices when partitioning

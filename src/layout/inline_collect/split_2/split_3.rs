@@ -55,7 +55,7 @@ impl<'a> LayoutBuilder<'a> {
         {
             return None;
         }
-        let replaced_sizing = ReplacedIntrinsicSizingContext {
+        let replaced_sizing = ReplacedBoxSizingContext {
             available_width: content_box_pt(available_width),
             inline_percentage_basis,
             block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
@@ -102,10 +102,15 @@ impl<'a> LayoutBuilder<'a> {
                 .with_visual_offset(visual_offset),
             );
         }
-        let (width, height, baseline_offset) = match replaced_element_kind(element) {
-            Some(ReplacedElementKind::Canvas) => {
-                let canvas =
-                    used_canvas_with_intrinsic_sizing_context(element, style, replaced_sizing);
+        let (width, height, baseline_offset) = match resolve_replaced_element(
+            element,
+            style,
+            replaced_sizing,
+            self.base_url,
+            self.root_url,
+            self.resource_cache,
+        ) {
+            Some(ResolvedReplacedElement::Canvas(canvas)) => {
                 let border_box_width = canvas.border_box_size.width;
                 let border_box_height = canvas.border_box_size.height;
                 (
@@ -118,15 +123,7 @@ impl<'a> LayoutBuilder<'a> {
                     border_box_height,
                 )
             }
-            Some(ReplacedElementKind::Image) => used_image_with_intrinsic_sizing_context(
-                element,
-                style,
-                replaced_sizing,
-                self.base_url,
-                self.root_url,
-                self.resource_cache,
-            )
-            .map(|image| {
+            Some(ResolvedReplacedElement::Image(image)) => {
                 let border_box_width = image.border_box_size.width;
                 let border_box_height = image.border_box_size.height;
                 (
@@ -138,9 +135,8 @@ impl<'a> LayoutBuilder<'a> {
                         + intrinsic_metrics.margin.bottom.points(),
                     border_box_height,
                 )
-            })?,
-            Some(ReplacedElementKind::Svg) => {
-                let svg = used_svg_with_intrinsic_sizing_context(element, style, replaced_sizing)?;
+            }
+            Some(ResolvedReplacedElement::Svg(svg)) => {
                 let width = svg.border_box_size.width;
                 let height = svg.border_box_size.height;
                 (
@@ -610,14 +606,20 @@ impl<'a> LayoutBuilder<'a> {
         };
         let counter_snapshot = (counter_mode == GeneratedPseudoCounterMode::Rollback)
             .then(|| self.counter_set.clone());
-        let source = if originating_style
+        let (source, footnote_call) = if originating_style
             .before_style
             .as_deref()
             .is_some_and(|before| std::ptr::eq(before, pseudo_style))
         {
-            box_tree::CounterEventSource::Before
+            (box_tree::CounterEventSource::Before, None)
+        } else if originating_style
+            .footnote_call_style
+            .as_deref()
+            .is_some_and(|call| std::ptr::eq(call, pseudo_style))
+        {
+            (box_tree::CounterEventSource::FootnoteCall, Some(element.id))
         } else {
-            box_tree::CounterEventSource::After
+            (box_tree::CounterEventSource::After, None)
         };
         let counter_scope = self.begin_pseudo_counter_scope(element, source, pseudo_style);
         let alt_text = self.generated_alt_text(element, pseudo_style);
@@ -652,6 +654,13 @@ impl<'a> LayoutBuilder<'a> {
                 alt_text.clone(),
                 output,
             );
+        }
+        if let Some(element) = footnote_call {
+            for item in &mut output[start_len..] {
+                if let InlineItem::Word(word) = item {
+                    word.source = InlineTextSource::FootnoteCall(element);
+                }
+            }
         }
         annotate_line_break_element_breaks(element, originating_style, output, scope_start_len);
         let emitted_content = output.len() > scope_start_len;
@@ -1080,7 +1089,24 @@ impl<'a> LayoutBuilder<'a> {
                     .last()
                     .cloned()
                     .unwrap_or_else(PercentageBasis::indefinite);
-                let canvas = used_canvas(element, &style, available_width, containing_block_height);
+                let canvas = resolve_replaced_element(
+                    element,
+                    &style,
+                    ReplacedBoxSizingContext {
+                        available_width: content_box_pt(available_width),
+                        inline_percentage_basis: PercentageBasis::definite_from(
+                            content_box_pt(available_width),
+                            IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
+                        ),
+                        block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
+                            containing_block_height,
+                        ),
+                    },
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                )?
+                .geometry();
                 let content = if element.tag.eq_ignore_ascii_case("iframe") {
                     self.resource_cache.record_iframe_viewport(
                         element.id,
@@ -1142,18 +1168,27 @@ impl<'a> LayoutBuilder<'a> {
                     self.current_content_logical_inline_percentage_basis(),
                 );
                 let style = &used_style;
-                let image = used_image(
+                let image = resolve_replaced_element(
                     element,
                     style,
-                    available_width,
-                    self.definite_block_size_stack
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(PercentageBasis::indefinite),
+                    ReplacedBoxSizingContext {
+                        available_width: content_box_pt(available_width),
+                        inline_percentage_basis: PercentageBasis::definite_from(
+                            content_box_pt(available_width),
+                            IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
+                        ),
+                        block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
+                            self.definite_block_size_stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(PercentageBasis::indefinite),
+                        ),
+                    },
                     self.base_url,
                     self.root_url,
                     self.resource_cache,
-                )?;
+                )?
+                .into_image()?;
                 let border_box_width = image.border_box_size.width;
                 let border_box_height = image.border_box_size.height;
                 let content = image
@@ -1185,15 +1220,27 @@ impl<'a> LayoutBuilder<'a> {
                     &mut style,
                     self.current_content_logical_inline_percentage_basis(),
                 );
-                let svg = used_svg(
+                let svg = resolve_replaced_element(
                     element,
                     &style,
-                    available_width,
-                    self.definite_block_size_stack
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(PercentageBasis::indefinite),
-                )?;
+                    ReplacedBoxSizingContext {
+                        available_width: content_box_pt(available_width),
+                        inline_percentage_basis: PercentageBasis::definite_from(
+                            content_box_pt(available_width),
+                            IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
+                        ),
+                        block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
+                            self.definite_block_size_stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(PercentageBasis::indefinite),
+                        ),
+                    },
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                )?
+                .geometry();
                 let width = svg.border_box_size.width;
                 let height = svg.border_box_size.height;
                 Some(
@@ -1494,14 +1541,13 @@ impl<'a> LayoutBuilder<'a> {
                     link_target,
                     None,
                 );
-                // An empty inline-block has no last in-flow line box from
-                // which to export a baseline.  Defer its synthesized
-                // border-box-end baseline to the containing inline context,
-                // whose logical block axis can differ from this box's
-                // physical height in vertical writing modes.
-                // <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>
+                // An empty inline-block has no content-derived baseline.
+                // Its synthesized alphabetic baseline is therefore the
+                // line-under margin edge, projected by the containing inline
+                // context's logical block axis.
+                // <https://drafts.csswg.org/css-inline-3/#synthesize-baselines>
                 if line_baseline_offset.is_none() {
-                    atom = atom.with_synthesized_border_box_block_end_baseline();
+                    atom = atom.with_synthesized_margin_box_block_end_baseline();
                 }
                 Some(
                     atom.with_outside_marker(outside_marker)

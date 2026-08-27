@@ -1,6 +1,6 @@
 # CSS Tables Parity
 
-Last updated: 2026-08-13
+Last updated: 2026-08-25
 
 CSS 2.2 table layout, CSS Tables Level 3, CSS Sizing Level 3, CSS
 Fragmentation Level 3, and HTML table semantics are the conformance targets.
@@ -117,6 +117,12 @@ but spec conformance takes priority when behavior differs.
 - Table-cell row sizing now measures nested table fragments through the table
   measurement path, so nested table captions, spacing, row heights, and wrapper
   box sizing contribute to the containing row.
+- A nested percentage-width table contributes its intrinsic margin-box width
+  with an explicit indefinite percentage basis while its containing cell's
+  tracks are measured. Cyclic `width` and `max-width` values therefore remain
+  `auto` for that pass, percentage wrapper edges use their intrinsic zero
+  basis, and the final cell-content pass resolves the table against the
+  committed cell width.
 - Floated inline children inside table cells, including children wrapped by
   anonymous table-cell construction, contribute to auto row height and paint
   through the normal float placement path.

@@ -325,6 +325,8 @@ impl<'a> LayoutBuilder<'a> {
         block_style: &ComputedStyle,
         available_width: f32,
     ) -> inline_layout::InlineIntrinsicMeasurement {
+        #[cfg(feature = "layout-profile")]
+        let _profile_scope = crate::layout::layout_profile::inline_intrinsic_measurement_scope();
         let text_box_line_trim = self.effective_text_box_line_trim_for_style(block_style);
         self.with_text_box_line_trim_scope(text_box_line_trim, |layout| {
             layout.intrinsic_inline_measurement_for_items_in_trim_scope(

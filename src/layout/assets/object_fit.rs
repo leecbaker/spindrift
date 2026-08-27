@@ -5,6 +5,7 @@ use crate::layout::asset_helpers::{
     resolved_object_view_box, resolved_object_view_box_for_svg,
 };
 use crate::svg::{SharedSvgAsset, SvgSourcePoint, SvgSourceRect, SvgSourceSize};
+use crate::text::FontSystem;
 use crate::units::LayoutSize;
 
 /// Whether CSS Overflow clips a replaced object's concrete content paint to
@@ -19,6 +20,16 @@ use crate::units::LayoutSize;
 pub(in crate::layout) enum ReplacedObjectOverflow {
     ClipToContentBox,
     Visible,
+}
+
+/// SVG-specific paint context that does not belong to CSS object-fit
+/// geometry. The document font system is present only for inline SVG roots;
+/// external SVG image painting remains font-independent until its resource
+/// loading path can share the document font registry as well.
+struct SvgReplacedPaintPolicy<'a> {
+    overflow: ReplacedObjectOverflow,
+    clip_viewport: bool,
+    font_system: Option<&'a mut FontSystem>,
 }
 
 impl ReplacedObjectOverflow {
@@ -318,6 +329,7 @@ fn concrete_object_geometry(
 /// SVG source coordinates start at the top, while paint rectangles start at
 /// the bottom. The source Y conversion therefore inverts the visible
 /// intersection within the concrete object.
+#[cfg(test)]
 pub(in crate::layout) fn svg_replaced_group(
     asset: &SharedSvgAsset,
     destination: PaintRect,
@@ -336,12 +348,41 @@ pub(in crate::layout) fn svg_replaced_group(
     )
 }
 
+/// Font-aware replaced-SVG painting for document content such as `<img>`.
+///
+/// This shares exactly the same object-fit/source-crop geometry as the
+/// vector-only path, but lets retained SVG text register fonts in the
+/// document that owns the PDF output.
+pub(in crate::layout) fn svg_replaced_group_with_font_system(
+    asset: &SharedSvgAsset,
+    destination: PaintRect,
+    object_fit: ObjectFit,
+    object_position: css::BackgroundPosition,
+    object_view_box: css::ObjectViewBox,
+    overflow: ReplacedObjectOverflow,
+    font_system: &mut FontSystem,
+) -> crate::svg::SvgPaintGroup {
+    svg_replaced_group_with_geometry_policy(
+        asset,
+        destination,
+        object_fit,
+        object_position,
+        object_view_box,
+        SvgReplacedPaintPolicy {
+            overflow,
+            clip_viewport: overflow.clips_to_content_box(),
+            font_system: Some(font_system),
+        },
+    )
+}
+
 /// Paint an external SVG replaced object while preserving the CSS overflow
 /// policy of its containing replaced element.
 ///
 /// `overflow: visible` lets the selected source extend beyond the CSS content
 /// box, while an effective `object-view-box` remains a source crop.
 /// <https://www.w3.org/TR/SVG2/render.html#OverflowAndClipProperties>
+#[cfg(test)]
 fn svg_replaced_group_with_overflow(
     asset: &SharedSvgAsset,
     destination: PaintRect,
@@ -356,25 +397,27 @@ fn svg_replaced_group_with_overflow(
         object_fit,
         object_position,
         object_view_box,
-        overflow,
-        overflow.clips_to_content_box(),
+        SvgReplacedPaintPolicy {
+            overflow,
+            clip_viewport: overflow.clips_to_content_box(),
+            font_system: None,
+        },
     )
 }
 
-/// Paint an embedded SVG root with its established SVG viewport policy.
+/// Paint an embedded SVG root using the owner document's font system.
 ///
-/// This path intentionally keeps the pre-existing source-selection behavior:
-/// even when the SVG root's viewport is visible, object-fit continues to map
-/// the content-box intersection. External SVG image overflow is handled by
-/// [`svg_replaced_group`] instead.
-/// <https://www.w3.org/TR/SVG2/render.html#OverflowAndClipProperties>
-pub(in crate::layout) fn svg_replaced_group_with_overflow_clip(
+/// The regular replaced-image path deliberately remains font-independent for
+/// now; inline SVG calls this variant so its text is emitted as native PDF
+/// text from the same document font registry as HTML.
+pub(in crate::layout) fn svg_replaced_group_with_overflow_clip_and_font_system(
     asset: &SharedSvgAsset,
     destination: PaintRect,
     object_fit: ObjectFit,
     object_position: css::BackgroundPosition,
     object_view_box: css::ObjectViewBox,
     overflow_edge: Option<&ResolvedOverflowClipEdge>,
+    font_system: &mut FontSystem,
 ) -> crate::svg::SvgPaintGroup {
     let group = svg_replaced_group_with_geometry_policy(
         asset,
@@ -382,8 +425,11 @@ pub(in crate::layout) fn svg_replaced_group_with_overflow_clip(
         object_fit,
         object_position,
         object_view_box,
-        ReplacedObjectOverflow::Visible,
-        false,
+        SvgReplacedPaintPolicy {
+            overflow: ReplacedObjectOverflow::Visible,
+            clip_viewport: false,
+            font_system: Some(font_system),
+        },
     );
     overflow_edge
         .and_then(|edge| edge.clip.path_clip())
@@ -396,8 +442,7 @@ fn svg_replaced_group_with_geometry_policy(
     object_fit: ObjectFit,
     object_position: css::BackgroundPosition,
     object_view_box: css::ObjectViewBox,
-    overflow: ReplacedObjectOverflow,
-    clip_viewport: bool,
+    policy: SvgReplacedPaintPolicy<'_>,
 ) -> crate::svg::SvgPaintGroup {
     let natural_size = asset.replaced_intrinsic_size();
     let view_box = resolved_object_view_box_for_svg(object_view_box, asset);
@@ -422,16 +467,27 @@ fn svg_replaced_group_with_geometry_policy(
         geometry.concrete.size.height / source_view_box.size.height,
     ));
     let source_size = viewport_asset.source_viewport_size();
-    let Some(mapping) =
-        SvgConcreteObjectMapping::from_geometry(geometry, overflow, source_view_box, source_size)
-    else {
+    let Some(mapping) = SvgConcreteObjectMapping::from_geometry(
+        geometry,
+        policy.overflow,
+        source_view_box,
+        source_size,
+    ) else {
         return crate::svg::SvgPaintGroup::empty();
     };
-    let mut group = viewport_asset.paint_group_for_source_rect_with_viewport_clip(
-        mapping.destination,
-        mapping.source,
-        clip_viewport,
-    );
+    let mut group = match policy.font_system {
+        Some(font_system) => viewport_asset.paint_group_for_source_rect_with_font_system(
+            mapping.destination,
+            mapping.source,
+            policy.clip_viewport,
+            font_system,
+        ),
+        None => viewport_asset.paint_group_for_source_rect_with_viewport_clip(
+            mapping.destination,
+            mapping.source,
+            policy.clip_viewport,
+        ),
+    };
     if let Some(background) = asset.viewport_background() {
         group.items.insert(
             0,
@@ -453,7 +509,7 @@ fn svg_replaced_group_with_geometry_policy(
     // <https://drafts.csswg.org/css-images-4/#object-view-box>
     if view_box.applies() {
         group.with_clip(
-            object_view_box_clip(&view_box, natural_size, geometry, overflow)
+            object_view_box_clip(&view_box, natural_size, geometry, policy.overflow)
                 .expect("an effective object-view-box has a destination clip"),
         )
     } else {
@@ -557,7 +613,9 @@ mod tests {
             crate::svg::SvgPaintItem::Group(group) | crate::svg::SvgPaintItem::NestedSvg(group) => {
                 first_svg_path(group)
             }
-            crate::svg::SvgPaintItem::RasterImage(_) => None,
+            crate::svg::SvgPaintItem::RasterImage(_)
+            | crate::svg::SvgPaintItem::Text(_)
+            | crate::svg::SvgPaintItem::OutlinedText(_) => None,
         })
     }
 
@@ -1207,7 +1265,9 @@ mod tests {
                     .and(path.fill),
                 crate::svg::SvgPaintItem::Group(_)
                 | crate::svg::SvgPaintItem::NestedSvg(_)
-                | crate::svg::SvgPaintItem::RasterImage(_) => None,
+                | crate::svg::SvgPaintItem::RasterImage(_)
+                | crate::svg::SvgPaintItem::Text(_)
+                | crate::svg::SvgPaintItem::OutlinedText(_) => None,
             })
             .collect::<Vec<_>>();
 

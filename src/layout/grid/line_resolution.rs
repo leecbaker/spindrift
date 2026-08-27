@@ -356,6 +356,35 @@ pub(super) fn content_aligned_grid_line_offset(
     line_offsets: &[f32],
     line_index: usize,
 ) -> Option<f32> {
+    content_aligned_grid_line_offset_with_collapsed_tracks(
+        content_alignment,
+        container_size,
+        line_offsets,
+        line_index,
+        None,
+    )
+}
+
+/// Return a content-aligned grid-line offset with explicit collapsed-track
+/// provenance.
+///
+/// A feedback pass can freeze an empty `auto-fit` track as a numeric zero.
+/// Numeric size alone is not enough to decide whether that track participates
+/// in distributed content alignment: an occupied zero-sized track still does,
+/// while an empty auto-fit track does not.
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>
+pub(super) fn content_aligned_grid_line_offset_with_collapsed_tracks(
+    content_alignment: css::ContentAlignment,
+    container_size: f32,
+    line_offsets: &[f32],
+    line_index: usize,
+    collapsed_tracks: Option<&[bool]>,
+) -> Option<f32> {
+    if let Some(collapsed_tracks) = collapsed_tracks
+        && collapsed_tracks.len().saturating_add(1) != line_offsets.len()
+    {
+        return None;
+    }
     let offset = line_offsets.get(line_index).cloned()?;
     let used_size = line_offsets.last().cloned()?;
     let free_space = container_size - used_size;
@@ -379,18 +408,21 @@ pub(super) fn content_aligned_grid_line_offset(
             line_index,
             free_space,
             DistributedContentAlignment::Between,
+            collapsed_tracks,
         )?,
         css::ContentAlignmentKeyword::SpaceAround => distributed_content_alignment_shift(
             line_offsets,
             line_index,
             free_space,
             DistributedContentAlignment::Around,
+            collapsed_tracks,
         )?,
         css::ContentAlignmentKeyword::SpaceEvenly => distributed_content_alignment_shift(
             line_offsets,
             line_index,
             free_space,
             DistributedContentAlignment::Evenly,
+            collapsed_tracks,
         )?,
     };
     Some(offset + alignment_shift)
@@ -407,10 +439,14 @@ fn distributed_content_alignment_shift(
     line_index: usize,
     free_space: f32,
     alignment: DistributedContentAlignment,
+    collapsed_tracks: Option<&[bool]>,
 ) -> Option<f32> {
     let non_collapsed_track_count = line_offsets
         .windows(2)
-        .filter(|window| window[1] > window[0])
+        .enumerate()
+        .filter(|(index, window)| {
+            collapsed_tracks.map_or(window[1] > window[0], |collapsed| !collapsed[*index])
+        })
         .count();
     if non_collapsed_track_count == 0 {
         return Some(0.0);
@@ -426,8 +462,11 @@ fn distributed_content_alignment_shift(
     let interval = free_space / interval_divisor;
     let preceding_non_collapsed_tracks = line_offsets
         .windows(2)
+        .enumerate()
         .take(line_index)
-        .filter(|window| window[1] > window[0])
+        .filter(|(index, window)| {
+            collapsed_tracks.map_or(window[1] > window[0], |collapsed| !collapsed[*index])
+        })
         .count();
     let between_intervals =
         preceding_non_collapsed_tracks.min(non_collapsed_track_count.saturating_sub(1));

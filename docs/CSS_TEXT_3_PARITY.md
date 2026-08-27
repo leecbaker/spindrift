@@ -80,6 +80,12 @@ except where existing code already implements draft properties.
   joiners where possible. Alignment and justification use final visual
   advances, so source-preserved default-ignorable join controls do not shift an
   RTL line's inline origin.
+- Boundary-shaping WPT coverage is restored for Arabic (`shaping-001` through
+  `008`, `014`, `016` through `018`), N'Ko (`020` through `022`), and vertical
+  Mongolian (`024`). Quire shapes each eligible inline group from one authored
+  stream; U+200C/U+200D remain authored extraction text, while any required
+  font-transition context is virtual, zero-metric input. Quire never
+  synthesizes U+0640 ARABIC TATWEEL for boundary shaping.
 - Horizontal mixed inline bidi reordering now operates on measured inline
   items, preserving neutral text fragments such as collapsed spaces and keeping
   regular inline box edge atoms attached to the adjacent visual content that
@@ -99,6 +105,10 @@ except where existing code already implements draft properties.
   filtering as ordinary shaping. CGJ therefore remains available to line-break
   processing and source extraction without causing a visible Ahem or fallback
   glyph in the same cluster to select a different font.
+- When the retained source requires a PDF `/ActualText` span, a fully covered
+  full-em glyph run still emits its original text codes invisibly and paints
+  the opaque vector coverage paths. Partially covered spans remain ordinary,
+  unsplit text so their replacement-text ownership stays exact.
 - Compatibility-only glyph selection preserves the authored source stream and
   its byte ranges: U+2011 can select a face's U+2010 hyphen glyph without
   changing its CSS Text line-break class or PDF ToUnicode value. PDF emission

@@ -1,10 +1,13 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+#[cfg(feature = "layout-profile")]
+use std::time::Instant;
 
 use super::super::mixed::apply_visual_tracking_boundaries;
 use super::*;
-use crate::css::{BoxDecorationBreak, DiscretionaryHyphenationPolicy, Hyphens};
+use crate::css::{BoxDecorationBreak, DiscretionaryHyphenationPolicy, Hyphens, TextSpacingTrim};
 use crate::layout::inline_collect::{
     InlineBoxEdge, autospace_boundary_character_at_end, autospace_boundary_character_at_start,
     inline_box_edge_components, inline_box_edge_physical_side, inline_box_edge_width,
@@ -15,8 +18,7 @@ use crate::text::{
     TextBreakPolicy, automatic_hyphenation_opportunities, character_is_css_other_space_separator,
     character_is_default_ignorable_code_point, character_is_first_letter_associated_space,
     character_is_first_letter_suffix_punctuation, character_is_unicode_first_letter_base,
-    character_is_unicode_mark, character_is_unicode_punctuation,
-    collect_measured_break_opportunities, hyphenator_for_language,
+    character_is_unicode_mark, character_is_unicode_punctuation, hyphenator_for_language,
     manual_hyphenation_opportunities,
 };
 
@@ -709,6 +711,20 @@ pub(in crate::layout) struct InlineGraphRange {
     pub(in crate::layout) end: InlineGraphPosition,
 }
 
+/// An unbreakable source continuation that contains an inline right-float
+/// marker.
+///
+/// The source range starts after the preceding candidate soft wrap and ends
+/// at the continuation's next soft wrap. The marker remains zero-width
+/// source-order state; it is not a CSS Text line break.
+/// <https://www.w3.org/TR/css-text-3/#white-space-property>
+/// <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct UnbreakableInlineFloatContinuation {
+    pub(in crate::layout) source_range: InlineGraphRange,
+    pub(in crate::layout) marker: InlineGraphPosition,
+}
+
 /// The kind of CSS Text break represented at one graph boundary.
 ///
 /// CSS Text assigns different effects to soft wraps, preserved spaces,
@@ -902,6 +918,53 @@ pub(in crate::layout) struct InlineOpportunityGraph {
     /// candidate. This is graph metadata rather than an inherited text style:
     /// <https://www.w3.org/TR/css-text-4/#wrap-inside-property>.
     wrap_inside_avoid_depths: BTreeMap<InlineGraphPosition, u16>,
+    /// Immutable, provenance-safe source advances for all graph boundaries.
+    /// `None` caches the fact that this graph needs conventional shaped-line
+    /// materialization instead.
+    monotonic_source_measurement: RefCell<Option<Option<Rc<InlineLineMeasureIndex>>>>,
+}
+
+/// One graph-wide source-advance table shared by every greedy line cursor.
+///
+/// Its values are measured from the paragraph start, so a later line only
+/// subtracts its selected start. Constructing a separate prefix table for
+/// every selected line would rescan the remaining `break-all` boundaries and
+/// reintroduce quadratic fitting work.
+#[derive(Debug, Clone)]
+struct InlineLineMeasureIndex {
+    run_starts: Vec<f32>,
+    opportunity_advances: Vec<f32>,
+}
+
+/// A borrowed suffix of one graph-wide source-advance table.
+pub(in crate::layout) struct LineMeasureCursor<'a> {
+    opportunities: &'a [InlineBreakOpportunity],
+    index: Rc<InlineLineMeasureIndex>,
+    first_opportunity: usize,
+    start_advance: f32,
+}
+
+impl LineMeasureCursor<'_> {
+    /// Return the last legal boundary whose provenance-safe source advance
+    /// fits the available inline size, with the normal glyph-rounding
+    /// tolerance used by shaped-line fitting.
+    pub(in crate::layout) fn last_fitting(
+        &self,
+        available_width: f32,
+    ) -> Option<InlineBreakOpportunity> {
+        let first_too_wide = self.index.opportunity_advances[self.first_opportunity..]
+            .partition_point(|advance| *advance - self.start_advance <= available_width + 0.5);
+        self.opportunities
+            .get(first_too_wide.saturating_sub(1))
+            .copied()
+    }
+
+    /// Return the earliest legal source boundary for the required-progress
+    /// fallback when a zero-width or narrower-than-one-unit line has no
+    /// fitting candidate.
+    pub(in crate::layout) fn first(&self) -> Option<InlineBreakOpportunity> {
+        self.opportunities.first().copied()
+    }
 }
 
 /// UAX #9 controls that must be virtually restored around a selected
@@ -1564,6 +1627,8 @@ impl<'a> LayoutBuilder<'a> {
         I: IntoIterator,
         I::Item: AsRef<InlineItem>,
     {
+        #[cfg(feature = "layout-profile")]
+        let _profile_scope = crate::layout::layout_profile::inline_opportunity_graph_build_scope();
         build_inline_opportunity_graph(&mut self.font_system, items, block_style)
     }
 
@@ -1659,7 +1724,11 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
         // <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>.
         shape_logical_joining_graph_runs(&mut runs, &mut self.font_system, block_style);
-        let opportunities = inline_break_opportunities_for_runs(&runs, block_style);
+        let opportunities = inline_break_opportunities_for_runs_with_font_system(
+            &runs,
+            block_style,
+            Some(&mut self.font_system),
+        );
         InlineOpportunityGraph::new(runs, opportunities)
     }
 }
@@ -2057,9 +2126,9 @@ fn measured_fragment_run(
     tracking_scope: Rc<InlineTrackingScope>,
     font_system: &mut FontSystem,
 ) -> InlineParagraphRun {
-    let shaped = font_system.shape_untracked_inline_line(
+    let shaped = font_system.shape_untracked_inline_line_with_style_identity(
         fragment.text(),
-        fragment.style(),
+        &fragment.data.style,
         fragment.style().line_height,
     );
     let width = shaped
@@ -2336,9 +2405,9 @@ fn push_text_spacing_fragment(
                 .sort_by_key(|setting| setting.tag);
         }
     }
-    let shaped = font_system.shape_untracked_inline_line(
+    let shaped = font_system.shape_untracked_inline_line_with_style_identity(
         fragment.text(),
-        fragment.style(),
+        &fragment.data.style,
         fragment.style().line_height,
     );
     let width = shaped
@@ -2437,7 +2506,8 @@ where
     let manual_discretionary_effects =
         manual_hyphenation_effects_across_transparent_inline_edges(&runs);
     shape_logical_joining_graph_runs(&mut runs, font_system, block_style);
-    let mut opportunities = inline_break_opportunities_for_runs(&runs, block_style);
+    let mut opportunities =
+        inline_break_opportunities_for_runs_with_font_system(&runs, block_style, Some(font_system));
     merge_automatic_discretionary_breaks(&mut opportunities, automatic_discretionary_breaks);
     merge_manual_discretionary_effects(&mut opportunities, manual_discretionary_effects);
     InlineOpportunityGraph::new(runs, opportunities)
@@ -2587,9 +2657,9 @@ fn coalesce_trailing_tracking_controls(
         text.push_str(previous.text());
         text.push_str(&control_text);
         previous.set_text(text);
-        let shaped = font_system.shape_untracked_inline_line(
+        let shaped = font_system.shape_untracked_inline_line_with_style_identity(
             previous.text(),
-            previous.style(),
+            &previous.data.style,
             previous.style().line_height,
         );
         let width = shaped
@@ -2957,7 +3027,7 @@ fn shape_logical_joining_graph_runs(
                 &runs[fragment_indices[0]].item,
                 InlineLineItem::Fragment(fragment) if {
                     let mut opportunities = Vec::new();
-                    collect_measured_break_opportunities(
+                    font_system.collect_cached_measured_break_opportunities(
                         fragment.text(),
                         TextBreakPolicy::from(fragment.style()),
                         &mut opportunities,
@@ -2970,7 +3040,31 @@ fn shape_logical_joining_graph_runs(
         if fragment_indices.len() < 2 && !needs_source_shape {
             continue;
         }
+        if fragment_indices.len() == 1 {
+            let fragment_index = fragment_indices[0];
+            let Some(source) = runs[fragment_index].shaped.clone() else {
+                continue;
+            };
+            let text_len = match &runs[fragment_index].item {
+                InlineLineItem::Fragment(fragment) => fragment.text().len(),
+                InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
+                    unreachable!("graph fragment indices name fragments")
+                }
+            };
+            let Some(selection) = SourceShapedSelection::from_source(source, 0..text_len) else {
+                continue;
+            };
+            let selected = selection.selected_rc();
+            let InlineLineItem::Fragment(fragment) = &mut runs[fragment_index].item else {
+                unreachable!("graph fragment indices name fragments")
+            };
+            runs[fragment_index].width = selected.advance_width();
+            runs[fragment_index].shaped = Some(selected);
+            fragment.set_source_shaped_selection(Some(selection));
+            continue;
+        }
         let mut spans = Vec::with_capacity(fragment_indices.len());
+        let mut span_styles = Vec::with_capacity(fragment_indices.len());
         let mut text = String::new();
         let mut ranges = Vec::with_capacity(fragment_indices.len());
         let mut line_height = None;
@@ -2984,48 +3078,40 @@ fn shape_logical_joining_graph_runs(
             ranges.push(start..text.len());
             spans.push(StyledTextSpan {
                 text: fragment.text(),
-                // Keep even a paint-only span boundary in the shaping input.
-                // The styled shaper records its paint state independently,
-                // and needs the boundary to synthesize cursive context for
-                // scripts such as Mongolian that cannot recover it from a
-                // flattened source string.
+                // Keep every eligible CSS span in one canonical shaping
+                // stream. The styled shaper retains paint/style ranges
+                // independently and adds virtual U+200D only for a genuine
+                // glyph-affecting font transition.
                 // <https://drafts.csswg.org/css-text-3/#boundary-shaping>
                 style: fragment.style(),
             });
+            span_styles.push(Rc::clone(&fragment.data.style));
         }
-        let Some(shaped) = font_system.shape_untracked_styled_inline_fragments(
-            &spans,
-            text,
-            0.0,
-            line_height.expect("graph shaping group has a fragment"),
-            0.0,
-            tab_metric_style,
-        ) else {
+        let Some(shaped) = font_system
+            .shape_untracked_styled_inline_fragments_with_style_identities(
+                &spans,
+                text,
+                line_height.expect("graph shaping group has a fragment"),
+                tab_metric_style,
+                &span_styles,
+            )
+        else {
             continue;
         };
         let shaped = Rc::new(shaped);
-        // `word-space-transform` keeps its replacement as a distinct graph
-        // fragment so it can own the original separator's break and text
-        // extraction behavior. It nevertheless has no CSS shaping boundary
-        // of its own. Retain the complete source shape so visual ordering and
-        // paint can directly emit the same glyph geometry as one literal replacement
-        // character between the adjacent text fragments.
-        // <https://drafts.csswg.org/css-text-4/#word-space-transform>
-        let boundary_source = fragment_indices
-            .iter()
-            .any(|&fragment_index| {
-                matches!(
-                    &runs[fragment_index].item,
-                    InlineLineItem::Fragment(fragment)
-                        if matches!(fragment.source(), InlineTextSource::WordSpaceTransform(_))
-                )
-            })
-            .then(|| {
-                Rc::new(BoundaryShapedSource {
-                    shaped: Rc::clone(&shaped),
-                })
-            });
+        // Retain the complete canonical source shape for every fragment.
+        // Selections, visual ordering, and paint then consume exactly the
+        // glyph geometry selected across transparent CSS boundaries instead
+        // of independently reshaping paint-only fragments.
+        // <https://drafts.csswg.org/css-text-3/#boundary-shaping>
+        let boundary_source = Rc::new(BoundaryShapedSource {
+            shaped: Rc::clone(&shaped),
+        });
         for (&fragment_index, range) in fragment_indices.iter().zip(ranges) {
+            let InlineLineItem::Fragment(fragment) = &mut runs[fragment_index].item else {
+                unreachable!("graph fragment indices name fragments")
+            };
+            fragment.set_boundary_shaped_source(Rc::clone(&boundary_source), range.clone());
             let Some(mut selection) =
                 SourceShapedSelection::from_source(Rc::clone(&shaped), range.clone())
             else {
@@ -3036,12 +3122,6 @@ fn shape_logical_joining_graph_runs(
                 .as_ref()
                 .map(ShapedInlineLine::advance_width)
                 .unwrap_or(0.0);
-            let InlineLineItem::Fragment(fragment) = &mut runs[fragment_index].item else {
-                unreachable!("graph fragment indices name fragments");
-            };
-            if let Some(boundary_source) = &boundary_source {
-                fragment.set_boundary_shaped_source(Rc::clone(boundary_source), range);
-            }
             if let Some(slice) = slice.as_ref() {
                 selection.replace_selected(slice.clone());
             }
@@ -3073,7 +3153,7 @@ fn graph_atom_is_transparent_to_shaping(atom: &InlineAtom) -> bool {
     matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
         if edge.advance == 0.0
             && edge.paint_extent == 0.0
-            && !inline_box_edge_breaks_shaping(atom.style())
+            && !inline_box_edge_fragment_breaks_shaping(atom.style(), *edge)
             && !inline_box_bidi_isolation_breaks_shaping(atom.style()))
 }
 
@@ -3189,7 +3269,13 @@ pub(in crate::layout) fn push_text_graph_run_segment(
     // the controls after line selection.
     // <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>
     let shaped = (word.source != InlineTextSource::BidiControl)
-        .then(|| font_system.shape_untracked_inline_line(text, &word.style, word.style.line_height))
+        .then(|| {
+            font_system.shape_untracked_inline_line_with_style_identity(
+                text,
+                &word.style,
+                word.style.line_height,
+            )
+        })
         .flatten();
     let width = shaped
         .as_ref()
@@ -3239,6 +3325,7 @@ impl InlineOpportunityGraph {
             runs,
             opportunities,
             wrap_inside_avoid_depths: BTreeMap::new(),
+            monotonic_source_measurement: RefCell::new(None),
         };
         for opportunity in &graph.opportunities {
             let depth = graph.lexical_wrap_inside_avoid_depth(opportunity.position);
@@ -3259,6 +3346,141 @@ impl InlineOpportunityGraph {
 
     pub(in crate::layout) fn end_position(&self) -> InlineGraphPosition {
         InlineGraphPosition::at_run_start(self.runs.len())
+    }
+
+    /// Return whether every graph run and CSS break boundary can use the
+    /// immutable source-advance table. Line-local effects such as
+    /// `::first-line` and hanging punctuation remain checked by the caller.
+    pub(in crate::layout) fn supports_monotonic_source_measurement(&self) -> bool {
+        if let Some(supported) = self.monotonic_source_measurement.borrow().as_ref() {
+            return supported.is_some();
+        }
+        let runs_supported = self.runs.iter().all(|run| {
+            matches!(
+                &run.item,
+                InlineLineItem::Fragment(fragment)
+                    if matches!(fragment.style().word_break, css::WordBreak::BreakAll)
+                        && matches!(
+                            fragment.style().text_spacing_trim.resolved(),
+                            TextSpacingTrim::SpaceAll | TextSpacingTrim::Normal
+                        )
+                        && !inline_run_has_nonzero_tracking(run)
+                        && !fragment.text().contains('\t')
+            )
+        });
+        let opportunities_supported = self.opportunities.iter().all(|opportunity| {
+            self.wrap_inside_avoid_depth(opportunity.position) == 0
+                && matches!(
+                    opportunity.kind,
+                    InlineBreakKind::SoftWrap
+                        | InlineBreakKind::ExplicitVirtual
+                        | InlineBreakKind::PreservedSpace
+                        | InlineBreakKind::Forced
+                )
+                && !opportunity.hangs_from_fitting_measure()
+                && !opportunity.is_discretionary()
+                && opportunity.discretionary.is_none()
+                && !opportunity.availability.is_fallback()
+                && (opportunity.kind != InlineBreakKind::Forced
+                    || opportunity.position == self.end_position())
+        });
+        let supported = runs_supported && opportunities_supported;
+        if !supported {
+            *self.monotonic_source_measurement.borrow_mut() = Some(None);
+        }
+        supported
+    }
+
+    /// Borrow the source-advance suffix beginning at `start`.
+    ///
+    /// The table is built at most once for an eligible graph. All later line
+    /// selections simply subtract the selected start advance from the shared
+    /// paragraph-relative candidate advances.
+    pub(in crate::layout) fn monotonic_source_measure_cursor_after(
+        &self,
+        start: InlineGraphPosition,
+    ) -> Option<LineMeasureCursor<'_>> {
+        let index = self.monotonic_source_measurement_index()?;
+        let first = self
+            .opportunities
+            .partition_point(|opportunity| opportunity.position <= start);
+        let start_advance = self.monotonic_source_advance_at(start, &index)?;
+        Some(LineMeasureCursor {
+            opportunities: &self.opportunities[first..],
+            index,
+            first_opportunity: first,
+            start_advance,
+        })
+    }
+
+    fn monotonic_source_measurement_index(&self) -> Option<Rc<InlineLineMeasureIndex>> {
+        if !self.supports_monotonic_source_measurement() {
+            return None;
+        }
+        if self.monotonic_source_measurement.borrow().is_none() {
+            #[cfg(feature = "layout-profile")]
+            let profile_started = Instant::now();
+            let index = self.build_monotonic_source_measurement_index();
+            #[cfg(feature = "layout-profile")]
+            if index.is_some() {
+                crate::layout::layout_profile::record_inline_line_measure_index_build(
+                    profile_started.elapsed(),
+                );
+                crate::layout::layout_profile::record_inline_line_measure_index_scan(
+                    self.opportunities.len(),
+                );
+            }
+            *self.monotonic_source_measurement.borrow_mut() = Some(index.map(Rc::new));
+        }
+        let cache = self.monotonic_source_measurement.borrow();
+        let index = Rc::clone(cache.as_ref()?.as_ref()?);
+        Some(index)
+    }
+
+    fn build_monotonic_source_measurement_index(&self) -> Option<InlineLineMeasureIndex> {
+        let mut run_starts = Vec::with_capacity(self.runs.len() + 1);
+        let mut advance = 0.0;
+        for run in &self.runs {
+            run_starts.push(advance);
+            let InlineLineItem::Fragment(fragment) = &run.item else {
+                return None;
+            };
+            advance += run
+                .shaped
+                .as_deref()?
+                .monotonic_source_prefix_advance(fragment.text().len())?;
+        }
+        run_starts.push(advance);
+        let mut index = InlineLineMeasureIndex {
+            run_starts,
+            opportunity_advances: Vec::with_capacity(self.opportunities.len()),
+        };
+        for opportunity in &self.opportunities {
+            index
+                .opportunity_advances
+                .push(self.monotonic_source_advance_at(opportunity.position, &index)?);
+        }
+        Some(index)
+    }
+
+    fn monotonic_source_advance_at(
+        &self,
+        position: InlineGraphPosition,
+        index: &InlineLineMeasureIndex,
+    ) -> Option<f32> {
+        if position == self.end_position() {
+            return index.run_starts.last().copied();
+        }
+        let run = self.runs.get(position.run_index)?;
+        let InlineLineItem::Fragment(fragment) = &run.item else {
+            return None;
+        };
+        let advance = run
+            .shaped
+            .as_deref()?
+            .monotonic_source_prefix_advance(position.byte_offset)?;
+        (position.byte_offset <= fragment.text().len())
+            .then(|| index.run_starts[position.run_index] + advance)
     }
 
     /// Return the number of `wrap-inside: avoid` inline boxes split by a
@@ -3347,6 +3569,98 @@ impl InlineOpportunityGraph {
             })
             .map(InlineGraphPosition::at_run_start)
             .next()
+    }
+
+    /// Find the unbreakable continuation immediately after a candidate line
+    /// end when it contains an inline float after visible no-wrap source.
+    ///
+    /// A legal soft wrap before a `nowrap` descendant ends the preceding
+    /// line, but must not let marker-only lookahead absorb the descendant's
+    /// leading source into it. On the following iteration the selector takes
+    /// the returned complete continuation and its float transaction defers
+    /// the float below that source line when necessary. Requiring visible
+    /// unbreakable source before the marker leaves the distinct marker-leading
+    /// case on its existing source-order placement path.
+    /// <https://www.w3.org/TR/css-text-3/#white-space-property>
+    /// <https://www.w3.org/TR/CSS22/visuren.html#float-position>
+    pub(in crate::layout) fn unbreakable_inline_float_continuation_after(
+        &self,
+        candidate: InlineGraphRange,
+    ) -> Option<UnbreakableInlineFloatContinuation> {
+        if !self
+            .break_opportunity_at(candidate.end)
+            .is_some_and(opportunity_is_soft_wrap)
+        {
+            return None;
+        }
+        let following = InlineGraphRange {
+            start: candidate.end,
+            end: self.end_position(),
+        };
+        let marker = self.first_float_position_in_range(following)?;
+        let float = self.float_at_position(marker)?;
+        if float.style().float != Float::Right
+            || float.style().allows_soft_wrap()
+            || self
+                .break_opportunities_after(candidate.end)
+                .take_while(|opportunity| opportunity.position <= marker)
+                .any(opportunity_is_soft_wrap)
+            || !self.has_visible_unbreakable_source(InlineGraphRange {
+                start: candidate.end,
+                end: marker,
+            })
+        {
+            return None;
+        }
+
+        let continuation_end = self
+            .break_opportunities_after(marker)
+            .find(|opportunity| opportunity_is_soft_wrap(*opportunity))
+            .map_or_else(|| self.end_position(), |opportunity| opportunity.position);
+        Some(UnbreakableInlineFloatContinuation {
+            source_range: InlineGraphRange {
+                start: candidate.end,
+                end: continuation_end,
+            },
+            marker,
+        })
+    }
+
+    fn has_visible_unbreakable_source(&self, range: InlineGraphRange) -> bool {
+        let Some(mut run_range) = self.run_indices_for_graph_range(range) else {
+            return false;
+        };
+        run_range.any(|run_index| {
+            let run = &self.runs[run_index];
+            match &run.item {
+                InlineLineItem::Fragment(fragment) if !fragment.style().allows_soft_wrap() => {
+                    let start = if run_index == range.start.run_index {
+                        range.start.byte_offset
+                    } else {
+                        0
+                    }
+                    .min(fragment.text().len());
+                    let end = if run_index == range.end.run_index {
+                        range.end.byte_offset
+                    } else {
+                        fragment.text().len()
+                    }
+                    .min(fragment.text().len());
+                    start < end
+                        && fragment.text()[start..end]
+                            .chars()
+                            .any(|character| !is_css_collapsible_whitespace(character))
+                }
+                InlineLineItem::Atom(atom)
+                    if !atom.style().allows_soft_wrap() && !atom.content().is_box_edge() =>
+                {
+                    true
+                }
+                InlineLineItem::Fragment(_)
+                | InlineLineItem::Atom(_)
+                | InlineLineItem::Float(_) => false,
+            }
+        })
     }
 
     pub(in crate::layout) fn line_measured_items_for_graph_range(
@@ -3618,6 +3932,22 @@ impl InlineOpportunityGraph {
             .filter(move |opportunity| opportunity.position > start)
     }
 
+    /// Borrow the source-ordered suffix of legal break opportunities.
+    ///
+    /// Inline line fitting commonly revisits a graph while resolving
+    /// orthogonal intrinsic sizes. Keeping the suffix borrowed prevents each
+    /// attempt from allocating and copying every `word-break: break-all`
+    /// boundary before the line-measure cursor can inspect it.
+    pub(in crate::layout) fn break_opportunity_slice_after(
+        &self,
+        start: InlineGraphPosition,
+    ) -> &[InlineBreakOpportunity] {
+        let first = self
+            .opportunities
+            .partition_point(|opportunity| opportunity.position <= start);
+        &self.opportunities[first..]
+    }
+
     pub(in crate::layout) fn break_opportunity_at(
         &self,
         position: InlineGraphPosition,
@@ -3679,6 +4009,33 @@ impl InlineOpportunityGraph {
         }
         .min(self.runs.len());
         (range.start.run_index < end_run).then_some(range.start.run_index..end_run)
+    }
+
+    /// Count authored bytes in a graph range for layout diagnostics.
+    #[cfg(feature = "layout-profile")]
+    pub(in crate::layout) fn source_byte_len_for_range(&self, range: InlineGraphRange) -> usize {
+        let Some(run_range) = self.run_indices_for_graph_range(range) else {
+            return 0;
+        };
+        run_range
+            .filter_map(|run_index| {
+                let InlineLineItem::Fragment(fragment) = &self.runs.get(run_index)?.item else {
+                    return Some(0);
+                };
+                let text_len = fragment.text().len();
+                let start = if run_index == range.start.run_index {
+                    range.start.byte_offset.min(text_len)
+                } else {
+                    0
+                };
+                let end = if run_index == range.end.run_index {
+                    range.end.byte_offset.min(text_len)
+                } else {
+                    text_len
+                };
+                Some(end.saturating_sub(start))
+            })
+            .sum()
     }
 
     fn range_may_use_text_spacing_trim(&self, range: InlineGraphRange) -> bool {
@@ -3920,6 +4277,11 @@ impl InlineOpportunityGraph {
         &self,
         range: InlineGraphRange,
     ) -> Option<f32> {
+        if let Some(index) = self.monotonic_source_measurement_index() {
+            let start = self.monotonic_source_advance_at(range.start, &index)?;
+            let end = self.monotonic_source_advance_at(range.end, &index)?;
+            return Some(end - start);
+        }
         let run_range = self.run_indices_for_graph_range(range)?;
         let mut width = 0.0;
         for run_index in run_range {
@@ -6029,6 +6391,52 @@ mod tests {
             0,
             "the trailing margin edge is outside both nested boxes"
         );
+    }
+
+    #[test]
+    fn unbreakable_float_continuation_excludes_breakable_prefix() {
+        let normal = ComputedStyle::initial();
+        let mut nowrap = normal.clone();
+        nowrap.white_space = WhiteSpace::NoWrap;
+        nowrap.float = Float::Right;
+        let float = InlineFloat::first_letter(
+            Vec::new(),
+            FirstLetterPseudoGroupId::allocate(),
+            nowrap.clone(),
+        );
+        let graph = InlineOpportunityGraph::new(
+            vec![
+                bidi_scope_run("Some ", normal, InlineTextSource::Normal),
+                bidi_scope_run("text ", nowrap.clone(), InlineTextSource::Normal),
+                InlineParagraphRun {
+                    item: InlineLineItem::Float(float),
+                    width: 0.0,
+                    shaped: None,
+                },
+                bidi_scope_run("that overflows", nowrap, InlineTextSource::Normal),
+            ],
+            vec![InlineBreakOpportunity {
+                position: InlineGraphPosition::at_run_start(1),
+                kind: BreakEffect::SoftWrap,
+                availability: BreakAvailability::Ordinary,
+                whitespace_edge: SelectedWhitespaceEdge::None,
+                discretionary: None,
+            }],
+        );
+
+        let continuation = graph
+            .unbreakable_inline_float_continuation_after(InlineGraphRange {
+                start: graph.start_position(),
+                end: InlineGraphPosition::at_run_start(1),
+            })
+            .expect("visible nowrap prefix before the float forms a continuation");
+
+        assert_eq!(continuation.marker, InlineGraphPosition::at_run_start(2));
+        assert_eq!(
+            continuation.source_range.start,
+            InlineGraphPosition::at_run_start(1)
+        );
+        assert_eq!(continuation.source_range.end, graph.end_position());
     }
 
     #[test]

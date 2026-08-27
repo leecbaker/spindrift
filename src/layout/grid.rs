@@ -12,7 +12,6 @@ mod lanes;
 mod line_resolution;
 mod model;
 mod replay;
-use replay::SplitGridItemSourceReplay;
 mod resolved;
 mod sizing;
 mod static_position;
@@ -28,6 +27,7 @@ use item_adjustment::{
     grid_subject_self_start_side, resolve_grid_item_final_percentage_size,
 };
 use line_resolution::*;
+pub(in crate::layout) use model::GridAxisTopology;
 use model::{
     GridItemArea, GridItemLayout, GridItemReplayDimensions, GridLayout, GridLayoutPurpose,
 };

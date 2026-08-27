@@ -785,6 +785,16 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
                     remeasured,
                     physical_direction,
                 );
+                // The completed cross-size phase owns this item's final
+                // formatting-context replay.  Its source extent must come
+                // from that same definite cross-size measurement: retaining
+                // a larger intrinsic probe would replay a cyclic percentage
+                // as though it were final content and manufacture an extra
+                // fragmentainer slice.
+                // <https://drafts.csswg.org/css-flexbox-1/#algo-cross-item>
+                // <https://drafts.csswg.org/css-flexbox-1/#definite-sizes>
+                estimates[index]
+                    .set_fragmentable_overflow_height(remeasured.fragmentable_overflow_height);
             }
         }
     }
@@ -1298,7 +1308,11 @@ pub(in crate::layout::flex) fn update_flex_item_estimate_cross_axis(
         estimate.height = remeasured.height;
         estimate.min_height = remeasured.min_height;
         estimate.content_height = remeasured.content_height;
-        estimate.set_fragmentable_overflow_height(remeasured.fragmentable_overflow_height);
+        // Cross-axis remeasurement refines the used Flex line contribution,
+        // but it must not discard a source extent committed before Flex
+        // resolved the item's main size.  That extent is solely for
+        // fragmentation replay and can be longer than the used border box.
+        estimate.merge_fragmentable_overflow_height(remeasured.fragmentable_overflow_height);
     } else {
         estimate.width = remeasured.width;
         estimate.min_width = remeasured.min_width;
@@ -1872,7 +1886,7 @@ mod tests {
 
     #[test]
     fn later_flex_line_sharing_group_does_not_replace_first_line_item_fallback() {
-        let lines = vec![
+        let lines = [
             FlexLineLayout {
                 item_indices: vec![0],
                 logical_cross_start_rank: 0,

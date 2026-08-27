@@ -13,8 +13,7 @@ use crate::layout::table::layout::{
     table_cell_alignment_baseline_set, table_cell_block_size_depends_on_parent_percentage,
     table_cell_border_box_height_with_insets, table_cell_border_insets,
     table_cell_can_consume_physical_y_row_baseline_for_alignment,
-    table_cell_canvas_first_pass_outer_height, table_cell_child_is_in_flow_float,
-    table_cell_content_pass_from_committed_basis,
+    table_cell_child_is_in_flow_float, table_cell_content_pass_from_committed_basis,
     table_cell_formatting_child_has_parent_percentage_block_size,
     table_cell_participates_in_physical_y_row_baseline, table_cell_row_sizing_border_box_height,
     table_content_height_from_plan, table_height_distribution_groups,
@@ -31,15 +30,15 @@ use crate::layout::table::{
 use crate::layout::{
     BlockSizeBasisSource, BlockSizePercentageBasis, DocumentCanvasResolution, FloatContext,
     LayoutBuilder, LogicalBlockContentSize, LogicalInlineContentSize, PhysicalContentWidth,
-    ReplacedElementKind, apply_used_box_metrics, block_size_percentage_basis_from_points, box_tree,
-    collapse_margins, collapsible_first_child_start_margin_from_boxes, constrain,
-    constrain_content_height, constrain_content_width, effective_overflow_for_style,
-    estimate_svg_height, formatting_box_can_only_create_phantom_line_boxes,
-    has_atomic_inline_formatting_box, has_auto_height, has_direct_inline_content_box,
-    has_non_inline_formatting_box, inline_text_from_formatting_boxes, intrinsic,
-    is_replaced_element, is_self_collapsing_block_box, outer_margins_adjoin_block_siblings,
-    replaced_element_kind, self_collapsing_block_margin_set_for_box, set_style_auto_height,
-    set_style_used_height, used_border_widths, used_content_box_height_or_auto,
+    apply_used_box_metrics, block_size_percentage_basis_from_points, box_tree, collapse_margins,
+    collapsible_first_child_start_margin_from_boxes, constrain, constrain_content_height,
+    constrain_content_width, effective_overflow_for_style,
+    formatting_box_can_only_create_phantom_line_boxes, has_atomic_inline_formatting_box,
+    has_auto_height, has_direct_inline_content_box, has_non_inline_formatting_box,
+    inline_text_from_formatting_boxes, intrinsic, is_replaced_element,
+    is_self_collapsing_block_box, outer_margins_adjoin_block_siblings, replaced_element_kind,
+    self_collapsing_block_margin_set_for_box, set_style_auto_height, set_style_used_height,
+    used_border_widths, used_content_box_height_or_auto,
     used_content_box_height_or_auto_with_basis, used_content_box_width, used_length_percentage,
     used_length_percentage_or_auto_with_basis, used_max_height, used_min_height,
     used_property_containment,
@@ -1379,15 +1378,8 @@ impl<'a> LayoutBuilder<'a> {
                 );
         let style =
             self.table_cell_content_sizing_style(style, TableCellContentSizingPolicy::RowMinimum);
-        match replaced_element_kind(element) {
-            Some(ReplacedElementKind::Canvas) => {
-                table_cell_canvas_first_pass_outer_height(element, &style, available_width)
-            }
-            Some(ReplacedElementKind::Image) => {
-                self.estimate_image_height(element, &style, available_width)
-            }
-            Some(ReplacedElementKind::Svg) => estimate_svg_height(element, &style, available_width),
-            None if style.display.is_table() => self
+        if replaced_element_kind(element).is_some() {
+            return self
                 .estimate_element_height(
                     element,
                     &style,
@@ -1397,15 +1389,26 @@ impl<'a> LayoutBuilder<'a> {
                 )
                 .unwrap_or_else(|| {
                     table_cell_formatting_child_outer_height(fallback_child).points()
-                }),
-            None => self.table_cell_row_minimum_block_like_outer_height(
+                });
+        }
+        if style.display.is_table() {
+            self.estimate_element_height(
+                element,
+                &style,
+                stylesheets,
+                available_width,
+                Some(children),
+            )
+            .unwrap_or_else(|| table_cell_formatting_child_outer_height(fallback_child).points())
+        } else {
+            self.table_cell_row_minimum_block_like_outer_height(
                 element,
                 &style,
                 children,
                 stylesheets,
                 available_width,
                 cyclic_percentage_scroll_container,
-            ),
+            )
         }
     }
 

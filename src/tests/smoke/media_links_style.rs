@@ -943,6 +943,54 @@ async fn anonymous_inline_runs_layout_replaced_atoms_with_text() {
 }
 
 #[tokio::test]
+async fn inline_svg_block_margins_do_not_shift_sibling_text_across_breaks() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 120pt; margin: 10pt } body, div, span { margin:0; font-size:12pt; line-height:12pt } svg { width:10pt; height:10pt; margin-right:3pt; margin-bottom:-5px; padding-bottom:2px }</style>\
+         <div><svg style=\"margin-top:15px\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"red\" /></svg><span>Alpha</span><br>\
+         <svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"green\" /></svg><span>Bravo</span><br>\
+         <svg width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"blue\" /></svg><span>Charlie</span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let swatches = [
+        CssColor::new(255, 0, 0),
+        CssColor::new(0, 128, 0),
+        CssColor::new(0, 0, 255),
+    ]
+    .map(|color| {
+        page.paths()
+            .iter()
+            .find(|path| path.fill == Some(color))
+            .unwrap_or_else(|| panic!("expected {color:?} SVG swatch"))
+    });
+    let labels = ["Alpha", "Bravo", "Charlie"].map(|text| {
+        page.lines()
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("expected label {text:?}"))
+    });
+
+    for (swatch, label) in swatches.iter().zip(labels) {
+        let swatch_bounds = swatch.bounds().expect("SVG swatch bounds");
+        assert!(
+            label.x() > swatch_bounds.origin.x,
+            "label must follow its SVG swatch: swatch={swatch:?}, label={label:?}"
+        );
+        assert!(
+            (label.y() - swatch_bounds.origin.y).abs() < 5.0,
+            "label must share the swatch line: swatch={swatch:?}, label={label:?}"
+        );
+    }
+    assert!(
+        labels.windows(2).all(|pair| pair[0].y() > pair[1].y()),
+        "labels must remain on successive source-order rows: {labels:?}"
+    );
+}
+
+#[tokio::test]
 async fn inline_formatting_context_places_atomic_image_between_text_fragments() {
     let document = Html::from_string(
         "<style>@page { size: 200pt 100pt; margin: 20pt } body, div { margin: 0; font-size: 12pt; line-height: 12pt } img { width: 10pt; height: 10pt }</style>\
