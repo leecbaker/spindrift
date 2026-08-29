@@ -1247,6 +1247,56 @@ async fn atomic_inline_moves_below_float_when_shortened_line_cannot_contain_it()
     );
 }
 
+/// An established float marker in an anonymous run does not make its following
+/// atomic inline part of the source-order float transaction. The atom is
+/// normal-flow content and must retry below the float when its full margin box
+/// cannot fit in the residual band.
+/// CSS 2.2 §9.5 applies after block-in-inline normalization.
+#[tokio::test]
+async fn atomic_inline_after_block_in_inline_and_intervening_float_clears_float() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>\
+         @page { size: 160px 220px; margin: 0 }\
+         body { margin: 0 }\
+         .container { width: 100px }\
+         .first { width: 100px; height: 10px; margin-bottom: 50px; background: blue }\
+         .intervening { float: left; width: 90px; height: 50px; background: green }\
+         .atomic { display: inline-block; width: 50px; height: 10px; vertical-align: top; background: orange }\
+         </style>\
+         <div class=\"container\"><span><div class=\"first\"></div></span><div class=\"intervening\"></div><span class=\"atomic\"></span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let blue = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("the preceding block should paint");
+    let float = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+        .expect("the intervening float should paint");
+    let atom = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 165, 0)))
+        .expect("the atomic inline should paint");
+
+    assert!(
+        (atom.x() - blue.x()).abs() < 0.01,
+        "the retried atom must use the container's inline start: blue={blue:?}, float={float:?}, atom={atom:?}"
+    );
+    assert!(
+        atom.y() + atom.height() <= float.y() + 0.01,
+        "the atom must move below the intervening float: blue={blue:?}, float={float:?}, atom={atom:?}"
+    );
+}
+
 /// An atomic inline that does fit in the shortened band remains beside its
 /// preceding float; CSS 2.2's retry is not an unconditional float clear.
 #[tokio::test]

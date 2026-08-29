@@ -8,7 +8,6 @@ use super::{
     DiscardRegionLimit,
 };
 use crate::css::Edges;
-use crate::layout::block::DefinitePhysicalContentHeight;
 use crate::layout::block::flow::children::BlockFlowMarginCollapseContext;
 use crate::layout::block::flow::children::shared::{
     BlockEndMarginTrim, preserve_adjusted_block_margins,
@@ -188,28 +187,28 @@ fn multicol_flow_contains_inline_content(boxes: &[box_tree::FormattingBox<'_>]) 
 }
 
 #[derive(Debug, Clone, Copy)]
-struct MulticolDescendantPercentageBasis(BlockSizePercentageBasis);
+struct MulticolDescendantPercentageBasis(DescendantBlockPercentageContext);
 
 impl MulticolDescendantPercentageBasis {
-    const INDEFINITE: Self = Self(PercentageBasis::Indefinite);
+    const INDEFINITE: Self = Self(DescendantBlockPercentageContext::ContentSized);
 
     fn from_points(value: Option<f32>) -> Self {
-        Self(block_size_percentage_basis_from_points(
-            value,
+        Self(DescendantBlockPercentageContext::formatting_context(
+            value.map(content_box_pt),
             BlockSizeBasisSource::ContainingBlock,
         ))
     }
 
     fn basis(self) -> BlockSizePercentageBasis {
+        self.0.percentage_basis()
+    }
+
+    fn context(self) -> DescendantBlockPercentageContext {
         self.0
     }
 
     fn and_then<R>(self, f: impl FnOnce(f32) -> Option<R>) -> Option<R> {
-        self.0.points().and_then(f)
-    }
-
-    fn map<R>(self, f: impl FnOnce(f32) -> R) -> Option<R> {
-        self.0.points().map(f)
+        self.basis().points().and_then(f)
     }
 }
 
@@ -785,17 +784,15 @@ impl<'a> LayoutBuilder<'a> {
                         preceding_inline_clamp_block_advance: content_box_pt(0.0),
                         discard_region_limit: None,
                         direct_automatic_block_size_constraint: None,
-                        definite_content_height: content_height.map(|height| {
-                            DefinitePhysicalContentHeight::new(PhysicalContentHeight::new(
-                                content_box_pt(height),
-                            ))
-                        }),
-                        descendant_percentage_height_basis: content_height.map(|height| {
-                            block_size_percentage_basis_from_points(
-                                Some(height),
-                                BlockSizeBasisSource::ContainingBlock,
-                            )
-                        }),
+                        descendant_percentage_height_context: content_height.map_or(
+                            DescendantBlockPercentageContext::ContentSized,
+                            |height| {
+                                DescendantBlockPercentageContext::definite(
+                                    content_box_pt(height),
+                                    BlockSizeBasisSource::ContainingBlock,
+                                )
+                            },
+                        ),
                     }));
                     self.multicol_spanner_fragmentation_depth -= 1;
                     let spanner_start = (content_top - self.cursor_y).max(0.0);
@@ -1639,8 +1636,8 @@ impl<'a> LayoutBuilder<'a> {
                 inline_size: LogicalInlineContentSize::new(content_box_pt(column_inline_size)),
                 content_left: previous_left,
             });
-        self.definite_block_size_stack
-            .push(descendant_percentage_height_basis.basis());
+        self.block_percentage_context_stack
+            .push_context(descendant_percentage_height_basis.context());
         self.truncate_page_start_margins = false;
         self.multicol_text_box_trim_end_child_indices = planned_trim_end_child_indices;
 
@@ -1684,17 +1681,8 @@ impl<'a> LayoutBuilder<'a> {
                         )
                     }),
                     direct_automatic_block_size_constraint: None,
-                    definite_content_height: Some(DefinitePhysicalContentHeight::new(
-                        PhysicalContentHeight::new(content_box_pt(fragmentation_column_height)),
-                    )),
-                    descendant_percentage_height_basis: descendant_percentage_height_basis.map(
-                        |height| {
-                            block_size_percentage_basis_from_points(
-                                Some(height),
-                                BlockSizeBasisSource::ContainingBlock,
-                            )
-                        },
-                    ),
+                    descendant_percentage_height_context: descendant_percentage_height_basis
+                        .context(),
                 }))
             });
         let direct_positioned_element_ids = child_boxes
@@ -3042,8 +3030,8 @@ impl<'a> LayoutBuilder<'a> {
                 inline_size: LogicalInlineContentSize::new(content_box_pt(input.column_width)),
                 content_left: previous_left,
             });
-        self.definite_block_size_stack
-            .push(input.descendant_percentage_height_basis.basis());
+        self.block_percentage_context_stack
+            .push_context(input.descendant_percentage_height_basis.context());
         self.truncate_page_start_margins = false;
         self.multicol_text_box_trim_end_child_indices = None;
 
@@ -3083,17 +3071,9 @@ impl<'a> LayoutBuilder<'a> {
                     )
                 }),
                 direct_automatic_block_size_constraint: None,
-                definite_content_height: Some(DefinitePhysicalContentHeight::new(
-                    PhysicalContentHeight::new(content_box_pt(candidate_height)),
-                )),
-                descendant_percentage_height_basis: input.descendant_percentage_height_basis.map(
-                    |height| {
-                        block_size_percentage_basis_from_points(
-                            Some(height),
-                            BlockSizeBasisSource::ContainingBlock,
-                        )
-                    },
-                ),
+                descendant_percentage_height_context: input
+                    .descendant_percentage_height_basis
+                    .context(),
             }));
             layout.multicol_balance_probe_depth -= 1;
         });

@@ -1,5 +1,86 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct CounterSet {
+    pub(in crate::layout) values: HashMap<String, Vec<CounterInstance>>,
+    pub(in crate::layout) frames: Vec<CounterFrame>,
+    pub(in crate::layout) next_scope_id: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct CounterInstance {
+    pub(in crate::layout) value: CounterValue,
+    pub(in crate::layout) reversed: bool,
+    /// The element or tree-abiding pseudo-element that instantiated this
+    /// counter, when the counter set originates from source-order planning.
+    ///
+    /// CSS Lists defines counter identity in terms of both its name and
+    /// originating element. See <https://drafts.csswg.org/css-lists-3/#creating-counters>.
+    pub(in crate::layout) creator: Option<CounterOriginKey>,
+    /// The traversal scope that owns this counter instance for style
+    /// containment. This is deliberately distinct from `creator`: traversal
+    /// scopes are not CSS counter identity.
+    pub(in crate::layout) creator_scope: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) struct CounterOriginKey {
+    pub(in crate::layout) element_id: crate::dom::ElementId,
+    pub(in crate::layout) source: box_tree::CounterEventSource,
+}
+
+impl CounterOriginKey {
+    pub(in crate::layout) fn new(element: &Element, source: box_tree::CounterEventSource) -> Self {
+        Self {
+            element_id: element.id,
+            source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) struct CounterResetKey {
+    pub(in crate::layout) origin: CounterOriginKey,
+    pub(in crate::layout) declaration_index: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::layout) struct CounterPlan {
+    pub(in crate::layout) reversed_initial_values: HashMap<CounterResetKey, CounterValue>,
+    pub(in crate::layout) values_at_origin: HashMap<CounterOriginKey, HashMap<String, Vec<i32>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::layout) struct CounterFrame {
+    pub(in crate::layout) base_lengths: HashMap<String, usize>,
+    pub(in crate::layout) scope_id: usize,
+    /// The innermost style-containment boundary visible to this scope.
+    ///
+    /// `counter-increment` and `counter-set` must not mutate instances
+    /// created outside this scope. See CSS Containment 2 § 3.3:
+    /// <https://drafts.csswg.org/css-contain-2/#containment-style>.
+    pub(in crate::layout) counter_mutation_floor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct CounterScopeState {
+    /// Generated pseudo-content is evaluated against the durable source-order
+    /// counter snapshot and restores the caller's transient layout state when
+    /// complete.
+    pub(in crate::layout) previous_counter_set: Option<CounterSet>,
+    /// Style containment also scopes generated-quote nesting.  The enclosing
+    /// quote depth remains observable inside the scope, but quote operations
+    /// performed there must not affect following siblings outside it.
+    /// <https://drafts.csswg.org/css-contain-2/#containment-style>
+    pub(in crate::layout) previous_quote_depth: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum GeneratedPseudoCounterMode {
+    Commit,
+    Rollback,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PlannedCounterInstance {
     id: usize,
@@ -980,7 +1061,7 @@ impl<'a> LayoutBuilder<'a> {
             content,
             &counter_stacks,
             &self.counter_styles,
-            list::CounterStyleRenderContext::for_style(pseudo_style),
+            counter_styles::CounterStyleRenderContext::for_style(pseudo_style),
         )
     }
 
@@ -1071,11 +1152,11 @@ impl<'a> LayoutBuilder<'a> {
                         .get(name)
                         .and_then(|values| values.last().cloned())
                         .unwrap_or(0);
-                    if let Some(counter) = list::counter_text_with_context(
+                    if let Some(counter) = counter_styles::counter_text_with_context(
                         counter_style.clone().unwrap_or(ListStyleType::Decimal),
                         value,
                         &self.counter_styles,
-                        list::CounterStyleRenderContext::for_style(style),
+                        counter_styles::CounterStyleRenderContext::for_style(style),
                     ) {
                         push_named_string_text_part(&mut output, &counter);
                     }
@@ -1102,11 +1183,11 @@ impl<'a> LayoutBuilder<'a> {
                         .unwrap_or_else(|| vec![0])
                         .into_iter()
                         .filter_map(|value| {
-                            list::counter_text_with_context(
+                            counter_styles::counter_text_with_context(
                                 counter_style.clone(),
                                 value,
                                 &self.counter_styles,
-                                list::CounterStyleRenderContext::for_style(style),
+                                counter_styles::CounterStyleRenderContext::for_style(style),
                             )
                         })
                         .collect::<Vec<_>>();
@@ -1167,7 +1248,7 @@ impl<'a> LayoutBuilder<'a> {
                         std::slice::from_ref(part),
                         &counter_stacks,
                         &self.counter_styles,
-                        list::CounterStyleRenderContext::for_style(pseudo_style),
+                        counter_styles::CounterStyleRenderContext::for_style(pseudo_style),
                     );
                     push_named_string_text_part(&mut output, &text);
                 }

@@ -102,6 +102,33 @@ fn deeply_nested_box_tree_freeze_and_thaw_use_a_small_native_stack() {
 }
 
 #[test]
+fn automatic_scroll_markers_form_an_external_sibling_group() {
+    let root = dom::parse(
+        "<div class=scroller><section class=target>First</section><section class=target>Second</section></div>",
+    );
+    let author = css::parse_stylesheet(&Css::from_string(
+        ".scroller { overflow: auto; scroll-marker-group: after } \
+         .target::scroll-marker { content: \"•\" }",
+    ));
+    let page = build_test_page(&root, &[author]);
+    let html = page.children.first().expect("html root");
+    let body = html.children().first().expect("body root");
+    let children = body.children();
+    assert_eq!(children.len(), 2);
+    assert!(matches!(
+        children[1].element_core().map(|core| &core.source),
+        Some(BoxSource::GeneratedPseudo(pseudo))
+            if pseudo.kind == GeneratedPseudoKind::ScrollMarkerGroup
+    ));
+    assert_eq!(children[1].children().len(), 2);
+    assert!(children[1].children().iter().all(|marker| matches!(
+        marker.element_core().map(|core| &core.source),
+        Some(BoxSource::GeneratedPseudo(pseudo))
+            if pseudo.kind == GeneratedPseudoKind::ScrollMarker
+    )));
+}
+
+#[test]
 fn nested_zoom_keeps_effective_scale_on_frozen_descendant_styles() {
     let root = dom::parse("<div class=zoom><div class=shadow>text</div></div>");
     let author = css::parse_stylesheet(&Css::from_string(".zoom { zoom: 2 }"));

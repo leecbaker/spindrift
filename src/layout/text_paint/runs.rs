@@ -79,9 +79,9 @@ fn rendered_line_source_for_inline_text_group(
         | InlineTextSource::Generated
         | InlineTextSource::GeneratedWbr
         | InlineTextSource::WordSpaceTransform(_)
-        | InlineTextSource::BlockEllipsis
         | InlineTextSource::FootnoteCall(_)
         | InlineTextSource::BidiControl => RenderedLineSource::Normal,
+        InlineTextSource::BlockEllipsis => RenderedLineSource::BlockEllipsis,
         InlineTextSource::RunIn => RenderedLineSource::RunIn,
         InlineTextSource::Marker => RenderedLineSource::Marker,
     }

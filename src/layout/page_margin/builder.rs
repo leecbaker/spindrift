@@ -384,7 +384,7 @@ impl<'a> LayoutBuilder<'a> {
         self.inline_static_position = None;
         self.block_static_position_y_offset = None;
         self.fragment_top_offsets.clear();
-        self.definite_block_size_stack.clear();
+        self.block_percentage_context_stack.clear();
         self.truncate_page_start_margins = false;
         self.avoid_inside_retry_depth = 0;
         self.containing_blocks.clear();

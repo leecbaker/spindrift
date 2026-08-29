@@ -26,6 +26,7 @@ pub(super) fn grid_used_track_extent(
     line_extent.max(item_extent).min(fallback).max(0.0)
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(super) struct GridGapFragmentProjection<'a> {
     pub(super) style: &'a ComputedStyle,
     pub(super) content_origin: PageTopPoint,
@@ -201,6 +202,313 @@ pub(super) fn grid_fragment_source_range_from_bounds(
         GridFragmentBlockOffset::new(block_start),
         GridFragmentBlockOffset::new(block_end),
     )
+}
+
+/// Paints CSS Gap Decoration rules for resolved gutters in a grid container.
+///
+/// CSS Grid resolves explicit/implicit tracks and gutters before CSS Gaps
+/// assigns decoration rules to the resulting gap sequence:
+/// <https://www.w3.org/TR/css-grid-1/#track-sizing> and
+/// <https://drafts.csswg.org/css-gaps-1/#assigning>.
+pub(in crate::layout) fn grid_gap_decoration_primitives(
+    style: &ComputedStyle,
+    container: GapDecorationContainer,
+    items: &[GapDecorationItem],
+    gutters: &GapDecorationGridGutters,
+) -> Vec<PaintPrimitive> {
+    let column_gaps = gutters
+        .columns
+        .iter()
+        .cloned()
+        .map(GapBand::from)
+        .collect::<Vec<_>>();
+    let row_gaps = gutters
+        .rows
+        .iter()
+        .cloned()
+        .map(GapBand::from)
+        .collect::<Vec<_>>();
+    gap_decoration_primitives_for_gaps(GapDecorationContext {
+        style,
+        container,
+        column_gaps: &column_gaps,
+        row_gaps: &row_gaps,
+        items,
+        container_kind: GapContainerKind::Grid,
+    })
+}
+
+/// Resolves grid gap rules into source-coordinate centerline segments.
+///
+/// This is deliberately separate from primitive generation because a grid may
+/// fragment after its complete track and item geometry has been resolved.
+/// <https://drafts.csswg.org/css-gaps-1/#fragmentation>
+pub(in crate::layout) fn grid_gap_rule_paint_segments(
+    style: &ComputedStyle,
+    container: GapDecorationContainer,
+    items: &[GapDecorationItem],
+    gutters: &GapDecorationGridGutters,
+) -> Vec<GapRulePaintSegment> {
+    let axis_mapped_style = GapRulePhysicalProjection::new(style).project_style(style);
+    let style = &axis_mapped_style;
+    let column_gaps = gutters
+        .columns
+        .iter()
+        .cloned()
+        .map(GapBand::from)
+        .collect::<Vec<_>>();
+    let row_gaps = gutters
+        .rows
+        .iter()
+        .cloned()
+        .map(GapBand::from)
+        .collect::<Vec<_>>();
+    let assigned_column_gaps = assign_gap_bands(&column_gaps);
+    let assigned_row_gaps = assign_gap_bands(&row_gaps);
+    let column_rules = axis_rule_paint_segments(AxisRuleContext {
+        kind: GapRuleAxisKind::Column,
+        container_kind: GapContainerKind::Grid,
+        rule: &style.column_rule,
+        crossing_rule: &style.row_rule,
+        container,
+        gaps: &assigned_column_gaps,
+        crossing_gaps: &row_gaps,
+        items,
+    });
+    let row_rules = axis_rule_paint_segments(AxisRuleContext {
+        kind: GapRuleAxisKind::Row,
+        container_kind: GapContainerKind::Grid,
+        rule: &style.row_rule,
+        crossing_rule: &style.column_rule,
+        container,
+        gaps: &assigned_row_gaps,
+        crossing_gaps: &column_gaps,
+        items,
+    });
+    match style.rule_overlap {
+        css::GapRuleOverlap::RowOverColumn => column_rules.into_iter().chain(row_rules).collect(),
+        css::GapRuleOverlap::ColumnOverRow => row_rules.into_iter().chain(column_rules).collect(),
+    }
+}
+
+/// Expands a previously resolved grid segment into paint primitives.
+pub(in crate::layout) fn grid_gap_rule_segment_primitives(
+    style: &ComputedStyle,
+    container: GapDecorationContainer,
+    rule_segment: GapRulePaintSegment,
+) -> Vec<PaintPrimitive> {
+    let (rule, crossing_rule) = match rule_segment.kind {
+        GapRuleAxisKind::Column => (&style.column_rule, &style.row_rule),
+        GapRuleAxisKind::Row => (&style.row_rule, &style.column_rule),
+    };
+    gap_rule_segment_primitives_with_pattern_phase(
+        AxisRuleContext {
+            kind: rule_segment.kind,
+            container_kind: GapContainerKind::Grid,
+            rule,
+            crossing_rule,
+            container,
+            gaps: &[],
+            crossing_gaps: &[],
+            items: &[],
+        },
+        rule_segment.gap,
+        rule_segment.segment,
+        rule_segment.width,
+        rule_segment.style,
+        rule_segment.color,
+        rule_segment.pattern_phase,
+    )
+}
+
+/// Projects Grid's final canonical track topology into paintable gutter bands.
+///
+/// The Grid layout owns `auto-fit` collapse provenance. Keeping this as a
+/// projection rather than accepting Taffy's detailed gutter record ensures
+/// gap-rule assignment happens after collapsed tracks and their gutters have
+/// been removed from the used Grid topology.
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>
+pub(in crate::layout) fn grid_gap_decoration_gutters_from_topologies(
+    columns: &GridAxisTopology,
+    rows: &GridAxisTopology,
+    style: &ComputedStyle,
+    content_width: f32,
+    content_height: f32,
+) -> GapDecorationGridGutters {
+    GapDecorationGutters {
+        columns: grid_axis_gutters_from_topology(
+            columns,
+            content_width,
+            style.justify_content,
+            style.direction == Direction::Rtl,
+        ),
+        rows: grid_axis_gutters_from_topology(rows, content_height, style.align_content, false),
+    }
+}
+
+pub(in crate::layout) fn grid_axis_gutters_from_topology(
+    topology: &GridAxisTopology,
+    axis_size: f32,
+    alignment: AlignContent,
+    axis_is_reversed: bool,
+) -> Vec<GapDecorationGutter> {
+    let sizes = topology.track_sizes();
+    let gutters = topology.interior_gutters();
+    let collapsed_tracks = topology.collapsed_auto_fit_tracks();
+    if sizes.is_empty()
+        || gutters.len() != sizes.len().saturating_sub(1)
+        || collapsed_tracks.len() != sizes.len()
+    {
+        return Vec::new();
+    }
+    let used_size = sizes.iter().chain(gutters.iter()).sum::<f32>();
+    let free_space = axis_size - used_size;
+    let track_count = sizes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !collapsed_tracks[*index])
+        .count();
+    let alignment = grid_alignment_fallback(free_space, track_count, alignment);
+    let alignment = if axis_is_reversed {
+        reverse_grid_alignment(alignment)
+    } else {
+        alignment
+    };
+
+    let mut cursor = 0.0;
+    let mut seen_track = false;
+    let mut bands = Vec::new();
+    for (index, size) in sizes.iter().cloned().enumerate() {
+        let gutter_size = index
+            .checked_sub(1)
+            .and_then(|gutter_index| gutters.get(gutter_index))
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        if index > 0 && gutter_size > GAP_RULE_EPSILON {
+            bands.push(GapDecorationGutter::with_grid_line(
+                cursor,
+                cursor + gutter_size,
+                Some((index + 1) as u16),
+            ));
+        }
+        cursor += gutter_size;
+
+        let is_track = !collapsed_tracks[index];
+        if is_track {
+            cursor += grid_alignment_offset(free_space, track_count, alignment, !seen_track);
+            seen_track = true;
+        }
+        cursor += size.max(0.0);
+    }
+    bands
+}
+
+pub(in crate::layout) fn grid_alignment_fallback(
+    free_space: f32,
+    track_count: usize,
+    alignment: AlignContent,
+) -> ContentAlignmentKeyword {
+    let mut keyword = grid_alignment_keyword(alignment.keyword);
+    let mut safe = alignment.safety == AlignmentSafety::Safe;
+    if track_count <= 1 || free_space <= 0.0 {
+        (keyword, safe) = match keyword {
+            ContentAlignmentKeyword::Stretch | ContentAlignmentKeyword::SpaceBetween => {
+                (ContentAlignmentKeyword::FlexStart, true)
+            }
+            ContentAlignmentKeyword::SpaceAround | ContentAlignmentKeyword::SpaceEvenly => {
+                (ContentAlignmentKeyword::Center, true)
+            }
+            other => (other, safe),
+        };
+    }
+    if free_space <= 0.0 && safe {
+        ContentAlignmentKeyword::Start
+    } else {
+        keyword
+    }
+}
+
+pub(in crate::layout) fn grid_alignment_keyword(
+    keyword: ContentAlignmentKeyword,
+) -> ContentAlignmentKeyword {
+    match keyword {
+        ContentAlignmentKeyword::Normal | ContentAlignmentKeyword::Stretch => {
+            ContentAlignmentKeyword::Stretch
+        }
+        ContentAlignmentKeyword::Left | ContentAlignmentKeyword::FlexStart => {
+            ContentAlignmentKeyword::FlexStart
+        }
+        ContentAlignmentKeyword::Right | ContentAlignmentKeyword::FlexEnd => {
+            ContentAlignmentKeyword::FlexEnd
+        }
+        ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline => {
+            ContentAlignmentKeyword::FlexStart
+        }
+        other => other,
+    }
+}
+
+pub(in crate::layout) fn reverse_grid_alignment(
+    keyword: ContentAlignmentKeyword,
+) -> ContentAlignmentKeyword {
+    match keyword {
+        ContentAlignmentKeyword::Start => ContentAlignmentKeyword::End,
+        ContentAlignmentKeyword::End => ContentAlignmentKeyword::Start,
+        ContentAlignmentKeyword::FlexStart => ContentAlignmentKeyword::FlexEnd,
+        ContentAlignmentKeyword::FlexEnd => ContentAlignmentKeyword::FlexStart,
+        other => other,
+    }
+}
+
+pub(in crate::layout) fn grid_alignment_offset(
+    free_space: f32,
+    track_count: usize,
+    alignment: ContentAlignmentKeyword,
+    is_first: bool,
+) -> f32 {
+    if track_count == 0 {
+        return 0.0;
+    }
+    if is_first {
+        match alignment {
+            ContentAlignmentKeyword::Start
+            | ContentAlignmentKeyword::FlexStart
+            | ContentAlignmentKeyword::Stretch
+            | ContentAlignmentKeyword::SpaceBetween => 0.0,
+            ContentAlignmentKeyword::End | ContentAlignmentKeyword::FlexEnd => free_space,
+            ContentAlignmentKeyword::Center => free_space / 2.0,
+            ContentAlignmentKeyword::SpaceAround => {
+                if free_space >= 0.0 {
+                    (free_space / track_count as f32) / 2.0
+                } else {
+                    free_space / 2.0
+                }
+            }
+            ContentAlignmentKeyword::SpaceEvenly => {
+                if free_space >= 0.0 {
+                    free_space / (track_count + 1) as f32
+                } else {
+                    free_space / 2.0
+                }
+            }
+            ContentAlignmentKeyword::Normal
+            | ContentAlignmentKeyword::Left
+            | ContentAlignmentKeyword::Right
+            | ContentAlignmentKeyword::Baseline
+            | ContentAlignmentKeyword::LastBaseline => 0.0,
+        }
+    } else {
+        let free_space = free_space.max(0.0);
+        match alignment {
+            ContentAlignmentKeyword::SpaceBetween if track_count > 1 => {
+                free_space / (track_count - 1) as f32
+            }
+            ContentAlignmentKeyword::SpaceAround => free_space / track_count as f32,
+            ContentAlignmentKeyword::SpaceEvenly => free_space / (track_count + 1) as f32,
+            _ => 0.0,
+        }
+    }
 }
 
 #[cfg(test)]

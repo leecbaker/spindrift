@@ -431,7 +431,19 @@ impl<'a> LayoutBuilder<'a> {
                     }
                 });
             let shaping_spans = logical_joining_spans.as_deref().unwrap_or(&spans);
-            let reused_boundary_shape = (!group_text.contains('\t'))
+            // A selected source glyph stream retains the source run's RTL
+            // character placement. The visual item sequence has already
+            // performed UAX #9 L2, so a non-joining RTL group must be shaped
+            // from that sequence instead of borrowing the logical source
+            // placement. Joining text and join controls are the exception:
+            // their contextual forms cannot be reconstructed from separated
+            // visual fragments.
+            // <https://www.unicode.org/reports/tr9/#L2>
+            // <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+            let can_reuse_boundary_shape = resolved_direction != ResolvedBidiDirection::Rtl
+                || has_join_control
+                || has_joining_behavior;
+            let reused_boundary_shape = (can_reuse_boundary_shape && !group_text.contains('\t'))
                 .then(|| complete_boundary_shaped_source(group))
                 .flatten();
             let reused_selected_shape = reused_boundary_shape.or_else(|| {

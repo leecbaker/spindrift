@@ -291,6 +291,7 @@ pub(in crate::layout) struct BlockLayoutGeometry {
     pub(in crate::layout) border_edges: UsedEdges,
     pub(in crate::layout) vertical_non_content: NonContentLength,
     pub(in crate::layout) containing_block_content_height: BlockSizePercentageBasis,
+    pub(in crate::layout) containing_block_percentage_context: DescendantBlockPercentageContext,
     /// Definite physical content height exported for descendant percentage
     /// resolution. This remains physical even for a vertical block, whose
     /// logical inline size is the same axis.

@@ -1,14 +1,15 @@
 use super::super::{
-    BlockAutoWidthRole, BlockContentWidthInputs, BlockSizeBasisSource, ComputedStyle, DisplayInner,
-    Element, ElementSignature, Float, FloatContext, FloatId, FloatPlacementAxes, FloatShape,
-    IntrinsicBlockBasis, IntrinsicInlinePercentageBasisSource, LayoutBuilder, NodeKind,
-    PageInlineSpan, PageTopBlockPosition, PageTopRect, PercentageBasis, PhysicalContentHeight,
+    BlockAutoWidthRole, BlockContentWidthInputs, BlockSizeBasisSource, ComputedStyle,
+    DescendantBlockPercentageContext, DisplayInner, Element, ElementSignature, Float, FloatContext,
+    FloatId, FloatPlacementAxes, FloatShape, IntrinsicBlockBasis,
+    IntrinsicInlinePercentageBasisSource, LayoutBuilder, NodeKind, PageInlineSpan,
+    PageTopBlockPosition, PageTopRect, PercentageBasis, PhysicalContentHeight,
     PhysicalContentWidth, Position, ReplacedBoxSizingContext, SemanticLengthExt, Stylesheets,
-    UsedFloatSide, WritingMode, apply_used_box_metrics, block_size_percentage_basis_from_points,
-    box_tree, constrain_content_height, constrain_content_width, constrain_height_with_intrinsic,
-    constrain_width_with_intrinsic, content_box_pt, css, dom, element_sibling_signature_list,
-    element_signature, formatting_box_has_inline_content, has_atomic_inline_formatting_box,
-    has_auto_height, has_direct_flow_child_with_font_metrics, has_direct_inline_content_box,
+    UsedFloatSide, WritingMode, apply_used_box_metrics, box_tree, constrain_content_height,
+    constrain_content_width, constrain_height_with_intrinsic, constrain_width_with_intrinsic,
+    content_box_pt, css, dom, element_sibling_signature_list, element_signature,
+    formatting_box_has_inline_content, has_atomic_inline_formatting_box, has_auto_height,
+    has_direct_flow_child_with_font_metrics, has_direct_inline_content_box,
     has_direct_inline_replaced_child, has_non_inline_formatting_box, inline_text_for_style,
     inline_text_from_formatting_boxes, intrinsic, is_replaced_element, layout_pt,
     margin_box_size_pt, needs_intrinsic_height_contribution, needs_intrinsic_width_contribution,
@@ -18,34 +19,6 @@ use super::super::{
     used_property_containment,
 };
 use super::float::{freeze_float_replay_height, freeze_float_replay_width};
-
-/// The continuous physical block-axis range occupied by an in-flow box.
-///
-/// Size containment changes the principal box's used contribution, but not
-/// necessarily the visible paint of its in-flow descendants.  Fragmentation
-/// consumers commit this measurement before replay, so replay need not
-/// reinterpret authored containment or overflow properties.
-/// <https://www.w3.org/TR/css-contain-2/#size-containment>
-/// <https://www.w3.org/TR/css-break-3/#box-splitting>
-#[derive(Debug, Clone, Copy)]
-pub(in crate::layout) struct InFlowSourceExtent {
-    used_principal: PhysicalContentHeight,
-    visible_descendant: PhysicalContentHeight,
-}
-
-impl InFlowSourceExtent {
-    pub(in crate::layout) fn visible_descendant(self) -> PhysicalContentHeight {
-        self.visible_descendant
-    }
-
-    pub(in crate::layout) fn source_extent(self) -> PhysicalContentHeight {
-        PhysicalContentHeight::new(content_box_pt(
-            self.used_principal
-                .points()
-                .max(self.visible_descendant.points()),
-        ))
-    }
-}
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn estimate_element_height(
@@ -133,267 +106,6 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    /// Measure a box's final used content height together with the visible
-    /// in-flow source extent of its descendants.
-    ///
-    /// The ordinary estimator intentionally treats a size-contained box as
-    /// empty.  This companion measurement keeps that used result, then walks
-    /// the same normal-flow descendants with size containment suppressed only
-    /// for the source-range probe.  Overflow clips are resolved here, not in
-    /// fragmented replay.
-    /// <https://www.w3.org/TR/css-contain-2/#size-containment>
-    /// <https://www.w3.org/TR/css-overflow-3/#overflow-types>
-    pub(in crate::layout) fn measure_in_flow_source_extent(
-        &mut self,
-        element: &Element,
-        style: &ComputedStyle,
-        stylesheets: &Stylesheets<'_>,
-        available_outer_width: f32,
-        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-    ) -> Option<InFlowSourceExtent> {
-        let used_outer = self.estimate_element_height(
-            element,
-            style,
-            stylesheets,
-            available_outer_width,
-            child_boxes,
-        )?;
-        let used_principal = Self::content_height_from_estimated_outer(style, used_outer);
-        if self.element_used_overflow_clips(element, style)
-            && self
-                .used_overflow_axes_for_element(element, style)
-                .clips_y()
-        {
-            return Some(InFlowSourceExtent {
-                used_principal,
-                visible_descendant: used_principal,
-            });
-        }
-
-        let mut source_style = style.clone();
-        source_style.contain.size = false;
-        let mut visible_outer = self.estimate_element_height(
-            element,
-            &source_style,
-            stylesheets,
-            available_outer_width,
-            child_boxes,
-        )?;
-
-        let mut visible_flow_children_outer = 0.0;
-        if let Some(child_boxes) = child_boxes {
-            for child_box in child_boxes {
-                let Some((child_element, _, child_style, child_children)) =
-                    child_box.element_parts()
-                else {
-                    continue;
-                };
-                if !Self::source_extent_child_participates(child_style) {
-                    continue;
-                }
-                let mut source_child_style = child_style.clone();
-                source_child_style.contain.size = false;
-                let Some(source_child_outer) = self.estimate_element_height(
-                    child_element,
-                    &source_child_style,
-                    stylesheets,
-                    available_outer_width,
-                    Some(child_children),
-                ) else {
-                    continue;
-                };
-                let Some(child_source) = self.measure_in_flow_source_extent(
-                    child_element,
-                    child_style,
-                    stylesheets,
-                    available_outer_width,
-                    Some(child_children),
-                ) else {
-                    continue;
-                };
-                // A size-contained child can still paint its own definite
-                // principal box.  Its intrinsic contribution is empty, but
-                // source measurement must retain that unclipped box before
-                // adding any longer descendant range.  The cleared-contain
-                // probe is the authoritative physical principal extent.
-                let child_source_outer = if used_property_containment(child_element, child_style)
-                    .size
-                    && Self::source_extent_principal_has_visible_paint(child_style)
-                {
-                    source_child_outer.max(Self::estimated_outer_from_content(
-                        child_style,
-                        child_source.source_extent(),
-                    ))
-                } else {
-                    Self::estimated_outer_from_content(
-                        child_style,
-                        child_source.visible_descendant(),
-                    )
-                };
-                visible_flow_children_outer += child_source_outer;
-                visible_outer += child_source_outer - source_child_outer;
-            }
-        } else {
-            let sibling_tags = element_sibling_signature_list(element);
-            let mut element_index = 0usize;
-            for node in &element.children {
-                let NodeKind::Element(child_element) = &node.kind else {
-                    continue;
-                };
-                let signature = ElementSignature::with_sibling_list(
-                    child_element.tag.clone(),
-                    child_element.attrs.clone(),
-                    element_index,
-                    sibling_tags.clone(),
-                );
-                element_index += 1;
-                let child_style = self.style_for_layout_element_with_parent_font_metrics(
-                    child_element,
-                    signature,
-                    stylesheets,
-                    Some(style),
-                );
-                if !Self::source_extent_child_participates(&child_style) {
-                    continue;
-                }
-                let mut source_child_style = child_style.clone();
-                source_child_style.contain.size = false;
-                let Some(source_child_outer) = self.estimate_element_height(
-                    child_element,
-                    &source_child_style,
-                    stylesheets,
-                    available_outer_width,
-                    None,
-                ) else {
-                    continue;
-                };
-                let Some(child_source) = self.measure_in_flow_source_extent(
-                    child_element,
-                    &child_style,
-                    stylesheets,
-                    available_outer_width,
-                    None,
-                ) else {
-                    continue;
-                };
-                // See the frozen-child-box branch above: retain visible
-                // principal paint from the size-containment-suppressed
-                // source probe, while keeping the used contribution empty.
-                let child_source_outer = if used_property_containment(child_element, &child_style)
-                    .size
-                    && Self::source_extent_principal_has_visible_paint(&child_style)
-                {
-                    source_child_outer.max(Self::estimated_outer_from_content(
-                        &child_style,
-                        child_source.source_extent(),
-                    ))
-                } else {
-                    Self::estimated_outer_from_content(
-                        &child_style,
-                        child_source.visible_descendant(),
-                    )
-                };
-                visible_flow_children_outer += child_source_outer;
-                visible_outer += child_source_outer - source_child_outer;
-            }
-        }
-        let mut visible_inline_height = 0.0;
-        if visible_flow_children_outer > 0.0 {
-            // A mixed block-and-inline formatting context owns an anonymous
-            // trailing line after its in-flow block stack. The used-size
-            // estimator is allowed to suppress that line for a
-            // size-contained principal box, but the source canvas must
-            // retain it after visible descendant overflow.
-            // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
-            let own_inline = own_inline_text_for_style(element, &source_style);
-            visible_inline_height = if own_inline.is_empty() {
-                self.intrinsic_inline_measurement_for_element(
-                    element,
-                    &source_style,
-                    stylesheets,
-                    child_boxes,
-                    available_outer_width.max(1.0),
-                )
-                .height()
-            } else {
-                self.estimate_text_height(
-                    &own_inline,
-                    &source_style,
-                    available_outer_width,
-                    source_style.padding.left,
-                    source_style.padding.right,
-                )
-            };
-            let borders = used_border_widths(style);
-            let stacked_outer = style.margin.top
-                + style.padding.top
-                + borders.top
-                + visible_flow_children_outer
-                + visible_inline_height
-                + style.padding.bottom
-                + borders.bottom
-                + style.margin.bottom;
-            visible_outer = visible_outer.max(stacked_outer);
-        }
-        let visible_descendant = if used_property_containment(element, style).size {
-            PhysicalContentHeight::new(content_box_pt(
-                (visible_flow_children_outer + visible_inline_height).max(0.0),
-            ))
-        } else {
-            Self::content_height_from_estimated_outer(style, visible_outer)
-        };
-        Some(InFlowSourceExtent {
-            used_principal,
-            visible_descendant,
-        })
-    }
-
-    fn source_extent_child_participates(style: &ComputedStyle) -> bool {
-        style.display.is_block_level()
-            && style.float == Float::None
-            && !matches!(style.position, Position::Absolute | Position::Fixed)
-            && !style.position.is_running()
-    }
-
-    fn source_extent_principal_has_visible_paint(style: &ComputedStyle) -> bool {
-        let borders = used_border_widths(style);
-        style.background.background_color.is_potentially_visible()
-            || style.background.background_image.is_image()
-            || !style.background.background_layers.is_empty()
-            || borders.top + borders.bottom > 0.0
-    }
-
-    fn content_height_from_estimated_outer(
-        style: &ComputedStyle,
-        outer_height: f32,
-    ) -> PhysicalContentHeight {
-        let borders = used_border_widths(style);
-        PhysicalContentHeight::new(content_box_pt(
-            (outer_height
-                - style.margin.top
-                - style.margin.bottom
-                - style.padding.top
-                - style.padding.bottom
-                - borders.top
-                - borders.bottom)
-                .max(0.0),
-        ))
-    }
-
-    fn estimated_outer_from_content(
-        style: &ComputedStyle,
-        content_height: PhysicalContentHeight,
-    ) -> f32 {
-        let borders = used_border_widths(style);
-        style.margin.top
-            + style.padding.top
-            + borders.top
-            + content_height.points()
-            + style.padding.bottom
-            + borders.bottom
-            + style.margin.bottom
-    }
-
     pub(in crate::layout) fn estimate_block_like_height(
         &mut self,
         element: &Element,
@@ -417,21 +129,20 @@ impl<'a> LayoutBuilder<'a> {
         // against its containing block, never against itself.
         // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
         let containing_block_size_basis = self
-            .definite_block_size_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(PercentageBasis::indefinite);
+            .block_percentage_context_stack
+            .current_percentage_basis();
         let definite_content_height = used_content_box_size_with_basis(
             style.box_values.height.value().clone(),
             style.box_sizing,
             containing_block_size_basis,
             vertical_extras,
         );
-        self.definite_block_size_stack
-            .push(block_size_percentage_basis_from_points(
-                definite_content_height.map(SemanticLengthExt::points),
+        self.block_percentage_context_stack.push_context(
+            DescendantBlockPercentageContext::formatting_context(
+                definite_content_height,
                 BlockSizeBasisSource::ContainingBlock,
-            ));
+            ),
+        );
         let intrinsic_sizes = (needs_intrinsic_width_contribution(style.box_values.width.clone())
             || needs_intrinsic_width_contribution(style.box_values.min_width.clone())
             || needs_intrinsic_width_contribution(style.box_values.max_width.clone()))
@@ -535,7 +246,7 @@ impl<'a> LayoutBuilder<'a> {
                 + style.padding.bottom
                 + borders.bottom
                 + style.margin.bottom;
-            self.definite_block_size_stack.pop();
+            self.block_percentage_context_stack.pop();
             return outer_height;
         }
 
@@ -801,7 +512,7 @@ impl<'a> LayoutBuilder<'a> {
             + style.padding.bottom
             + borders.bottom
             + style.margin.bottom;
-        self.definite_block_size_stack.pop();
+        self.block_percentage_context_stack.pop();
         outer_height
     }
 
@@ -923,10 +634,8 @@ impl<'a> LayoutBuilder<'a> {
         );
         let _ = freeze_float_replay_height(
             &mut placed_style,
-            self.definite_block_size_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(PercentageBasis::indefinite),
+            self.block_percentage_context_stack
+                .current_percentage_basis(),
             element.document_compatibility_mode == dom::DocumentCompatibilityMode::Quirks,
         );
         let inline_size = self.resolved_float_inline_size(

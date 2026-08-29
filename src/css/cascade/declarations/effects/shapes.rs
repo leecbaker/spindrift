@@ -313,7 +313,225 @@ fn parse_shape_outside_basic_shape(value: &str, font_size: f32) -> Option<BasicS
     if let Some(ellipse) = parse_shape_ellipse(value, font_size) {
         return Some(BasicShape::Ellipse(ellipse));
     }
-    parse_shape_polygon(value, font_size).map(BasicShape::Polygon)
+    if let Some(polygon) = parse_shape_polygon(value, font_size) {
+        return Some(BasicShape::Polygon(polygon));
+    }
+    if let Some(path) = parse_shape_path(value) {
+        return Some(BasicShape::Path(path));
+    }
+    parse_shape_function(value, font_size).map(BasicShape::Shape)
+}
+
+/// Parse CSS Shapes `path()` using CSS Syntax for the function/string
+/// boundary and kurbo's SVG 1.1 path-data parser for the string grammar.
+/// CSS Shapes uses the SVG coordinate system, whose unitless coordinates are
+/// CSS pixels; layout converts them only after the float reference box exists.
+/// <https://drafts.csswg.org/css-shapes/#funcdef-path>
+fn parse_shape_path(value: &str) -> Option<ShapePath> {
+    let functions = css_function_list(value)?;
+    let [(name, body)] = functions.as_slice() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("path") {
+        return None;
+    }
+    let mut arguments = try_split_css_top_level_delimiter(body, ',')?;
+    let fill_rule = match arguments.first().map(|value| trim_css_value(value)) {
+        Some(value) if value.eq_ignore_ascii_case("evenodd") => {
+            arguments.remove(0);
+            ShapeFillRule::EvenOdd
+        }
+        Some(value) if value.eq_ignore_ascii_case("nonzero") => {
+            arguments.remove(0);
+            ShapeFillRule::NonZero
+        }
+        _ => ShapeFillRule::NonZero,
+    };
+    let [data] = arguments.as_slice() else {
+        return None;
+    };
+    let (data, tail) = parse_css_string_token(trim_css_value(data))?;
+    if !tail.is_empty() || kurbo::BezPath::from_svg(&data).is_err() {
+        return None;
+    }
+    Some(ShapePath { fill_rule, data })
+}
+
+/// Parse the full CSS Shapes Level 2 command vocabulary. CSS Syntax owns all
+/// function, string, comment, nested-function, and comma boundaries here;
+/// command parsing operates only on already-tokenized component slices.
+/// <https://drafts.csswg.org/css-shapes-2/#shape-function>
+fn parse_shape_function(value: &str, font_size: f32) -> Option<ShapeFunction> {
+    let functions = css_function_list(value)?;
+    let [(name, body)] = functions.as_slice() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("shape") {
+        return None;
+    }
+    let mut segments = try_split_css_top_level_delimiter(body, ',')?;
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| trim_css_value(segment).is_empty())
+    {
+        return None;
+    }
+    let first = segments.remove(0);
+    let mut first_values = try_split_css_component_values(first)?;
+    let fill_rule = match first_values.first().copied() {
+        Some(value) if value.eq_ignore_ascii_case("evenodd") => {
+            first_values.remove(0);
+            ShapeFillRule::EvenOdd
+        }
+        Some(value) if value.eq_ignore_ascii_case("nonzero") => {
+            first_values.remove(0);
+            ShapeFillRule::NonZero
+        }
+        _ => ShapeFillRule::NonZero,
+    };
+    let origin = match first_values.first().copied() {
+        Some(value) if value.eq_ignore_ascii_case("from") => {
+            parse_shape_position(&first_values[1..], font_size)?
+        }
+        None => ShapePosition {
+            x: ComputedLengthPercentage::ZERO,
+            y: ComputedLengthPercentage::ZERO,
+        },
+        _ => return None,
+    };
+    let commands = segments
+        .into_iter()
+        .map(|segment| parse_shape_command(segment, font_size))
+        .collect::<Option<Vec<_>>>()?;
+    (!commands.is_empty()).then_some(ShapeFunction {
+        fill_rule,
+        origin,
+        commands,
+    })
+}
+
+fn parse_shape_command(value: &str, font_size: f32) -> Option<ShapeCommand> {
+    let values = try_split_css_component_values(value)?;
+    let command = values.first()?.to_ascii_lowercase();
+    if command == "close" {
+        return (values.len() == 1).then_some(ShapeCommand::Close);
+    }
+    let direction = match values.get(1)?.to_ascii_lowercase().as_str() {
+        "to" => ShapeCommandDirection::To,
+        "by" => ShapeCommandDirection::By,
+        _ => return None,
+    };
+    match command.as_str() {
+        "move" | "line" => {
+            let point = parse_shape_position(&values[2..], font_size)?;
+            Some(if command == "move" {
+                ShapeCommand::Move { direction, point }
+            } else {
+                ShapeCommand::Line { direction, point }
+            })
+        }
+        "hline" | "vline" => {
+            let [value] = &values[2..] else {
+                return None;
+            };
+            let value = parse_computed_length_percentage(value, font_size)?;
+            Some(if command == "hline" {
+                ShapeCommand::HorizontalLine { direction, value }
+            } else {
+                ShapeCommand::VerticalLine { direction, value }
+            })
+        }
+        "curve" => parse_shape_curve_command(direction, &values[2..], font_size),
+        "smooth" => parse_shape_smooth_command(direction, &values[2..], font_size),
+        "arc" => parse_shape_arc_command(direction, &values[2..], font_size),
+        _ => None,
+    }
+}
+
+fn parse_shape_curve_command(
+    direction: ShapeCommandDirection,
+    values: &[&str],
+    font_size: f32,
+) -> Option<ShapeCommand> {
+    let with = values
+        .iter()
+        .position(|value| value.eq_ignore_ascii_case("with"))?;
+    let point = parse_shape_position(&values[..with], font_size)?;
+    let controls_source = values[with + 1..].join(" ");
+    let controls = try_split_css_top_level_delimiter(&controls_source, '/')?;
+    let [control_start, control_end] = controls.as_slice() else {
+        return None;
+    };
+    Some(ShapeCommand::Curve {
+        direction,
+        point,
+        control_start: parse_shape_position(
+            &try_split_css_component_values(control_start)?,
+            font_size,
+        )?,
+        control_end: parse_shape_position(
+            &try_split_css_component_values(control_end)?,
+            font_size,
+        )?,
+    })
+}
+
+fn parse_shape_smooth_command(
+    direction: ShapeCommandDirection,
+    values: &[&str],
+    font_size: f32,
+) -> Option<ShapeCommand> {
+    let with = values
+        .iter()
+        .position(|value| value.eq_ignore_ascii_case("with"))?;
+    Some(ShapeCommand::Smooth {
+        direction,
+        point: parse_shape_position(&values[..with], font_size)?,
+        control_end: parse_shape_position(&values[with + 1..], font_size)?,
+    })
+}
+
+fn parse_shape_arc_command(
+    direction: ShapeCommandDirection,
+    values: &[&str],
+    font_size: f32,
+) -> Option<ShapeCommand> {
+    let of = values
+        .iter()
+        .position(|value| value.eq_ignore_ascii_case("of"))?;
+    let point = parse_shape_position(&values[..of], font_size)?;
+    let radius_and_flags = &values[of + 1..];
+    let [radius_x, radius_y, tail @ ..] = radius_and_flags else {
+        return None;
+    };
+    let radius_x = parse_computed_length_percentage(radius_x, font_size)?;
+    let radius_y = parse_computed_length_percentage(radius_y, font_size)?;
+    if radius_x.is_definitely_negative() || radius_y.is_definitely_negative() {
+        return None;
+    }
+    let mut rotation_radians = 0.0;
+    let mut large = false;
+    let mut clockwise = true;
+    for value in tail {
+        match value.to_ascii_lowercase().as_str() {
+            "large" => large = true,
+            "small" => large = false,
+            "cw" | "clockwise" => clockwise = true,
+            "ccw" | "counterclockwise" => clockwise = false,
+            _ if rotation_radians == 0.0 => rotation_radians = parse_css_angle_radians(value)?,
+            _ => return None,
+        }
+    }
+    Some(ShapeCommand::Arc {
+        direction,
+        point,
+        radius_x,
+        radius_y,
+        rotation_radians,
+        large,
+        clockwise,
+    })
 }
 
 fn parse_shape_polygon(value: &str, font_size: f32) -> Option<ShapePolygon> {
@@ -614,6 +832,88 @@ fn parse_shape_position_component(
             Some(ComputedLengthPercentage::from_percent(1.0))
         }
         _ => parse_computed_length_percentage(value, font_size),
+    }
+}
+
+#[cfg(test)]
+mod shape_outside_tests {
+    use super::*;
+
+    #[test]
+    fn shape_outside_path_requires_one_valid_svg_string() {
+        let valid = parse_shape_outside_with_urls(
+            "path(evenodd, 'M 0 0 L 20 0 L 20 20 Z')",
+            ROOT_FONT_SIZE_PT,
+            None,
+            None,
+        );
+        assert!(matches!(
+            valid,
+            Some(ShapeOutside::Basic {
+                shape: BasicShape::Path(ShapePath {
+                    fill_rule: ShapeFillRule::EvenOdd,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(
+            parse_shape_outside_with_urls(
+                "path('M 0 0 NOT-A-PATH')",
+                ROOT_FONT_SIZE_PT,
+                None,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            parse_shape_outside_with_urls("path('M 0 0', 'M 1 1')", ROOT_FONT_SIZE_PT, None, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shape_outside_shape_retains_all_command_kinds() {
+        let parsed = parse_shape_outside_with_urls(
+            "shape(from 0px 0px, move by 1px 1px, line to 20px 0px, hline by 5px, vline to 20px, curve to 20px 20px with 10px 0px / 20px 10px, smooth by 5px 0px with 5px 5px, arc to 0px 20px of 5px 10px 30deg large ccw, close)",
+            ROOT_FONT_SIZE_PT,
+            None,
+            None,
+        );
+        let Some(ShapeOutside::Basic {
+            shape: BasicShape::Shape(shape),
+            ..
+        }) = parsed
+        else {
+            panic!("shape() should parse");
+        };
+        assert!(matches!(shape.commands[0], ShapeCommand::Move { .. }));
+        assert!(matches!(shape.commands[1], ShapeCommand::Line { .. }));
+        assert!(matches!(
+            shape.commands[2],
+            ShapeCommand::HorizontalLine { .. }
+        ));
+        assert!(matches!(
+            shape.commands[3],
+            ShapeCommand::VerticalLine { .. }
+        ));
+        assert!(matches!(shape.commands[4], ShapeCommand::Curve { .. }));
+        assert!(matches!(shape.commands[5], ShapeCommand::Smooth { .. }));
+        assert!(matches!(shape.commands[6], ShapeCommand::Arc { .. }));
+        assert!(matches!(shape.commands[7], ShapeCommand::Close));
+    }
+
+    #[test]
+    fn shape_outside_shape_rejects_invalid_complete_declarations() {
+        assert!(
+            parse_shape_outside_with_urls(
+                "shape(from 0px 0px, curve to 10px 10px with 1px 1px, close)",
+                ROOT_FONT_SIZE_PT,
+                None,
+                None,
+            )
+            .is_none()
+        );
     }
 }
 

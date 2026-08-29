@@ -55,6 +55,24 @@ mod tests {
     }
 
     #[test]
+    fn cyclic_max_height_does_not_clamp_a_fixed_intrinsic_height() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.height = css::PhysicalHeight::from_computed(length(100.0));
+        style.box_values.max_height = cyclic_length(0.0, 1.0);
+
+        let contributions = contribution(&style, 0.0, 0.0, 0.0);
+
+        assert_eq!(
+            contributions.min.content_box_length(),
+            content_box_pt(100.0)
+        );
+        assert_eq!(
+            contributions.max.content_box_length(),
+            content_box_pt(100.0)
+        );
+    }
+
+    #[test]
     fn border_box_physical_height_converts_to_content_box_before_contributing() {
         let mut style = ComputedStyle::initial();
         style.box_sizing = css::BoxSizing::BorderBox;
@@ -141,11 +159,11 @@ fn non_replaced_intrinsic_physical_height_contributions(
     descendant_max: ContentBoxLength,
     vertical_non_content: NonContentLength,
 ) -> IntrinsicPhysicalHeightContributions {
-    let percentage_basis = PercentageBasis::<ContentBoxLength>::indefinite();
-    let constrain = |value| constrain_content_height(style, value, percentage_basis);
+    let context = DescendantBlockPercentageContext::ContentSized;
+    let constrain = |value| constrain_non_replaced_content_height(style, value, context);
 
     if let Some(height) =
-        used_content_box_height_or_auto_with_basis(style, percentage_basis, vertical_non_content)
+        used_non_replaced_content_box_height_or_auto(style, context, vertical_non_content)
     {
         let height = PhysicalContentHeight::new(constrain(height));
         return IntrinsicPhysicalHeightContributions {
@@ -1566,11 +1584,10 @@ impl<'a> LayoutBuilder<'a> {
         let border_edges = box_metrics.border;
         let horizontal_extras = box_metrics.horizontal_non_content_length();
         let vertical_extras = box_metrics.vertical_non_content_length();
-        let containing_block_content_height = self
-            .definite_block_size_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(PercentageBasis::indefinite);
+        let containing_block_percentage_context =
+            self.block_percentage_context_stack.current_context();
+        let containing_block_content_height =
+            containing_block_percentage_context.percentage_basis();
         let containing_block_stretch_height = containing_block_content_height
             .map_value(crate::units::IntoLayoutLength::into_layout_length)
             .value()
@@ -1653,7 +1670,8 @@ impl<'a> LayoutBuilder<'a> {
                     .then_some(containing_block_content_height)
                 });
             let pushed_definite_height = descendant_percentage_basis.map(|basis| {
-                self.definite_block_size_stack.push(basis);
+                self.block_percentage_context_stack
+                    .push_percentage_basis(basis);
             });
             let sizes = self.block_intrinsic_physical_widths(
                 element,
@@ -1663,7 +1681,7 @@ impl<'a> LayoutBuilder<'a> {
                 available_outer_width.points(),
             );
             if pushed_definite_height.is_some() {
-                self.definite_block_size_stack.pop();
+                self.block_percentage_context_stack.pop();
             }
             Some(sizes)
         } else {
@@ -1819,13 +1837,21 @@ impl<'a> LayoutBuilder<'a> {
             .flatten()
             .map(|height| {
                 unconstrained_aspect_height = Some(height);
-                constrain_height_with_stretch_fit(
-                    &used_style,
-                    content_box_pt(height),
-                    containing_block_stretch_height,
-                    layout_pt(used_style.margin.top + used_style.margin.bottom),
-                    vertical_extras,
-                )
+                if containing_block_percentage_context.is_definite() {
+                    constrain_height_with_stretch_fit(
+                        &used_style,
+                        content_box_pt(height),
+                        containing_block_stretch_height,
+                        layout_pt(used_style.margin.top + used_style.margin.bottom),
+                        vertical_extras,
+                    )
+                } else {
+                    constrain_non_replaced_content_height(
+                        &used_style,
+                        content_box_pt(height),
+                        containing_block_percentage_context,
+                    )
+                }
                 .points()
             });
         // A min/max block-size constraint can change the auto axis selected
@@ -1901,6 +1927,7 @@ impl<'a> LayoutBuilder<'a> {
             border_edges,
             vertical_non_content: vertical_extras,
             containing_block_content_height,
+            containing_block_percentage_context,
             definite_content_height,
             content_logical_inline_size,
             selected_orthogonal_inline_layout,

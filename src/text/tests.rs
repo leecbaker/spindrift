@@ -1270,6 +1270,82 @@ async fn font_size_adjust_from_font_keeps_its_primary_metric_across_unicode_rang
 }
 
 #[tokio::test]
+async fn selected_font_run_metrics_follow_unicode_range_and_used_size() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: ArabicRun;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+                unicode-range: U+0627;
+                size-adjust: 50%;
+            }
+            @font-face {
+                font-family: LatinRun;
+                src: url("tests/fixtures/wpt/css/css-fonts/Ahem.ttf");
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut style = ComputedStyle::initial();
+    style.font_size = 60.0;
+    style.font_family = FontFamily::List(vec![
+        FontFamily::Names(vec!["ArabicRun".to_string()]),
+        FontFamily::Names(vec!["LatinRun".to_string()]),
+    ]);
+
+    let shaped = system
+        .shape_unwrapped_line("\u{0627}A", &style, style.line_height)
+        .expect("mixed selected-font line");
+    let arabic_run = shaped
+        .runs
+        .iter()
+        .find(|run| run.text.contains('\u{0627}'))
+        .expect("Arabic unicode-range run");
+    let latin_run = shaped
+        .runs
+        .iter()
+        .find(|run| run.text.contains('A'))
+        .expect("Latin fallback run");
+    let arabic_font = arabic_run.font_id.expect("Arabic selected font");
+    let latin_font = latin_run.font_id.expect("Latin selected font");
+
+    assert!(
+        (arabic_run.font_size - 30.0).abs() < 0.01,
+        "the selected face's size-adjust must be retained on the shaped run"
+    );
+    let arabic_metrics = system
+        .resolved_inline_text_metrics_for_selected_font(&style, arabic_font, arabic_run.font_size)
+        .expect("Arabic selected-font metrics");
+    let latin_metrics = system
+        .resolved_inline_text_metrics_for_selected_font(&style, latin_font, latin_run.font_size)
+        .expect("Latin selected-font metrics");
+    assert!(
+        (arabic_metrics.line.block_size().points() - latin_metrics.line.block_size().points())
+            .abs()
+            > 0.01,
+        "normal line metrics must come from each selected font run"
+    );
+
+    let mut explicit = style.clone();
+    explicit.line_height = 48.0;
+    explicit.line_height_value = ComputedLineHeight::from_points(48.0);
+    for (font_id, run) in [(arabic_font, arabic_run), (latin_font, latin_run)] {
+        let metrics = system
+            .resolved_inline_text_metrics_for_selected_font(&explicit, font_id, run.font_size)
+            .expect("explicit selected-font metrics");
+        assert!(
+            (metrics.line.block_size().points() - 48.0).abs() < 0.01,
+            "explicit line-height must remain fixed for every selected font run"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unicode_range_selection_keeps_authored_style_and_shapes_both_parley_paths() {
     let stylesheet = parse_stylesheet(
         &Css::from_string(
@@ -2668,28 +2744,48 @@ async fn explicit_join_control_suppresses_synthetic_boundary_joiner() {
 }
 
 #[tokio::test]
-async fn other_space_separators_emit_blank_glyphs_with_original_unicode() {
+async fn other_space_separators_remain_paintable_shaped_text() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
     style.font_family = FontFamily::SansSerif;
     style.font_size = 12.0;
 
-    let space_glyph = system
-        .shape_text_runs_with_parley(" ", &style)
-        .into_iter()
-        .flat_map(|run| run.glyphs)
-        .next()
-        .unwrap();
-    let en_space_glyph = system
-        .shape_text_runs_with_parley("\u{2002}", &style)
-        .into_iter()
-        .flat_map(|run| run.glyphs)
-        .next()
-        .unwrap();
+    for character in ['\u{2002}', '\u{3000}'] {
+        let text = character.to_string();
+        let glyph = system
+            .shape_text_runs_with_parley(&text, &style)
+            .into_iter()
+            .flat_map(|run| run.glyphs)
+            .next()
+            .unwrap();
 
-    assert_eq!(en_space_glyph.painted_id(), space_glyph.painted_id());
-    assert_eq!(en_space_glyph.unicode, "\u{2002}");
-    assert!(en_space_glyph.x_advance > 0.0);
+        assert!(!glyph.is_advance_only(), "{character:?}: {glyph:?}");
+        assert!(glyph.painted_id().is_some(), "{character:?}: {glyph:?}");
+        assert_eq!(glyph.unicode, text, "{character:?}: {glyph:?}");
+        assert!(glyph.x_advance > 0.0, "{character:?}: {glyph:?}");
+
+        let styled = system.shape_styled_text_runs_with_parley(&[StyledTextSpan {
+            text: &text,
+            style: &style,
+        }]);
+        let styled_run = styled
+            .iter()
+            .find(|run| run.text.as_ref() == text)
+            .expect("styled separator run");
+        assert!(
+            !styled_run.glyphs[0].is_advance_only(),
+            "{character:?}: {styled_run:?}"
+        );
+        assert!(
+            styled_run.glyphs[0].painted_id().is_some(),
+            "{character:?}: {styled_run:?}"
+        );
+        assert_eq!(
+            styled_run.glyph_source_ranges,
+            vec![Some(0..text.len())],
+            "{character:?}: {styled_run:?}"
+        );
+    }
 }
 
 #[tokio::test]

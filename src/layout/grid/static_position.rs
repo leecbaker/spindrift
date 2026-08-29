@@ -1,3 +1,4 @@
+use super::model::GridAxisTopology;
 use super::*;
 
 /// Input geometry for an abspos grid child's static-position calculation.
@@ -13,6 +14,8 @@ pub(super) struct PositionedGridStaticContext<'a> {
     pub(super) content_top: f32,
     pub(super) definite_content_height: Option<PhysicalContentHeight>,
     pub(super) content_height: PhysicalContentHeight,
+    pub(super) columns: &'a GridAxisTopology,
+    pub(super) rows: &'a GridAxisTopology,
     pub(super) column_line_offsets: &'a [f32],
     pub(super) row_line_offsets: &'a [f32],
     /// The Grid padding box when this Grid establishes the child's actual
@@ -48,8 +51,8 @@ pub(in crate::layout) struct GridPositioningScope {
     inner_width: PhysicalContentWidth,
     content_top: f32,
     content_height: PhysicalContentHeight,
-    column_line_offsets: Vec<f32>,
-    row_line_offsets: Vec<f32>,
+    columns: GridAxisTopology,
+    rows: GridAxisTopology,
     containing_block: ContainingBlock,
 }
 
@@ -165,8 +168,8 @@ impl GridPositioningScope {
             inner_width: geometry.inner_width,
             content_top: geometry.content_top,
             content_height: geometry.content_height,
-            column_line_offsets: geometry.column_line_offsets.to_vec(),
-            row_line_offsets: geometry.row_line_offsets.to_vec(),
+            columns: geometry.columns.clone(),
+            rows: geometry.rows.clone(),
             containing_block,
         }
     }
@@ -199,8 +202,8 @@ impl GridPositioningScope {
                 &self.container_style,
                 style,
                 content_area,
-                &self.column_line_offsets,
-                &self.row_line_offsets,
+                &self.columns,
+                &self.rows,
             )
             .unwrap_or(content_area);
             let area = grid_abspos_static_position_area(
@@ -299,8 +302,8 @@ fn grid_explicit_placement_area(
     container_style: &ComputedStyle,
     child_style: &ComputedStyle,
     content_area: PageTopRect,
-    column_line_offsets: &[f32],
-    row_line_offsets: &[f32],
+    columns: &GridAxisTopology,
+    rows: &GridAxisTopology,
 ) -> Option<PageTopRect> {
     let axes = WritingModeAxes::new(
         container_style.writing_mode,
@@ -312,8 +315,8 @@ fn grid_explicit_placement_area(
         child_style,
         &axes,
         content_area,
-        column_line_offsets,
-        row_line_offsets,
+        columns,
+        rows,
     )?;
     let (block_start, block_end) = grid_static_logical_axis_range(
         LogicalAxis::Block,
@@ -321,8 +324,8 @@ fn grid_explicit_placement_area(
         child_style,
         &axes,
         content_area,
-        column_line_offsets,
-        row_line_offsets,
+        columns,
+        rows,
     )?;
 
     let mut left = content_area.x();
@@ -367,8 +370,8 @@ fn grid_static_logical_axis_range(
     child_style: &ComputedStyle,
     axes: &WritingModeAxes,
     content_area: PageTopRect,
-    column_line_offsets: &[f32],
-    row_line_offsets: &[f32],
+    columns: &GridAxisTopology,
+    rows: &GridAxisTopology,
 ) -> Option<(f32, f32)> {
     let (tracks, auto_tracks, start, end, gap, content_alignment) = match axis {
         LogicalAxis::Inline => (
@@ -388,10 +391,16 @@ fn grid_static_logical_axis_range(
             container_style.align_content,
         ),
     };
-    let line_offsets = match axes.physical_axis(axis) {
-        PhysicalAxis::Horizontal => column_line_offsets,
-        PhysicalAxis::Vertical => row_line_offsets,
+    let physical_topology = match axes.physical_axis(axis) {
+        PhysicalAxis::Horizontal => columns,
+        PhysicalAxis::Vertical => rows,
     };
+    let logical_topology = if axes.is_reversed(axis) {
+        physical_topology.reversed()
+    } else {
+        physical_topology.clone()
+    };
+    let line_offsets = logical_topology.line_offsets();
     let container_size = match axes.physical_axis(axis) {
         PhysicalAxis::Horizontal => content_area.width(),
         PhysicalAxis::Vertical => content_area.height(),
@@ -403,20 +412,20 @@ fn grid_static_logical_axis_range(
         // <https://www.w3.org/TR/css-grid-1/#abspos-items>
         return Some((0.0, container_size));
     }
-    let resolved_start = grid_static_line_offset(
+    let resolved_start = grid_static_line_position(
         tracks,
         auto_tracks,
         start,
-        line_offsets,
+        &line_offsets,
         gap.clone(),
         content_alignment,
         container_size,
     );
-    let resolved_end = grid_static_line_offset(
+    let resolved_end = grid_static_line_position(
         tracks,
         auto_tracks,
         end,
-        line_offsets,
+        &line_offsets,
         gap,
         content_alignment,
         container_size,
@@ -428,12 +437,22 @@ fn grid_static_logical_axis_range(
     // implicit lines because the probe does not materialize them.
     // <https://www.w3.org/TR/css-grid-1/#abspos-items>
     let start = match (resolved_start, end) {
-        (Some(start), _) => start,
-        (None, css::GridPlacement::Auto) => resolved_end?,
+        (Some(start), _) => start.offset,
+        (None, css::GridPlacement::Auto) => resolved_end?.offset,
         (None, _) => return None,
     };
     let end = match (resolved_end, start) {
-        (Some(end), _) => end,
+        (Some(end), _) => u16::try_from(end.line_index)
+            .ok()
+            .and_then(|line| {
+                logical_topology.aligned_area_bounds(
+                    content_alignment,
+                    container_size,
+                    line.checked_sub(1)?,
+                    line,
+                )
+            })
+            .map_or(end.offset, |(_, edge)| edge),
         (None, _) if matches!(end, css::GridPlacement::Auto) => start,
         (None, _) => return None,
     };
@@ -477,8 +496,8 @@ pub(super) struct GridPositioningGeometry<'a> {
     pub(super) inner_width: PhysicalContentWidth,
     pub(super) content_top: f32,
     pub(super) content_height: PhysicalContentHeight,
-    pub(super) column_line_offsets: &'a [f32],
-    pub(super) row_line_offsets: &'a [f32],
+    pub(super) columns: &'a GridAxisTopology,
+    pub(super) rows: &'a GridAxisTopology,
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -784,8 +803,8 @@ impl<'a> LayoutBuilder<'a> {
                 context.inner_width.points(),
                 row_container_size,
             ),
-            context.column_line_offsets,
-            context.row_line_offsets,
+            context.columns,
+            context.rows,
         )
         .unwrap_or(probed_placement_area);
         let static_area = grid_abspos_static_position_area(
@@ -955,6 +974,27 @@ fn grid_static_line_offset(
     content_alignment: css::ContentAlignment,
     container_size: f32,
 ) -> Option<f32> {
+    grid_static_line_position(
+        tracks,
+        auto_tracks,
+        placement,
+        line_offsets,
+        gap,
+        content_alignment,
+        container_size,
+    )
+    .map(|line| line.offset)
+}
+
+fn grid_static_line_position(
+    tracks: &css::GridTrackList,
+    auto_tracks: &css::GridAutoTrackList,
+    placement: &css::GridPlacement,
+    line_offsets: &[f32],
+    gap: css::ComputedGap,
+    content_alignment: css::ContentAlignment,
+    container_size: f32,
+) -> Option<ResolvedGridStaticLine> {
     let after_explicit_implicit_line = grid_static_placement_is_after_explicit_line(
         tracks,
         auto_tracks,
@@ -979,7 +1019,7 @@ fn grid_static_line_offset(
             },
         );
         return from_layout.or_else(|| {
-            grid_line_static_offset(
+            grid_line_static_position(
                 tracks,
                 auto_tracks,
                 placement,
@@ -995,7 +1035,7 @@ fn grid_static_line_offset(
     // would place an abspos item at a track's trailing edge instead of the
     // following grid line. Intrinsic and auto-repeat tracks still fall back
     // to the final layout geometry below.
-    grid_line_static_offset(
+    grid_line_static_position(
         tracks,
         auto_tracks,
         placement,
@@ -1004,7 +1044,7 @@ fn grid_static_line_offset(
         container_size,
     )
     .or_else(|| {
-        grid_layout_line_static_offset(
+        grid_layout_line_static_position(
             tracks,
             auto_tracks,
             placement,
@@ -1059,6 +1099,7 @@ fn grid_static_placement_is_after_explicit_line(
 /// a partial grid:
 /// <https://www.w3.org/TR/css-grid-1/#abspos-items> and
 /// <https://www.w3.org/TR/css-grid-1/#auto-repeat>.
+#[cfg(test)]
 fn grid_layout_line_static_offset(
     tracks: &css::GridTrackList,
     auto_tracks: &css::GridAutoTrackList,
@@ -1068,6 +1109,27 @@ fn grid_layout_line_static_offset(
     content_alignment: css::ContentAlignment,
     container_size: f32,
 ) -> Option<f32> {
+    grid_layout_line_static_position(
+        tracks,
+        auto_tracks,
+        placement,
+        line_offsets,
+        gap,
+        content_alignment,
+        container_size,
+    )
+    .map(|line| line.offset)
+}
+
+fn grid_layout_line_static_position(
+    tracks: &css::GridTrackList,
+    auto_tracks: &css::GridAutoTrackList,
+    placement: &css::GridPlacement,
+    line_offsets: &[f32],
+    gap: css::ComputedGap,
+    content_alignment: css::ContentAlignment,
+    container_size: f32,
+) -> Option<ResolvedGridStaticLine> {
     grid_layout_line_static_offset_with_inferred_gaps(
         tracks,
         auto_tracks,
@@ -1077,7 +1139,10 @@ fn grid_layout_line_static_offset(
         GridLayoutLineStaticOffsetOptions {
             content_alignment,
             container_size,
-            include_inferred_gaps: true,
+            // Taffy 0.14's detailed track positions retain the used gap in
+            // the topology that reaches this static-position path. Adding
+            // the authored gap again would shift every later explicit line.
+            include_inferred_gaps: false,
         },
     )
 }
@@ -1096,7 +1161,7 @@ fn grid_layout_line_static_offset_with_inferred_gaps(
     line_offsets: &[f32],
     gap: css::ComputedGap,
     options: GridLayoutLineStaticOffsetOptions,
-) -> Option<f32> {
+) -> Option<ResolvedGridStaticLine> {
     let css::GridPlacement::Line(_) = placement else {
         return None;
     };
@@ -1135,12 +1200,13 @@ fn grid_layout_line_static_offset_with_inferred_gaps(
             gap,
             options.container_size,
         )?;
-        return content_aligned_grid_line_offset(
+        let offset = content_aligned_grid_line_offset(
             options.content_alignment,
             options.container_size,
             &line_offsets.offsets,
             line_offsets.offset_index(line_index)?,
-        );
+        )?;
+        return Some(ResolvedGridStaticLine { line_index, offset });
     };
     let (components, trailing_names) = match tracks {
         css::GridTrackList::Tracks {
@@ -1189,12 +1255,13 @@ fn grid_layout_line_static_offset_with_inferred_gaps(
     } else {
         line_offsets
     };
-    content_aligned_grid_line_offset(
+    let offset = content_aligned_grid_line_offset(
         options.content_alignment,
         options.container_size,
         line_offsets,
         offset_index,
-    )
+    )?;
+    Some(ResolvedGridStaticLine { line_index, offset })
 }
 
 fn grid_track_list_components(

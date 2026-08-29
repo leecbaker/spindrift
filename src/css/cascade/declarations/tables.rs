@@ -39,7 +39,7 @@ pub(in crate::css) fn apply_cascaded_table_declaration(
         }
         "border-spacing" => {
             if let Some(spacing) = parse_border_spacing(value, style.font_size) {
-                style.border_spacing = TableBorderSpacing::from_declaration(
+                style.border_spacing = CascadedTableBorderSpacing::from_declaration(
                     spacing,
                     declaration.origin == StylesheetOrigin::Author,
                 );

@@ -92,26 +92,26 @@ pub(crate) fn physical_padding_side_longhand(side: BoxSide) -> &'static str {
 pub(crate) fn parse_edge_values(
     value: &str,
     font_size: f32,
-) -> Option<CssEdges<ComputedLengthPercentage>> {
+) -> Option<PhysicalEdges<ComputedLengthPercentage>> {
     let values = split_css_component_values(value)
         .into_iter()
         .map(|part| parse_computed_length_percentage(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
-        [all] => Some(CssEdges::all(all.clone())),
-        [vertical, horizontal] => Some(CssEdges {
+        [all] => Some(PhysicalEdges::all(all.clone())),
+        [vertical, horizontal] => Some(PhysicalEdges {
             top: vertical.clone(),
             right: horizontal.clone(),
             bottom: vertical.clone(),
             left: horizontal.clone(),
         }),
-        [top, horizontal, bottom] => Some(CssEdges {
+        [top, horizontal, bottom] => Some(PhysicalEdges {
             top: top.clone(),
             right: horizontal.clone(),
             bottom: bottom.clone(),
             left: horizontal.clone(),
         }),
-        [top, right, bottom, left] => Some(CssEdges {
+        [top, right, bottom, left] => Some(PhysicalEdges {
             top: top.clone(),
             right: right.clone(),
             bottom: bottom.clone(),
@@ -124,26 +124,26 @@ pub(crate) fn parse_edge_values(
 pub(crate) fn parse_margin_edge_values(
     value: &str,
     font_size: f32,
-) -> Option<CssEdges<ComputedLengthPercentageOrAuto>> {
+) -> Option<PhysicalEdges<ComputedLengthPercentageOrAuto>> {
     let values = split_css_component_values(value)
         .into_iter()
         .map(|part| parse_computed_length_percentage_auto(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
-        [all] => Some(CssEdges::all(all.clone())),
-        [vertical, horizontal] => Some(CssEdges {
+        [all] => Some(PhysicalEdges::all(all.clone())),
+        [vertical, horizontal] => Some(PhysicalEdges {
             top: vertical.clone(),
             right: horizontal.clone(),
             bottom: vertical.clone(),
             left: horizontal.clone(),
         }),
-        [top, horizontal, bottom] => Some(CssEdges {
+        [top, horizontal, bottom] => Some(PhysicalEdges {
             top: top.clone(),
             right: horizontal.clone(),
             bottom: bottom.clone(),
             left: horizontal.clone(),
         }),
-        [top, right, bottom, left] => Some(CssEdges {
+        [top, right, bottom, left] => Some(PhysicalEdges {
             top: top.clone(),
             right: right.clone(),
             bottom: bottom.clone(),

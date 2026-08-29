@@ -26,6 +26,8 @@ impl NonTSPseudoClass for QuirePseudoClass {
 pub(crate) enum QuirePseudoElement {
     Before,
     After,
+    ScrollMarker,
+    ScrollMarkerGroup,
     FootnoteCall,
     FootnoteMarker,
     Marker,
@@ -41,6 +43,8 @@ impl ToCss for QuirePseudoElement {
         dest.write_str(match self {
             QuirePseudoElement::Before => "::before",
             QuirePseudoElement::After => "::after",
+            QuirePseudoElement::ScrollMarker => "::scroll-marker",
+            QuirePseudoElement::ScrollMarkerGroup => "::scroll-marker-group",
             QuirePseudoElement::FootnoteCall => "::footnote-call",
             QuirePseudoElement::FootnoteMarker => "::footnote-marker",
             QuirePseudoElement::Marker => "::marker",
@@ -138,6 +142,12 @@ pub(crate) enum QuirePseudoClass {
     StaticFalse(&'static str),
     Target,
     TargetWithin,
+    /// Static-render approximation of CSS Overflow 5's selected marker.
+    /// The render topology promotes the indicated fragment target to current;
+    /// no interactive scrolling state exists in a PDF render.
+    TargetCurrent,
+    TargetBefore,
+    TargetAfter,
     Open,
     Defined,
     Enabled,
@@ -171,6 +181,9 @@ impl ToCss for QuirePseudoClass {
             Self::StaticFalse(name) => write!(dest, ":{name}"),
             Self::Target => dest.write_str(":target"),
             Self::TargetWithin => dest.write_str(":target-within"),
+            Self::TargetCurrent => dest.write_str(":target-current"),
+            Self::TargetBefore => dest.write_str(":target-before"),
+            Self::TargetAfter => dest.write_str(":target-after"),
             Self::Open => dest.write_str(":open"),
             Self::Defined => dest.write_str(":defined"),
             Self::Enabled => dest.write_str(":enabled"),

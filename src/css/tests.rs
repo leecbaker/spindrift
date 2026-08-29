@@ -2554,6 +2554,7 @@ async fn namespace_selectors_match_namespaced_type_and_attribute_signatures() {
          @namespace xlink \"http://www.w3.org/1999/xlink\";\
          html|p { color: lime }\
          svg|use[xlink|href] { color: blue }\
+         svg|use[*|href] { background-color: red }\
          svg|rect { background-color: red }",
     ));
     let mut paragraph = ElementSignature::new("p", HashMap::new());
@@ -2590,9 +2591,45 @@ async fn namespace_selectors_match_namespaced_type_and_attribute_signatures() {
     assert_eq!(html_style.color, CssColor::new(0, 255, 0));
     assert_eq!(use_style.color, CssColor::new(0, 0, 255));
     assert_eq!(
+        use_style.background.background_color.color(),
+        Some(CssColor::new(255, 0, 0))
+    );
+    assert_eq!(
         wrong_namespace_style.background.background_color.color(),
         Some(CssColor::TRANSPARENT)
     );
+}
+
+#[tokio::test]
+async fn parser_first_pseudo_routing_preserves_html_attribute_selector_branches() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "[data-kind=lead], p::before { color: red; content: \"generated\" }\
+         [|data-kind=lead] { border-top-color: lime }\
+         [dir=RTL i] { background-color: blue }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "p",
+            HashMap::from([
+                ("data-kind".to_string(), "lead".to_string()),
+                ("dir".to_string(), "RTL".to_string()),
+            ]),
+        ),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+
+    assert_eq!(stylesheet.rules.len(), 3);
+    assert_eq!(stylesheet.before_rules.len(), 1);
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 255, 0));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::new(0, 0, 255))
+    );
+    assert!(style.before_style.is_some());
 }
 
 #[tokio::test]
@@ -5726,6 +5763,24 @@ fn parses_css_scroll_snap_longhands_shorthands_and_logical_edges() {
     );
 }
 
+#[test]
+fn parses_css_scroll_marker_properties() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("scroll-target-group: auto; scroll-marker-group: after tabs"),
+    );
+
+    assert_eq!(style.scroll_target_group, ScrollTargetGroup::Auto);
+    assert_eq!(
+        style.scroll_marker_group,
+        Some(ScrollMarkerGroup {
+            placement: ScrollMarkerGroupPlacement::After,
+            mode: ScrollMarkerGroupMode::Tabs,
+        })
+    );
+}
+
 #[tokio::test]
 async fn parses_css_text_transform_full_width_and_kana_values() {
     let mut style = default_style_for_tag("p");
@@ -6079,7 +6134,7 @@ async fn parses_inline_vertical_align_subset() {
     );
     assert_eq!(
         style.vertical_align.table_cell_align,
-        TableCellVerticalAlign::Middle
+        TableCellVerticalAlignKeyword::Middle
     );
 
     let declarations = parse_declarations("vertical-align: calc(3pt + 25%)");
@@ -6122,7 +6177,7 @@ async fn parses_inline_vertical_align_subset() {
     apply_declarations(&mut style, &declarations);
     assert_eq!(
         style.vertical_align.table_cell_align,
-        TableCellVerticalAlign::Top
+        TableCellVerticalAlignKeyword::Top
     );
     assert_eq!(
         style.vertical_align.alignment_baseline,
@@ -8586,6 +8641,94 @@ async fn parses_marker_pseudo_element_rules() {
 }
 
 #[tokio::test]
+async fn parses_scroll_marker_pseudo_element_rules_and_target_state() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "section::scroll-marker { content: \"•\" } \
+         section::scroll-marker-group { display: flex } \
+         section::scroll-marker:target-current { color: red }",
+    ));
+
+    assert_eq!(stylesheet.scroll_marker_rules.len(), 2);
+    assert_eq!(stylesheet.scroll_marker_group_rules.len(), 1);
+    assert_eq!(
+        stylesheet.scroll_marker_rules[1].selector_text,
+        "section:target-current"
+    );
+}
+
+#[tokio::test]
+async fn nested_scroll_marker_rules_keep_typed_pseudo_routes() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".scroller { &::scroll-marker-group { display: grid } } \
+         .target { &::scroll-marker { content: \"marker\" } \
+                   &::scroll-marker:target-current { color: red } } \
+         .host { &::scroll-marker, & .ordinary { content: \"mixed\" } } \
+         .outer { .inner { &::scroll-marker { content: \"nested\" } } }",
+    ));
+
+    assert_eq!(stylesheet.scroll_marker_group_rules.len(), 1);
+    assert_eq!(stylesheet.scroll_marker_rules.len(), 4);
+    assert_eq!(stylesheet.rules.len(), 1);
+    assert!(stylesheet.rules[0].selector_text.contains(".ordinary"));
+    assert!(
+        stylesheet
+            .scroll_marker_rules
+            .iter()
+            .all(|rule| !rule.selector_text.contains("scroll-marker"))
+    );
+    assert!(
+        stylesheet
+            .scroll_marker_rules
+            .iter()
+            .any(|rule| rule.selector_text.contains(":target-current"))
+    );
+    assert!(
+        stylesheet
+            .scroll_marker_rules
+            .iter()
+            .any(|rule| rule.selector_text.contains(".outer")
+                && rule.selector_text.contains(".inner"))
+    );
+
+    let scroller = style_for_element_with_signature(
+        ElementSignature::new(
+            "div",
+            HashMap::from([("class".to_string(), "scroller".to_string())]),
+        ),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    assert!(!scroller.display.is_grid());
+    assert!(
+        scroller
+            .scroll_marker_group_style
+            .as_deref()
+            .is_some_and(|style| style.display.is_grid())
+    );
+
+    let mut target = ElementSignature::new(
+        "div",
+        HashMap::from([("class".to_string(), "target".to_string())]),
+    );
+    target.is_target = true;
+    let target = style_for_element_with_signature(
+        target,
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let marker = target
+        .scroll_marker_style
+        .as_deref()
+        .expect("nested scroll marker style");
+    assert!(marker.content.is_generated());
+    assert_eq!(marker.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
 async fn parses_markers_of_before_and_after_pseudo_elements() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "div::before, div::after { content: \"x\"; display: list-item }\
@@ -8623,6 +8766,17 @@ async fn parses_markers_of_before_and_after_pseudo_elements() {
             "after-marker".to_string()
         )]))
     );
+}
+
+#[tokio::test]
+async fn chained_marker_fallback_rejects_pseudo_class_suffixes() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p::before::marker:not(.selected) { color: red } q { color: blue }",
+    ));
+
+    assert!(stylesheet.before_marker_rules.is_empty());
+    assert_eq!(stylesheet.rules.len(), 1);
+    assert_eq!(stylesheet.rules[0].selector_text, "q");
 }
 
 #[tokio::test]
@@ -11680,11 +11834,11 @@ async fn presentational_hints_use_author_origin_zero_specificity() {
 
     assert_eq!(
         hinted.vertical_align.table_cell_align,
-        TableCellVerticalAlign::Bottom
+        TableCellVerticalAlignKeyword::Bottom
     );
     assert_eq!(
         overridden.vertical_align.table_cell_align,
-        TableCellVerticalAlign::Top
+        TableCellVerticalAlignKeyword::Top
     );
 }
 
@@ -13256,18 +13410,66 @@ async fn maps_logical_corner_radii_to_initial_physical_corners() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.value.length_points(), 1.0);
-    assert_eq!(style.border_radius.top_left.y.value.length_points(), 2.0);
-    assert_eq!(style.border_radius.top_right.x.value.length_points(), 3.0);
-    assert_eq!(style.border_radius.top_right.y.value.length_points(), 3.0);
-    assert_eq!(style.border_radius.bottom_left.x.value.length_points(), 4.0);
-    assert_eq!(style.border_radius.bottom_left.y.value.length_points(), 5.0);
     assert_eq!(
-        style.border_radius.bottom_right.x.value.length_points(),
+        style
+            .border_radius
+            .top_left
+            .horizontal
+            .value
+            .length_points(),
+        1.0
+    );
+    assert_eq!(
+        style.border_radius.top_left.vertical.value.length_points(),
+        2.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .top_right
+            .horizontal
+            .value
+            .length_points(),
+        3.0
+    );
+    assert_eq!(
+        style.border_radius.top_right.vertical.value.length_points(),
+        3.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .horizontal
+            .value
+            .length_points(),
+        4.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .vertical
+            .value
+            .length_points(),
+        5.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_right
+            .horizontal
+            .value
+            .length_points(),
         6.0
     );
     assert_eq!(
-        style.border_radius.bottom_right.y.value.length_points(),
+        style
+            .border_radius
+            .bottom_right
+            .vertical
+            .value
+            .length_points(),
         6.0
     );
 }
@@ -13284,20 +13486,68 @@ async fn maps_logical_corner_radii_through_vertical_writing_mode() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_right.x.value.length_points(), 1.0);
-    assert_eq!(style.border_radius.top_right.y.value.length_points(), 2.0);
     assert_eq!(
-        style.border_radius.bottom_right.x.value.length_points(),
+        style
+            .border_radius
+            .top_right
+            .horizontal
+            .value
+            .length_points(),
+        1.0
+    );
+    assert_eq!(
+        style.border_radius.top_right.vertical.value.length_points(),
+        2.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_right
+            .horizontal
+            .value
+            .length_points(),
         3.0
     );
     assert_eq!(
-        style.border_radius.bottom_right.y.value.length_points(),
+        style
+            .border_radius
+            .bottom_right
+            .vertical
+            .value
+            .length_points(),
         3.0
     );
-    assert_eq!(style.border_radius.top_left.x.value.length_points(), 4.0);
-    assert_eq!(style.border_radius.top_left.y.value.length_points(), 5.0);
-    assert_eq!(style.border_radius.bottom_left.x.value.length_points(), 6.0);
-    assert_eq!(style.border_radius.bottom_left.y.value.length_points(), 6.0);
+    assert_eq!(
+        style
+            .border_radius
+            .top_left
+            .horizontal
+            .value
+            .length_points(),
+        4.0
+    );
+    assert_eq!(
+        style.border_radius.top_left.vertical.value.length_points(),
+        5.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .horizontal
+            .value
+            .length_points(),
+        6.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .vertical
+            .value
+            .length_points(),
+        6.0
+    );
 }
 
 #[tokio::test]
@@ -13315,8 +13565,19 @@ async fn logical_corner_radius_revert_layer_rolls_back_physical_corner() {
         &[],
     );
 
-    assert_eq!(style.border_radius.top_left.x.value.length_points(), 7.0);
-    assert_eq!(style.border_radius.top_left.y.value.length_points(), 8.0);
+    assert_eq!(
+        style
+            .border_radius
+            .top_left
+            .horizontal
+            .value
+            .length_points(),
+        7.0
+    );
+    assert_eq!(
+        style.border_radius.top_left.vertical.value.length_points(),
+        8.0
+    );
 }
 
 #[tokio::test]
@@ -13524,18 +13785,47 @@ async fn parses_border_radius_shorthand_lengths_and_percentages() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.value.length_points(), 4.0);
-    assert_eq!(style.border_radius.top_right.x.value.length_points(), 8.0);
-    assert_eq!(
-        style.border_radius.bottom_right.x.value.length_points(),
-        4.0
-    );
-    assert_eq!(style.border_radius.bottom_left.x.value.length_points(), 8.0);
     assert_eq!(
         style
             .border_radius
             .top_left
-            .y
+            .horizontal
+            .value
+            .length_points(),
+        4.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .top_right
+            .horizontal
+            .value
+            .length_points(),
+        8.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_right
+            .horizontal
+            .value
+            .length_points(),
+        4.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .horizontal
+            .value
+            .length_points(),
+        8.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .top_left
+            .vertical
             .value
             .percentage_coefficient_or_zero(),
         0.1
@@ -13544,7 +13834,7 @@ async fn parses_border_radius_shorthand_lengths_and_percentages() {
         style
             .border_radius
             .top_right
-            .y
+            .vertical
             .value
             .percentage_coefficient_or_zero(),
         0.2
@@ -13553,7 +13843,7 @@ async fn parses_border_radius_shorthand_lengths_and_percentages() {
         style
             .border_radius
             .bottom_right
-            .y
+            .vertical
             .value
             .percentage_coefficient_or_zero(),
         0.1
@@ -13562,7 +13852,7 @@ async fn parses_border_radius_shorthand_lengths_and_percentages() {
         style
             .border_radius
             .bottom_left
-            .y
+            .vertical
             .value
             .percentage_coefficient_or_zero(),
         0.2
@@ -13581,10 +13871,10 @@ async fn border_radius_shorthand_preserves_a_zero_horizontal_radius() {
         style.border_radius.bottom_right,
         style.border_radius.bottom_left,
     ] {
-        assert_eq!(radius.x.value.length_points(), 0.0);
+        assert_eq!(radius.horizontal.value.length_points(), 0.0);
         // The initial CSS `medium` font size is 16px, i.e. 12pt at the
         // CSS reference pixel ratio. `5em` therefore resolves to 60pt.
-        assert_eq!(radius.y.value.length_points(), 60.0);
+        assert_eq!(radius.vertical.value.length_points(), 60.0);
     }
 }
 
@@ -13598,7 +13888,7 @@ async fn negative_calc_border_radius_is_clamped_at_used_value_time() {
         style
             .border_radius
             .top_left
-            .x
+            .horizontal
             .resolve(PercentageBasis::definite(layout_pt(100.0))),
         layout_pt(0.0)
     );
@@ -13611,25 +13901,25 @@ async fn ch_border_radius_preserves_font_metric_component_until_used_resolution(
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.border_radius.top_left.x.value,
+        style.border_radius.top_left.horizontal.value,
         ComputedLengthPercentage::from_ch(2.0)
     );
     assert_eq!(
-        style.border_radius.top_right.x.value,
+        style.border_radius.top_right.horizontal.value,
         ComputedLengthPercentage::from_points(1.0)
     );
 
     style.resolve_font_metric_lengths(layout_pt(6.0));
 
     assert_eq!(
-        style.border_radius.top_left.x.value,
+        style.border_radius.top_left.horizontal.value,
         ComputedLengthPercentage::from_points(12.0)
     );
     assert_eq!(
         style
             .border_radius
             .top_left
-            .x
+            .horizontal
             .resolve(PercentageBasis::definite(layout_pt(100.0))),
         layout_pt(12.0)
     );
@@ -13642,22 +13932,40 @@ async fn parses_border_radius_corner_longhands() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.value.length_points(), 4.0);
     assert_eq!(
         style
             .border_radius
             .top_left
-            .y
+            .horizontal
+            .value
+            .length_points(),
+        4.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .top_left
+            .vertical
             .value
             .percentage_coefficient_or_zero(),
         0.1
     );
     assert_eq!(
-        style.border_radius.bottom_right.x.value.length_points(),
+        style
+            .border_radius
+            .bottom_right
+            .horizontal
+            .value
+            .length_points(),
         8.0
     );
     assert_eq!(
-        style.border_radius.bottom_right.y.value.length_points(),
+        style
+            .border_radius
+            .bottom_right
+            .vertical
+            .value
+            .length_points(),
         12.0
     );
 }
@@ -13670,12 +13978,50 @@ async fn border_side_radius_shorthands_expand_to_adjacent_corners() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.value.length_points(), 5.0);
-    assert_eq!(style.border_radius.top_left.y.value.length_points(), 6.0);
-    assert_eq!(style.border_radius.top_right.x.value.length_points(), 3.0);
-    assert_eq!(style.border_radius.top_right.y.value.length_points(), 4.0);
-    assert_eq!(style.border_radius.bottom_left.x.value.length_points(), 7.0);
-    assert_eq!(style.border_radius.bottom_left.y.value.length_points(), 8.0);
+    assert_eq!(
+        style
+            .border_radius
+            .top_left
+            .horizontal
+            .value
+            .length_points(),
+        5.0
+    );
+    assert_eq!(
+        style.border_radius.top_left.vertical.value.length_points(),
+        6.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .top_right
+            .horizontal
+            .value
+            .length_points(),
+        3.0
+    );
+    assert_eq!(
+        style.border_radius.top_right.vertical.value.length_points(),
+        4.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .horizontal
+            .value
+            .length_points(),
+        7.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .vertical
+            .value
+            .length_points(),
+        8.0
+    );
 }
 
 #[tokio::test]
@@ -13686,16 +14032,48 @@ async fn logical_border_side_radius_shorthands_follow_writing_mode() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.value.length_points(), 1.0);
-    assert_eq!(style.border_radius.top_left.y.value.length_points(), 2.0);
-    assert_eq!(style.border_radius.top_right.x.value.length_points(), 5.0);
-    assert_eq!(style.border_radius.top_right.y.value.length_points(), 6.0);
     assert_eq!(
-        style.border_radius.bottom_right.x.value.length_points(),
+        style
+            .border_radius
+            .top_left
+            .horizontal
+            .value
+            .length_points(),
+        1.0
+    );
+    assert_eq!(
+        style.border_radius.top_left.vertical.value.length_points(),
+        2.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .top_right
+            .horizontal
+            .value
+            .length_points(),
+        5.0
+    );
+    assert_eq!(
+        style.border_radius.top_right.vertical.value.length_points(),
+        6.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_right
+            .horizontal
+            .value
+            .length_points(),
         7.0
     );
     assert_eq!(
-        style.border_radius.bottom_right.y.value.length_points(),
+        style
+            .border_radius
+            .bottom_right
+            .vertical
+            .value
+            .length_points(),
         8.0
     );
 }
@@ -13811,11 +14189,11 @@ fn parses_shape_outside_rounded_inset_and_shape_box() {
     assert_eq!(inset.top.percentage_coefficient(), Some(0.1));
     assert_eq!(inset.left.length_points(), 4.0);
     assert_eq!(
-        inset.radii.top_left.x.value.length_points(),
+        inset.radii.top_left.horizontal.value.length_points(),
         5.0 * CSS_PX_TO_PT
     );
     assert_eq!(
-        inset.radii.top_left.y.value.length_points(),
+        inset.radii.top_left.vertical.value.length_points(),
         10.0 * CSS_PX_TO_PT
     );
 }
@@ -13943,19 +14321,39 @@ async fn parses_corner_shape_and_corner_shorthand() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.border_radius.top_left.x.value.length_points(),
+        style
+            .border_radius
+            .top_left
+            .horizontal
+            .value
+            .length_points(),
         36.0 * CSS_PX_TO_PT
     );
     assert_eq!(
-        style.border_radius.top_right.x.value.length_points(),
+        style
+            .border_radius
+            .top_right
+            .horizontal
+            .value
+            .length_points(),
         18.0 * CSS_PX_TO_PT
     );
     assert_eq!(
-        style.border_radius.bottom_right.x.value.length_points(),
+        style
+            .border_radius
+            .bottom_right
+            .horizontal
+            .value
+            .length_points(),
         28.0 * CSS_PX_TO_PT
     );
     assert_eq!(
-        style.border_radius.bottom_left.x.value.length_points(),
+        style
+            .border_radius
+            .bottom_left
+            .horizontal
+            .value
+            .length_points(),
         20.0 * CSS_PX_TO_PT
     );
     assert_eq!(style.corner_shapes.top_left, CornerShape::ROUND);
@@ -14027,24 +14425,66 @@ async fn revert_layer_border_radius_longhand_preserves_unaffected_shorthand_corn
         &[],
     );
 
-    assert_eq!(style.border_radius.top_left.x.value.length_points(), 3.0);
-    assert_eq!(style.border_radius.top_left.y.value.length_points(), 3.0);
-    assert_eq!(style.border_radius.top_right.x.value.length_points(), 10.0);
-    assert_eq!(style.border_radius.top_right.y.value.length_points(), 20.0);
     assert_eq!(
-        style.border_radius.bottom_right.x.value.length_points(),
+        style
+            .border_radius
+            .top_left
+            .horizontal
+            .value
+            .length_points(),
+        3.0
+    );
+    assert_eq!(
+        style.border_radius.top_left.vertical.value.length_points(),
+        3.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .top_right
+            .horizontal
+            .value
+            .length_points(),
         10.0
     );
     assert_eq!(
-        style.border_radius.bottom_right.y.value.length_points(),
+        style.border_radius.top_right.vertical.value.length_points(),
         20.0
     );
     assert_eq!(
-        style.border_radius.bottom_left.x.value.length_points(),
+        style
+            .border_radius
+            .bottom_right
+            .horizontal
+            .value
+            .length_points(),
         10.0
     );
     assert_eq!(
-        style.border_radius.bottom_left.y.value.length_points(),
+        style
+            .border_radius
+            .bottom_right
+            .vertical
+            .value
+            .length_points(),
+        20.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .horizontal
+            .value
+            .length_points(),
+        10.0
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .vertical
+            .value
+            .length_points(),
         20.0
     );
 }

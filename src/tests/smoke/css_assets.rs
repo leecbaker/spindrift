@@ -202,7 +202,7 @@ async fn inline_content_background_height_is_independent_of_line_height() {
 }
 
 #[tokio::test]
-async fn normal_line_height_uses_primary_metrics_despite_fallback_runs() {
+async fn normal_line_height_includes_selected_fallback_metrics() {
     let dir =
         std::env::temp_dir().join(format!("quire-fallback-line-height-{}", std::process::id()));
     let fonts_dir = dir.join("fonts");
@@ -247,7 +247,7 @@ async fn normal_line_height_uses_primary_metrics_despite_fallback_runs() {
         .white { background: white; }
         .red { background: red; }
         </style>
-        <p>Test passes if there is no red below.</p>
+        <p>Test passes if the selected fallback expands the red line box.</p>
         <div class="hd red">ab</div>
         <div class="h white">aa</div>"#,
     )
@@ -276,12 +276,12 @@ async fn normal_line_height_uses_primary_metrics_despite_fallback_runs() {
     assert_eq!(red.len(), 1, "red backgrounds={red:?}");
     assert_eq!(white.len(), 1, "white backgrounds={white:?}");
     assert!(
-        (red[0].y() - white[0].y()).abs() < 0.01,
-        "fallback glyph metrics must not shift the normal-line background: red={red:?} white={white:?}"
+        red[0].y() < white[0].y(),
+        "selected fallback metrics must raise the normal-line background: red={red:?} white={white:?}"
     );
     assert!(
-        (red[0].height() - white[0].height()).abs() < 0.01,
-        "fallback glyph metrics must not change the normal-line background height: red={red:?} white={white:?}"
+        red[0].height() > white[0].height(),
+        "selected fallback metrics must expand the normal-line background height: red={red:?} white={white:?}"
     );
 }
 

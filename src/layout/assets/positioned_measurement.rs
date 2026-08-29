@@ -64,94 +64,99 @@ impl<'a> LayoutBuilder<'a> {
     ) -> ContentBoxLength {
         let vertical_border_width_for_positioning =
             self.positioned_vertical_border_width(element, style, stylesheets, table_fragment);
-        let snapshot = self.snapshot();
         let principal_context = PositionedAutoBlockMeasurementPrincipalContext::new(
             self.containing_block_writing_mode,
             measurement_space,
         );
-        // Flex and grid intrinsic sizing may recursively use this same
-        // surrogate for an in-flow descendant. The snapshot below restores
-        // the enclosing measurement mode when that nested probe completes.
-        self.layout_pass_kind = LayoutPassKind::PositionedAutoSizeMeasurement;
-        self.content_left = 0.0;
-        self.content_right = measurement_space
-            .content_width
-            .points()
-            .max(style.font_size);
-        let start_page_index = self.pages.len();
-        let start_page_context = self.current_page_context;
-        self.cursor_y = self.page_top();
-        // A horizontal auto-height measurement may traverse arbitrary page
-        // fragments, so its synthetic block-axis extent remains effectively
-        // unbounded. In a vertical writing mode, however, physical height is
-        // the logical inline axis. It is the definite inline containing size
-        // used to fit the positioned box's lines; replacing it with the
-        // measurement sentinel would make a one-glyph abspos box stretch to
-        // that sentinel instead of shrink-wrapping to its containing block.
-        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
-        // <https://www.w3.org/TR/css-position-3/#abspos-layout>
-        let measurement_height = if style.writing_mode.has_vertical_lines() {
-            measurement_space
-                .available_physical_height
+        self.with_speculative_layout(|layout| {
+            // Flex and grid intrinsic sizing may recursively use this same
+            // surrogate for an in-flow descendant. The transaction restores
+            // the enclosing measurement mode and owns all descendant output.
+            layout.layout_pass_kind = LayoutPassKind::PositionedAutoSizeMeasurement;
+            layout.content_left = 0.0;
+            layout.content_right = measurement_space
+                .content_width
                 .points()
-                .max(0.0)
-        } else {
-            10_000.0
-        };
-        self.containing_blocks
-            .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
-                self.content_left,
-                self.cursor_y,
-                self.content_right - self.content_left,
-                measurement_height,
-            )));
-        // Scope the established absolute-position containing block for the
-        // principal. Entering its automatic formatting context creates the
-        // separate descendant basis, preserving cyclic descendant percentages.
-        self.definite_block_size_stack
-            .push(principal_context.principal_block_size_basis);
-        self.child_available_space_stack
-            .push(principal_context.child_available_space);
-        // Match final absolute-positioned replay: the box is an independent
-        // block formatting context, so ambient source-float exclusions cannot
-        // inflate its measured auto height.
-        // <https://www.w3.org/TR/CSS22/visuren.html#dis-pos-flo>
-        self.push_float_context();
-        // Automatic abspos sizing measures the principal formatting context,
-        // not the sequence of fragmentainers that its final layout may later
-        // occupy. Suppress both forced and automatic fragmentation here so a
-        // descendant `break-after` cannot turn page-area gaps into used
-        // content height.
-        // <https://drafts.csswg.org/css-position-3/#abspos-layout>
-        self.fragmentation_suppression_depth += 1;
-        self.layout_element_inner(
-            element,
-            style,
-            stylesheets,
-            &[],
-            child_boxes,
-            table_fragment,
-        );
-        self.fragmentation_suppression_depth -= 1;
-        self.pop_float_context();
-        self.child_available_space_stack.pop();
-        self.definite_block_size_stack.pop();
-        self.containing_blocks.pop();
-        let consumed = self
-            .positioned_measurement_fragmented_block_extent(start_page_index, start_page_context);
-        self.restore(snapshot);
-        // CSS 2.2 absolute positioning equations use content height as the
-        // `height` term and add padding/borders separately. Collapsed table
-        // borders contribute resolved outer grid insets rather than authored
-        // full border widths, so use the same vertical non-content size that
-        // will be used by the absolute-position equation.
-        content_box_pt(
-            (consumed
-                - style.padding.top
-                - style.padding.bottom
-                - vertical_border_width_for_positioning)
-                .max(0.0),
-        )
+                .max(style.font_size);
+            let start_page_index = layout.pages.len();
+            let start_page_context = layout.current_page_context;
+            layout.cursor_y = layout.page_top();
+            // A horizontal auto-height measurement may traverse arbitrary page
+            // fragments, so its synthetic block-axis extent remains effectively
+            // unbounded. In a vertical writing mode, however, physical height is
+            // the logical inline axis. It is the definite inline containing size
+            // used to fit the positioned box's lines; replacing it with the
+            // measurement sentinel would make a one-glyph abspos box stretch to
+            // that sentinel instead of shrink-wrapping to its containing block.
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+            // <https://www.w3.org/TR/css-position-3/#abspos-layout>
+            let measurement_height = if style.writing_mode.has_vertical_lines() {
+                measurement_space
+                    .available_physical_height
+                    .points()
+                    .max(0.0)
+            } else {
+                10_000.0
+            };
+            layout
+                .containing_blocks
+                .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
+                    layout.content_left,
+                    layout.cursor_y,
+                    layout.content_right - layout.content_left,
+                    measurement_height,
+                )));
+            // Scope the established absolute-position containing block for the
+            // principal. Entering its automatic formatting context creates the
+            // separate descendant basis, preserving cyclic descendant percentages.
+            layout
+                .block_percentage_context_stack
+                .push_percentage_basis(principal_context.principal_block_size_basis);
+            layout
+                .child_available_space_stack
+                .push(principal_context.child_available_space);
+            // Match final absolute-positioned replay: the box is an independent
+            // block formatting context, so ambient source-float exclusions cannot
+            // inflate its measured auto height.
+            // <https://www.w3.org/TR/CSS22/visuren.html#dis-pos-flo>
+            layout.push_float_context();
+            // Automatic abspos sizing measures the principal formatting context,
+            // not the sequence of fragmentainers that its final layout may later
+            // occupy. Suppress both forced and automatic fragmentation here so a
+            // descendant `break-after` cannot turn page-area gaps into used
+            // content height.
+            // <https://drafts.csswg.org/css-position-3/#abspos-layout>
+            layout.fragmentation_suppression_depth += 1;
+            layout.layout_element_inner(
+                element,
+                style,
+                stylesheets,
+                &[],
+                child_boxes,
+                table_fragment,
+            );
+            layout.fragmentation_suppression_depth -= 1;
+            layout.pop_float_context();
+            layout.child_available_space_stack.pop();
+            layout.block_percentage_context_stack.pop();
+            layout.containing_blocks.pop();
+            let consumed = layout.positioned_measurement_fragmented_block_extent(
+                start_page_index,
+                start_page_context,
+            );
+            // CSS 2.2 absolute positioning equations use content height as the
+            // `height` term and add padding/borders separately. Collapsed table
+            // borders contribute resolved outer grid insets rather than authored
+            // full border widths, so use the same vertical non-content size that
+            // will be used by the absolute-position equation.
+            content_box_pt(
+                (consumed
+                    - style.padding.top
+                    - style.padding.bottom
+                    - vertical_border_width_for_positioning)
+                    .max(0.0),
+            )
+        })
     }
 
     /// Returns the continuous block-axis extent traversed by a positioned

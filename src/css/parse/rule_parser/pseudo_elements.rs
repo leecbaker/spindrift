@@ -1,7 +1,6 @@
 use cssparser::Delimiter;
 
 use super::*;
-use crate::css::{LayerName, StylesheetScopeAnchor};
 
 /// Splits a selector list only at CSS Syntax comma delimiters.  This is kept
 /// with pseudo-element routing because it works on selector source retained
@@ -33,120 +32,61 @@ pub(in crate::css) fn split_selector_list(selectors: &str) -> Vec<&str> {
     parts
 }
 
-pub(in crate::css) fn split_pseudo_element_rule(
-    selector_text: &str,
-    selector_parser: &QuireSelectorParser,
-    declarations: &Declarations,
-    layer_name: Option<LayerName>,
-    scopes: Vec<ScopeRule>,
-    stylesheet_scope_anchor: StylesheetScopeAnchor,
-) -> Vec<ParsedCssRule> {
-    // CSS Pseudo-Elements 4 pseudo rules are matched against their originating
-    // elements, then applied in pseudo-specific cascade/layout paths.
-    // <https://www.w3.org/TR/css-pseudo-4/#pseudo-elements>
-    let pseudo_names = [
-        (RoutedPseudoElement::BeforeMarker, "before::marker"),
-        (RoutedPseudoElement::AfterMarker, "after::marker"),
-        (RoutedPseudoElement::Marker, "marker"),
-        (RoutedPseudoElement::Before, "before"),
-        (RoutedPseudoElement::After, "after"),
-        (RoutedPseudoElement::FootnoteCall, "footnote-call"),
-        (RoutedPseudoElement::FootnoteMarker, "footnote-marker"),
-        (RoutedPseudoElement::FirstLine, "first-line"),
-        (RoutedPseudoElement::FirstLetter, "first-letter"),
-    ];
-    let mut normal_selectors = Vec::new();
-    let mut routed_selectors = Vec::new();
-    for selector in split_selector_list(selector_text) {
-        let mut routed = false;
-        for (pseudo, name) in pseudo_names {
-            if let Some(base) = strip_pseudo_selector(selector, name) {
-                routed_selectors.push((pseudo, base.to_string()));
-                routed = true;
-                break;
-            }
-        }
-        if !routed {
-            normal_selectors.push(selector.trim().to_string());
-        }
-    }
-    if routed_selectors.is_empty() {
-        return Vec::new();
-    }
-
-    let mut rules = Vec::new();
-    if !normal_selectors.is_empty() {
-        let selector_text = normal_selectors.join(", ");
-        if let Some(selector) = parse_selector_list_text(&selector_text, selector_parser) {
-            let specificity = selector
-                .slice()
-                .iter()
-                .map(|branch| branch.specificity())
-                .max()
-                .unwrap_or(0);
-            rules.push(ParsedCssRule::Style(StyleRule {
-                selector_text,
-                selector,
-                stylesheet_scope_anchor,
-                declarations: declarations.clone(),
-                specificity,
-                order: 0,
-                layer_name: layer_name.clone(),
-                scopes: scopes.clone(),
-            }));
-        }
-    }
-    for (pseudo, _name) in pseudo_names {
-        let base_selectors = routed_selectors
-            .iter()
-            .filter_map(|(routed_pseudo, selector)| (*routed_pseudo == pseudo).then_some(selector))
-            .cloned()
-            .collect::<Vec<_>>();
-        if base_selectors.is_empty() {
-            continue;
-        }
-        let selector_text = base_selectors.join(", ");
-        let Some(selector) = parse_selector_list_text(&selector_text, selector_parser) else {
-            continue;
-        };
-        let specificity = selector
-            .slice()
-            .iter()
-            .map(|branch| branch.specificity())
-            .max()
-            .unwrap_or(0);
-        let rule = StyleRule {
-            selector_text,
-            selector,
-            stylesheet_scope_anchor,
-            declarations: declarations.clone(),
-            specificity,
-            order: 0,
-            layer_name: layer_name.clone(),
-            scopes: scopes.clone(),
-        };
-        rules.push(match pseudo {
-            RoutedPseudoElement::Marker => ParsedCssRule::Marker(rule),
-            RoutedPseudoElement::BeforeMarker => ParsedCssRule::BeforeMarker(rule),
-            RoutedPseudoElement::AfterMarker => ParsedCssRule::AfterMarker(rule),
-            RoutedPseudoElement::Before => ParsedCssRule::Before(rule),
-            RoutedPseudoElement::After => ParsedCssRule::After(rule),
-            RoutedPseudoElement::FootnoteCall => ParsedCssRule::FootnoteCall(rule),
-            RoutedPseudoElement::FootnoteMarker => ParsedCssRule::FootnoteMarker(rule),
-            RoutedPseudoElement::FirstLine => ParsedCssRule::FirstLine(rule),
-            RoutedPseudoElement::FirstLetter => ParsedCssRule::FirstLetter(rule),
-        });
-    }
-    rules
+/// Remove one already-validated routed pseudo-element from a serialized
+/// selector. The selector parser establishes which pseudo-element is present;
+/// this helper only adapts that generated-box selector to its originating
+/// element selector.
+///
+/// CSS Overflow 5 permits target-state pseudo-classes after
+/// `::scroll-marker`; retain that state for the originating-element cascade.
+/// <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+/// <https://drafts.csswg.org/css-overflow-5/#scroll-markers>
+pub(in crate::css) fn strip_routed_pseudo_selector(
+    selector: &str,
+    pseudo: RoutedPseudoElement,
+) -> Option<std::borrow::Cow<'_, str>> {
+    let name = match pseudo {
+        RoutedPseudoElement::Marker => "marker",
+        RoutedPseudoElement::Before => "before",
+        RoutedPseudoElement::After => "after",
+        RoutedPseudoElement::ScrollMarker => "scroll-marker",
+        RoutedPseudoElement::ScrollMarkerGroup => "scroll-marker-group",
+        RoutedPseudoElement::FootnoteCall => "footnote-call",
+        RoutedPseudoElement::FootnoteMarker => "footnote-marker",
+        RoutedPseudoElement::FirstLine => "first-line",
+        RoutedPseudoElement::FirstLetter => "first-letter",
+        // The selector crate cannot represent chained tree-abiding
+        // pseudo-elements. Those use the source-only fallback below.
+        RoutedPseudoElement::BeforeMarker | RoutedPseudoElement::AfterMarker => return None,
+    };
+    strip_pseudo_selector(selector, name)
 }
 
-pub(in crate::css) fn parse_selector_list_text(
-    selector_text: &str,
-    selector_parser: &QuireSelectorParser,
-) -> Option<SelectorList<QuireSelectorImpl>> {
-    let mut input = ParserInput::new(selector_text);
-    let mut parser = Parser::new(&mut input);
-    SelectorList::parse(selector_parser, &mut parser, ParseRelative::No).ok()
+/// Route the only chained tree-abiding pseudo-elements outside the selector
+/// crate's AST, plus CSS Overflow target state after ::scroll-marker. This is
+/// deliberately exact: a parse failure must not turn an
+/// arbitrary selector containing pseudo-element-like text into an
+/// originating-element rule.
+pub(in crate::css) fn source_only_routed_pseudo_route(
+    selector: &str,
+) -> Option<(RoutedPseudoElement, std::borrow::Cow<'_, str>)> {
+    let trimmed = selector.trim();
+    for (pseudo, suffix) in [
+        (RoutedPseudoElement::BeforeMarker, "::before::marker"),
+        (RoutedPseudoElement::AfterMarker, "::after::marker"),
+    ] {
+        if trimmed.ends_with(suffix) {
+            return strip_pseudo_selector(trimmed, &suffix[2..]).map(|base| (pseudo, base));
+        }
+    }
+    for state in ["target-current", "target-before", "target-after"] {
+        let suffix = format!("::scroll-marker:{state}");
+        if trimmed.ends_with(&suffix) {
+            return strip_pseudo_selector(trimmed, "scroll-marker")
+                .map(|base| (RoutedPseudoElement::ScrollMarker, base));
+        }
+    }
+    None
 }
 
 pub(in crate::css) fn strip_pseudo_selector<'a>(
@@ -156,12 +96,24 @@ pub(in crate::css) fn strip_pseudo_selector<'a>(
     let trimmed = selector.trim();
     let double_colon = format!("::{pseudo}");
     let single_colon = format!(":{pseudo}");
-    let raw_base = trimmed
-        .strip_suffix(&double_colon)
-        .or_else(|| trimmed.strip_suffix(&single_colon))?;
+    let (raw_base, trailing_state) = if let Some(raw_base) = trimmed.strip_suffix(&double_colon) {
+        (raw_base, "")
+    } else if let Some(raw_base) = trimmed.strip_suffix(&single_colon) {
+        (raw_base, "")
+    } else {
+        // CSS Overflow 5 permits target-state pseudo-classes after its
+        // pseudo-elements. Route the pseudo-element away while retaining the
+        // state selector on its originating element for the pseudo cascade.
+        let position = trimmed.find(&double_colon)?;
+        let after = &trimmed[position + double_colon.len()..];
+        if !after.starts_with(':') {
+            return None;
+        }
+        (&trimmed[..position], after)
+    };
     let base = raw_base.trim();
     if base.is_empty() {
-        return Some(std::borrow::Cow::Borrowed("*"));
+        return Some(std::borrow::Cow::Owned(format!("*{trailing_state}")));
     }
     if raw_base
         .chars()
@@ -169,7 +121,11 @@ pub(in crate::css) fn strip_pseudo_selector<'a>(
         .is_some_and(|character| character.is_ascii_whitespace())
         || base.ends_with(['>', '+', '~'])
     {
-        return Some(std::borrow::Cow::Owned(format!("{base} *")));
+        return Some(std::borrow::Cow::Owned(format!("{base} *{trailing_state}")));
     }
-    Some(std::borrow::Cow::Borrowed(base))
+    if trailing_state.is_empty() {
+        Some(std::borrow::Cow::Borrowed(base))
+    } else {
+        Some(std::borrow::Cow::Owned(format!("{base}{trailing_state}")))
+    }
 }

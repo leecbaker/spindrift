@@ -44,6 +44,5 @@ pub(crate) use media_queries::{media_rule_applies, media_rule_applies_in_environ
 pub(in crate::css) use parser::{
     CssRuleParser, LayerRegistry, NamespaceRegistry, ParsedCssRule, RoutedPseudoElement,
 };
-pub(in crate::css) use pseudo_elements::split_pseudo_element_rule;
 pub(crate) use supports::supports_condition_applies;
 pub(in crate::css) use supports::supports_condition_applies_with_selector_parser;

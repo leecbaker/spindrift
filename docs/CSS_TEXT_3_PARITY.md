@@ -259,6 +259,10 @@ except where existing code already implements draft properties.
   trailing hanging without moving the separator to a line of its own. The
   hanging suffix is excluded from fitting and alignment, but remains source
   for inline backgrounds, decorations, and extraction.
+- Unicode other-space separators remain ordinary shaped text: their selected
+  glyph, shaping advance, and source mapping flow through to PDF paint and
+  extraction. Line-edge hanging excludes their advance from fitting where CSS
+  Text requires without changing glyph selection or paint ownership.
 - Ordinary UAX #14 candidates are finalized only after ICU and Quire's CJK
   fallback candidates have been combined. This retains the LB13 prohibition
   on beginning a line with any `NS` Nonstarter, including ideographic and
@@ -335,6 +339,13 @@ except where existing code already implements draft properties.
   grapheme clusters share this boundary policy. Ruby columns remain distinct
   base-text units, so annotations align to base geometry while inter-column
   tracking advances only the following column.
+- The legacy references for `letter-spacing-202`, `letter-spacing-203`, and
+  `letter-spacing-206` encode an earlier common-ancestor ownership model for
+  tracking. Quire follows the current CSS Text model instead: each adjacent
+  typographic unit contributes half of its own used `letter-spacing`, and
+  formatting controls are transparent when identifying the boundary. These
+  are WPT compatibility mismatches rather than CSS Text conformance
+  divergences; see <https://drafts.csswg.org/css-text-3/#letter-spacing-property>.
 - Reused source-shaped slices validate that their glyph provenance covers every
   paintable selected character. A conditional-hyphen control can otherwise
   leave a truncated backend slice that under-measures the remaining source;

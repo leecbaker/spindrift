@@ -935,8 +935,8 @@ impl<'a> LayoutBuilder<'a> {
                 vertical_border_width_for_positioning,
             );
         if positioned_height_percentage_basis.is_definite() {
-            self.definite_block_size_stack
-                .push(positioned_height_percentage_basis);
+            self.block_percentage_context_stack
+                .push_percentage_basis(positioned_height_percentage_basis);
         }
         let auto_or_intrinsic_width = replaced_content_size.map_or_else(
             || {
@@ -991,7 +991,7 @@ impl<'a> LayoutBuilder<'a> {
             |(width, _)| width,
         );
         if positioned_height_percentage_basis.is_definite() {
-            self.definite_block_size_stack.pop();
+            self.block_percentage_context_stack.pop();
         }
         let static_alignment_border_width = used_content_box_width_or_auto(
             style,
@@ -1132,7 +1132,7 @@ impl<'a> LayoutBuilder<'a> {
             estimate_style.position = Position::Static;
             estimate_style.margin = css::Edges::ZERO;
             estimate_style.box_values.margin =
-                css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
+                css::PhysicalEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
             set_style_used_width(&mut estimate_style, positioned_content_width);
             // `positioned_content_width` is already a used content-box
             // size.  The measurement surrogate must not interpret it through
@@ -1480,7 +1480,7 @@ impl<'a> LayoutBuilder<'a> {
         flow_style.scroll_snap_align = css::ScrollSnapAlign::default();
         flow_style.margin = css::Edges::ZERO;
         flow_style.box_values.margin =
-            css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
+            css::PhysicalEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
         set_style_used_width(&mut flow_style, positioned_content_width);
         set_style_used_height(&mut flow_style, positioned_content_height);
         // Positioned-axis resolution supplies content-box sizes.  The static
@@ -1731,6 +1731,15 @@ impl<'a> LayoutBuilder<'a> {
             table_fragment,
             false,
             PrincipalBoxPaintMode::RootPaints,
+            Some(if positioned_height_percentage_basis.is_definite() {
+                DescendantBlockPercentageContext::from_percentage_basis(
+                    positioned_height_percentage_basis,
+                )
+            } else if vertical_size_requires_content_measurement {
+                DescendantBlockPercentageContext::ContentSized
+            } else {
+                DescendantBlockPercentageContext::Indefinite
+            }),
         );
         self.fragmentainer_override = previous_fragmentainer_override;
         log::trace!(

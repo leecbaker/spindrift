@@ -280,7 +280,6 @@ struct UnicodeRangeResolvedSpan {
 }
 
 pub(crate) use artifacts::{ShapedGlyphRun, ShapedInlineGlyph, ShapedInlineLine, ShapedInlineRun};
-pub(crate) use system::TextShapingRequest;
 
 /// U+FFFC OBJECT REPLACEMENT CHARACTER for atomic inline line breaking.
 ///

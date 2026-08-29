@@ -3,7 +3,7 @@ use super::{
     PageTopRect, PaintStrokeWidth, PhysicalSide, RenderedPath, RenderedRect, TableAxes,
     TableColumnPlan, TableGridBlockOffset, TableGridBorderWidth, TableGridEdge,
     TableGridInlineOffset, TableGridLength, TableGridPlacement, TableRowBounds, UsedBorderSide,
-    css, layout_pt,
+    css, layout_pt, *,
 };
 
 pub(super) struct CollapsedBorderGrid {
@@ -1156,6 +1156,90 @@ fn collapsed_border_paint_style(style: BorderStyle) -> BorderStyle {
         BorderStyle::Outset => BorderStyle::Groove,
         _ => style,
     }
+}
+
+/// Shared CSS 2.2 collapsed-border geometry for one laid-out table.
+///
+/// The full resolved grid is the source of truth for table wrapper insets,
+/// structural background bounds, and fragmented border painting.
+/// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
+pub(in crate::layout::table) struct CollapsedTableGeometry {
+    pub(in crate::layout::table) grid: CollapsedBorderGrid,
+    pub(in crate::layout::table) outer_insets: css::Edges,
+}
+
+impl CollapsedTableGeometry {
+    pub(in crate::layout::table) fn cell_insets(
+        &self,
+        placement: &TableCellPlacement,
+        row_index: usize,
+    ) -> css::Edges {
+        self.grid.cell_insets(
+            row_index,
+            placement.column,
+            placement.colspan,
+            placement.rowspan,
+        )
+    }
+}
+
+pub(in crate::layout::table) fn table_cell_border_insets(
+    cell_style: &ComputedStyle,
+    placement: &TableCellPlacement,
+    row_index: usize,
+    table_metrics: TableMetrics,
+    collapsed_geometry: Option<&CollapsedTableGeometry>,
+) -> css::Edges {
+    if table_metrics.border_collapse == css::BorderCollapse::Collapse {
+        return collapsed_geometry
+            .map(|geometry| geometry.cell_insets(placement, row_index))
+            .unwrap_or(css::Edges::ZERO);
+    }
+    used_border_widths(cell_style)
+}
+
+pub(in crate::layout::table) fn table_cell_border_box_height_with_insets(
+    style: &ComputedStyle,
+    content_height: f32,
+    border_insets: css::Edges,
+) -> f32 {
+    table_cell_row_sizing_border_box_height(
+        style,
+        content_height,
+        percentage_basis_from_points(Some(content_height)),
+        border_insets,
+    )
+}
+
+/// Resolve a table-cell minimum border-box height for row height distribution.
+///
+/// CSS Tables row layout treats a cell's specified `height` as a minimum input
+/// to row sizing. The final table-cell box can still grow to fit required
+/// in-flow content, so `max-height` must not clamp the row/cell border box:
+/// <https://drafts.csswg.org/css-tables-3/#height-distribution> and
+/// <https://www.w3.org/TR/CSS22/tables.html#height-layout>.
+pub(in crate::layout::table) fn table_cell_row_sizing_border_box_height<Source: Copy>(
+    style: &ComputedStyle,
+    content_height: f32,
+    percentage_basis: PercentageBasis<ContentBoxLength, Source>,
+    border_insets: css::Edges,
+) -> f32 {
+    let vertical_non_content =
+        style.padding.top + style.padding.bottom + border_insets.top + border_insets.bottom;
+    let height_content = used_content_box_height_or_auto_with_basis(
+        style,
+        percentage_basis,
+        non_content_pt(vertical_non_content),
+    )
+    .map(SemanticLengthExt::points)
+    .unwrap_or(0.0);
+    let min_height_content = used_length_percentage_or_auto_with_basis(
+        style.box_values.min_height.clone(),
+        percentage_basis,
+    )
+    .map(|height| height.points())
+    .unwrap_or(0.0);
+    content_height.max(height_content).max(min_height_content) + vertical_non_content
 }
 
 #[cfg(test)]

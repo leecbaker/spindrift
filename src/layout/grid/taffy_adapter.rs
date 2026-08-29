@@ -3,32 +3,26 @@ use crate::layout::taffy_bridge;
 
 pub(super) fn taffy_dimension(
     value: css::ComputedLengthPercentageOrAuto,
-) -> taffy_layout::Dimension {
+) -> taffy_layout::LengthPercentageAuto {
     match value {
         css::ComputedLengthPercentageOrAuto::Auto
-        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
+        | css::ComputedLengthPercentageOrAuto::Stretch => {
+            taffy_layout::LengthPercentageAuto::auto()
+        }
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
             taffy_length_percentage(value).into()
         }
         css::ComputedLengthPercentageOrAuto::MinContent
-        | css::ComputedLengthPercentageOrAuto::MaxContent => taffy_layout::Dimension::auto(),
+        | css::ComputedLengthPercentageOrAuto::MaxContent => {
+            taffy_layout::LengthPercentageAuto::auto()
+        }
         css::ComputedLengthPercentageOrAuto::FitContent(limit) => limit
             .map(taffy_dimension_from_length_percentage)
-            .unwrap_or_else(taffy_layout::Dimension::auto),
-        css::ComputedLengthPercentageOrAuto::CalcSize(_) => taffy_layout::Dimension::auto(),
-    }
-}
-
-pub(super) fn taffy_grid_item_min_dimension(
-    value: css::ComputedLengthPercentageOrAuto,
-    percentage_basis: GridPercentageBasis,
-    min_content: ContentBoxLength,
-    max_content: ContentBoxLength,
-) -> taffy_layout::Dimension {
-    match value {
-        css::ComputedLengthPercentageOrAuto::Auto
-        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
-        _ => taffy_grid_item_dimension(value, percentage_basis, min_content, max_content),
+            .map(taffy_bridge::min_max_constraint)
+            .unwrap_or_else(taffy_layout::LengthPercentageAuto::auto),
+        css::ComputedLengthPercentageOrAuto::CalcSize(_) => {
+            taffy_layout::LengthPercentageAuto::auto()
+        }
     }
 }
 
@@ -74,6 +68,33 @@ fn taffy_grid_item_dimension_for_purpose(
     max_content: ContentBoxLength,
     purpose: GridTaffyDimensionPurpose,
 ) -> taffy_layout::Dimension {
+    // Preferred item sizes can retain Taffy's native intrinsic keywords:
+    // `taffy_grid_measurement` answers their min/max-content requests from
+    // Quire's typed estimate. Track-sizing constraints intentionally stay on
+    // Quire's scalar path because CSS Grid gives their percentage phase a
+    // different basis.
+    if purpose == GridTaffyDimensionPurpose::UsedItemSize {
+        match &value {
+            css::ComputedLengthPercentageOrAuto::MinContent => {
+                return taffy_layout::Dimension::min_content();
+            }
+            css::ComputedLengthPercentageOrAuto::MaxContent => {
+                return taffy_layout::Dimension::max_content();
+            }
+            css::ComputedLengthPercentageOrAuto::FitContent(None) => {
+                return taffy_layout::Dimension::fit_content();
+            }
+            css::ComputedLengthPercentageOrAuto::FitContent(Some(limit))
+                if limit.is_definitely_absolute() =>
+            {
+                return taffy_layout::Dimension::fit_content_px(limit.length_max_zero().points());
+            }
+            css::ComputedLengthPercentageOrAuto::Stretch => {
+                return taffy_layout::Dimension::stretch();
+            }
+            _ => {}
+        }
+    }
     let min_content = min_content.points().max(0.0);
     let max_content = max_content.points().max(min_content);
     match value {
@@ -165,21 +186,26 @@ fn taffy_grid_item_dimension_for_purpose(
 /// Taffy's grid algorithm resolves a percentage `Dimension` relative to its
 /// available sizing input while calculating tracks. That is appropriate for a
 /// used item size only after its grid area is known, but not for a constraint
-/// that participates in track sizing. Preserve the automatic intrinsic phase
-/// until final-area resolution applies the constraint.
-pub(super) fn taffy_grid_item_constraint_dimension(
+/// that participates in track sizing. Resolve intrinsic values to Quire's
+/// measured scalar contributions and defer cyclic percentages as `auto`.
+///
+/// Taffy accepts only scalar lengths, percentages, or `auto` for min/max
+/// constraints. Keeping that restriction in this return type prevents the
+/// preferred-size path's native intrinsic dimensions from crossing this
+/// boundary.
+pub(super) fn taffy_grid_item_constraint(
     value: css::ComputedLengthPercentageOrAuto,
     percentage_basis: GridPercentageBasis,
     min_content: ContentBoxLength,
     max_content: ContentBoxLength,
-) -> taffy_layout::Dimension {
-    taffy_grid_item_dimension_for_purpose(
+) -> taffy_layout::LengthPercentageAuto {
+    taffy_bridge::min_max_constraint(taffy_grid_item_dimension_for_purpose(
         value,
         percentage_basis,
         min_content,
         max_content,
         GridTaffyDimensionPurpose::TrackSizingConstraint,
-    )
+    ))
 }
 
 pub(super) fn taffy_dimension_from_length_percentage(
@@ -341,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_item_dimension_extracts_typed_min_and_max_content_points() {
+    fn grid_item_dimension_preserves_native_min_and_max_content_keywords() {
         let indefinite_basis: GridPercentageBasis = PercentageBasis::indefinite();
         let min_content = taffy_grid_item_dimension(
             css::ComputedLengthPercentageOrAuto::MinContent,
@@ -356,8 +382,8 @@ mod tests {
             content_box_pt(48.0),
         );
 
-        assert_eq!(min_content, taffy_layout::Dimension::length(12.0));
-        assert_eq!(max_content, taffy_layout::Dimension::length(48.0));
+        assert_eq!(min_content, taffy_layout::Dimension::min_content());
+        assert_eq!(max_content, taffy_layout::Dimension::max_content());
     }
 
     #[test]
@@ -400,13 +426,13 @@ mod tests {
             taffy_layout::Dimension::percent(0.5),
         );
         assert_eq!(
-            taffy_grid_item_constraint_dimension(
+            taffy_grid_item_constraint(
                 percent.clone(),
                 definite_basis,
                 content_box_pt(12.0),
                 content_box_pt(48.0),
             ),
-            taffy_layout::Dimension::auto(),
+            taffy_layout::LengthPercentageAuto::auto(),
         );
         assert!(
             taffy_grid_item_dimension(
@@ -418,7 +444,7 @@ mod tests {
             .is_auto()
         );
         assert!(
-            taffy_grid_item_constraint_dimension(
+            taffy_grid_item_constraint(
                 percent,
                 indefinite_basis,
                 content_box_pt(12.0),
@@ -429,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_dimension_purposes_share_intrinsic_keyword_and_calc_size_resolution() {
+    fn grid_preferred_sizes_delegate_exact_keywords_but_constraints_remain_scalar() {
         let basis = grid_percentage_basis(
             Some(content_box_pt(80.0)),
             GridAvailableSizeSource::ContainerInlineSize,
@@ -447,12 +473,57 @@ mod tests {
             upper_bound: None,
         });
 
-        for value in [fit_content, calc_size] {
-            assert_eq!(
-                taffy_grid_item_dimension(value.clone(), basis, min_content, max_content),
-                taffy_grid_item_constraint_dimension(value, basis, min_content, max_content),
-            );
-        }
+        assert_eq!(
+            taffy_grid_item_dimension(fit_content.clone(), basis, min_content, max_content),
+            taffy_layout::Dimension::fit_content_px(20.0),
+        );
+        assert_eq!(
+            taffy_grid_item_constraint(fit_content, basis, min_content, max_content),
+            taffy_layout::LengthPercentageAuto::length(20.0),
+        );
+        assert_eq!(
+            taffy_grid_item_dimension(calc_size.clone(), basis, min_content, max_content),
+            taffy_layout::Dimension::length(28.0),
+        );
+        assert_eq!(
+            taffy_grid_item_constraint(calc_size, basis, min_content, max_content),
+            taffy_layout::LengthPercentageAuto::length(28.0),
+        );
+    }
+
+    #[test]
+    fn grid_track_sizing_intrinsic_constraints_are_scalar() {
+        let basis: GridPercentageBasis = PercentageBasis::indefinite();
+        let min_content = content_box_pt(12.0);
+        let max_content = content_box_pt(48.0);
+
+        assert_eq!(
+            taffy_grid_item_constraint(
+                css::ComputedLengthPercentageOrAuto::Auto,
+                basis,
+                min_content,
+                max_content,
+            ),
+            taffy_layout::LengthPercentageAuto::auto(),
+        );
+        assert_eq!(
+            taffy_grid_item_constraint(
+                css::ComputedLengthPercentageOrAuto::MinContent,
+                basis,
+                min_content,
+                max_content,
+            ),
+            taffy_layout::LengthPercentageAuto::length(12.0),
+        );
+        assert_eq!(
+            taffy_grid_item_constraint(
+                css::ComputedLengthPercentageOrAuto::MaxContent,
+                basis,
+                min_content,
+                max_content,
+            ),
+            taffy_layout::LengthPercentageAuto::length(48.0),
+        );
     }
 
     #[test]
@@ -503,13 +574,13 @@ mod tests {
             taffy_layout::Dimension::auto(),
         );
         assert_eq!(
-            taffy_grid_item_constraint_dimension(
+            taffy_grid_item_constraint(
                 zero_percent,
                 indefinite_basis,
                 content_box_pt(12.0),
                 content_box_pt(48.0),
             ),
-            taffy_layout::Dimension::auto(),
+            taffy_layout::LengthPercentageAuto::auto(),
         );
     }
 
@@ -1982,27 +2053,6 @@ fn negative_named_line_startward_line_range(
     Some(start_line..end_line)
 }
 
-fn taffy_grid_placement_with_positive_line_shift(
-    value: &css::GridPlacement,
-    shift: i32,
-) -> taffy_layout::GridPlacement<String> {
-    match value {
-        css::GridPlacement::Line(line) if line.name().is_none() => line
-            .index()
-            .and_then(|index| {
-                let shifted = if index > 0 {
-                    index.checked_add(shift)?
-                } else {
-                    index
-                };
-                i16::try_from(shifted).ok()
-            })
-            .map(taffy_layout::line)
-            .unwrap_or(taffy_layout::GridPlacement::Auto),
-        _ => taffy_grid_placement(value),
-    }
-}
-
 pub(super) fn taffy_grid_placement_is_line(value: &taffy_layout::GridPlacement<String>) -> bool {
     matches!(
         value,
@@ -2045,5 +2095,25 @@ pub(super) fn taffy_grid_auto_flow(value: css::GridAutoFlow) -> taffy_layout::Gr
         css::GridAutoFlow::Column => taffy_layout::GridAutoFlow::Column,
         css::GridAutoFlow::RowDense => taffy_layout::GridAutoFlow::RowDense,
         css::GridAutoFlow::ColumnDense => taffy_layout::GridAutoFlow::ColumnDense,
+    }
+}
+fn taffy_grid_placement_with_positive_line_shift(
+    value: &css::GridPlacement,
+    shift: i32,
+) -> taffy_layout::GridPlacement<String> {
+    match value {
+        css::GridPlacement::Line(line) if line.name().is_none() => line
+            .index()
+            .and_then(|index| {
+                let shifted = if index > 0 {
+                    index.checked_add(shift)?
+                } else {
+                    index
+                };
+                i16::try_from(shifted).ok()
+            })
+            .map(taffy_layout::line)
+            .unwrap_or(taffy_layout::GridPlacement::Auto),
+        _ => taffy_grid_placement(value),
     }
 }

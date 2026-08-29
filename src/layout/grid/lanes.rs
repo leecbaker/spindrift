@@ -383,25 +383,34 @@ impl GridLanesAutoRepeatResolution {
         let mut starts = Vec::with_capacity(self.tracks.len());
         let mut ends = Vec::with_capacity(self.tracks.len());
         let mut active_index = 0;
-        let mut collapsed_offset = active_geometry.starts.first().copied().unwrap_or(0.0);
+        let mut collapsed_offset = active_geometry
+            .topology
+            .track(0)
+            .map_or(0.0, |track| track.start());
         for track in &self.tracks {
             if track.collapsed {
                 starts.push(collapsed_offset);
                 ends.push(collapsed_offset);
                 continue;
             }
-            let start = *active_geometry.starts.get(active_index)?;
-            let end = *active_geometry.ends.get(active_index)?;
+            let geometry = active_geometry.topology.track(active_index)?;
+            let start = geometry.start();
+            let end = geometry.end();
             starts.push(start);
             ends.push(end);
             collapsed_offset = end;
             active_index += 1;
         }
-        (active_index == active_geometry.track_count()).then_some(GridLanesTrackGeometry {
-            starts,
-            ends,
-            active: self.tracks.iter().map(|track| !track.collapsed).collect(),
-        })
+        (active_index == active_geometry.track_count())
+            .then(|| {
+                GridAxisTopology::from_track_bounds(
+                    &starts,
+                    &ends,
+                    self.tracks.iter().map(|track| track.collapsed).collect(),
+                )
+            })
+            .flatten()
+            .map(|topology| GridLanesTrackGeometry { topology })
     }
 
     fn geometry(&self, alignment: css::ContentAlignment, available: f32) -> GridLanesTrackGeometry {
@@ -510,11 +519,7 @@ impl GridLanesAutoRepeatResolution {
 /// or after its grid area.
 #[derive(Clone)]
 struct GridLanesTrackGeometry {
-    starts: Vec<f32>,
-    ends: Vec<f32>,
-    /// A collapsed `repeat(auto-fit, ...)` track keeps its grid lines but
-    /// cannot receive automatic Grid Lanes placement.
-    active: Vec<bool>,
+    topology: GridAxisTopology,
 }
 
 impl GridLanesTrackGeometry {
@@ -524,51 +529,35 @@ impl GridLanesTrackGeometry {
             axis.gutter_sizes().len(),
             axis.track_count().saturating_sub(1)
         );
-        (!axis.track_starts().is_empty()).then(|| Self {
-            starts: axis.track_starts().to_vec(),
-            ends: axis.track_ends().to_vec(),
-            active: vec![true; axis.track_count()],
-        })
+        let collapsed = vec![false; axis.track_count()];
+        GridAxisTopology::from_track_bounds(axis.track_starts(), axis.track_ends(), collapsed)
+            .filter(|topology| topology.track_count() != 0)
+            .map(|topology| Self { topology })
     }
 
-    fn from_grid_layout_offsets(
-        line_offsets: &[f32],
-        gutters: &[GapDecorationGutter],
-    ) -> Option<Self> {
-        let track_count = line_offsets.len().checked_sub(1)?;
-        if track_count == 0 {
-            return None;
-        }
-        let mut starts = Vec::with_capacity(track_count);
-        let mut ends = Vec::with_capacity(track_count);
-        for index in 0..track_count {
-            let start = if index == 0 {
-                line_offsets[0]
-            } else {
-                gutters
-                    .get(index - 1)
-                    .map(|gutter| gutter.span.end)
-                    .unwrap_or(line_offsets[index])
-            };
-            starts.push(start);
-            ends.push(line_offsets[index + 1].max(start));
-        }
-        Some(Self {
-            active: vec![true; track_count],
-            starts,
-            ends,
+    fn from_grid_axis_topology(topology: &GridAxisTopology) -> Option<Self> {
+        (topology.track_count() != 0).then(|| Self {
+            topology: topology.clone(),
         })
     }
 
     fn from_track_sizes(sizes: &[f32], gap: f32) -> Option<Self> {
-        Self::from_track_sizes_with_active(sizes, gap, &vec![true; sizes.len()])
+        if sizes.is_empty() {
+            return None;
+        }
+        GridAxisTopology::from_track_layout(
+            sizes.to_vec(),
+            vec![gap.max(0.0); sizes.len().saturating_sub(1)],
+            vec![false; sizes.len()],
+        )
+        .map(|topology| Self { topology })
     }
 
     /// Construct final line geometry after `auto-fit` has collapsed its empty
-    /// tracks. Collapsed tracks and the gutters on either side of them have
-    /// zero used size, but their lines remain addressable by explicit
-    /// placement.
-    /// <https://drafts.csswg.org/css-grid-3/#auto-repeat>
+    /// tracks. The canonical Grid topology owns collapsed-gutter removal, so
+    /// Grid Lanes cannot drift from ordinary Grid sizing when an interior run
+    /// of empty tracks separates two active tracks.
+    /// <https://drafts.csswg.org/css-grid-1/#auto-repeat>
     fn from_track_sizes_with_active(sizes: &[f32], gap: f32, active: &[bool]) -> Option<Self> {
         if sizes.len() != active.len() {
             return None;
@@ -576,56 +565,46 @@ impl GridLanesTrackGeometry {
         if sizes.is_empty() {
             return None;
         }
-        let mut starts = Vec::with_capacity(sizes.len());
-        let mut ends = Vec::with_capacity(sizes.len());
-        let mut offset = 0.0;
-        for (index, size) in sizes.iter().enumerate() {
-            starts.push(offset);
-            if active[index] {
-                offset += size.max(0.0);
-            }
-            ends.push(offset);
-            // A collapsed auto-fit track collapses the gutters on both of
-            // its sides. Therefore a gutter exists only when its two
-            // immediately adjacent tracks are active; looking for a later
-            // active track would incorrectly retain a gap across a collapsed
-            // track. <https://drafts.csswg.org/css-grid-2/#auto-repeat>
-            if index + 1 < sizes.len() && active[index] && active[index + 1] {
-                offset += gap;
-            }
-        }
-        Some(Self {
-            starts,
-            ends,
-            active: active.to_vec(),
-        })
+        let topology = GridAxisTopology::from_auto_fit_track_layout(
+            sizes.to_vec(),
+            vec![gap.max(0.0); sizes.len().saturating_sub(1)],
+            active.iter().map(|&active| !active).collect(),
+        )?;
+        Self::from_grid_axis_topology(&topology)
     }
 
     fn track_count(&self) -> usize {
-        self.starts.len()
+        self.topology.track_count()
     }
 
     fn area_start(&self, range: &std::ops::Range<usize>) -> f32 {
-        self.starts[range.start]
+        self.topology
+            .track(range.start)
+            .map_or(0.0, |track| track.start())
     }
 
     fn area_size(&self, range: &std::ops::Range<usize>) -> f32 {
-        (self.ends[range.end - 1] - self.starts[range.start]).max(0.0)
+        self.topology
+            .area_bounds(
+                u16::try_from(range.start + 1).unwrap_or(u16::MAX),
+                u16::try_from(range.end + 1).unwrap_or(u16::MAX),
+            )
+            .map_or(0.0, |(start, end)| (end - start).max(0.0))
     }
 
-    fn line_offsets(&self) -> Vec<f32> {
-        let mut offsets = Vec::with_capacity(self.track_count() + 1);
-        offsets.push(self.starts[0]);
-        offsets.extend(self.ends.iter().cloned());
-        offsets
-    }
-
-    fn track_sizes(&self) -> Vec<f32> {
-        self.starts
-            .iter()
-            .zip(&self.ends)
-            .map(|(start, end)| (end - start).max(0.0))
+    fn active_tracks(&self) -> Vec<bool> {
+        self.topology
+            .collapsed_tracks_iter()
+            .map(|collapsed| !collapsed)
             .collect()
+    }
+
+    /// Projects the lane-specific start/end representation back into Grid's
+    /// canonical axis topology. In particular, the space between the end of
+    /// one lane and the start of the next remains an interior Grid gutter
+    /// even if the following track has zero used size.
+    fn topology(&self) -> GridAxisTopology {
+        self.topology.clone()
     }
 
     /// Distribute a definite grid-axis container's remaining free space
@@ -634,15 +613,11 @@ impl GridLanesTrackGeometry {
     /// This operates on the explicit start/end representation, so distributed
     /// gaps never become part of an item's grid area:
     /// <https://www.w3.org/TR/css-align-3/#content-distribution>.
-    fn with_content_alignment(
-        mut self,
-        alignment: css::ContentAlignment,
-        container_size: f32,
-    ) -> Self {
+    fn with_content_alignment(self, alignment: css::ContentAlignment, container_size: f32) -> Self {
         if self.track_count() == 0 {
             return self;
         }
-        let occupied_size = self.ends.last().cloned().unwrap_or(0.0) - self.starts[0];
+        let occupied_size = self.topology.extent();
         let free_space = container_size - occupied_size;
         let free_space = if alignment.safety == AlignmentSafety::Unsafe {
             free_space
@@ -668,12 +643,18 @@ impl GridLanesTrackGeometry {
             }
             _ => (0.0, 0.0),
         };
-        for (index, (start, end)) in self.starts.iter_mut().zip(&mut self.ends).enumerate() {
+        let tracks = (0..count).filter_map(|index| {
+            let track = self.topology.track(index)?;
             let offset = initial_offset + between_offset * index as f32;
-            *start += offset;
-            *end += offset;
-        }
-        self
+            Some((
+                track.start() + offset,
+                track.end() + offset,
+                !track.is_active(),
+            ))
+        });
+        GridAxisTopology::from_track_geometry(tracks)
+            .map(|topology| Self { topology })
+            .unwrap_or(self)
     }
 
     /// Stretch auto-sized tracks before applying positional content alignment.
@@ -685,7 +666,7 @@ impl GridLanesTrackGeometry {
     /// preserves the distinction between a widened track and a gutter.
     /// <https://www.w3.org/TR/css-align-3/#valdef-justify-content-stretch>
     fn with_auto_track_stretch(
-        mut self,
+        self,
         auto_sized_tracks: &[bool],
         alignment: css::ContentAlignment,
         container_size: f32,
@@ -702,7 +683,7 @@ impl GridLanesTrackGeometry {
         if auto_track_count == 0 {
             return self;
         }
-        let occupied_size = self.ends.last().cloned().unwrap_or(0.0) - self.starts[0];
+        let occupied_size = self.topology.extent();
         let additional_size =
             ((container_size - occupied_size).max(0.0) / auto_track_count as f32).max(0.0);
         if additional_size == 0.0 {
@@ -710,20 +691,19 @@ impl GridLanesTrackGeometry {
         }
 
         let mut preceding_growth = 0.0;
-        for ((start, end), &is_auto_sized) in self
-            .starts
-            .iter_mut()
-            .zip(&mut self.ends)
-            .zip(auto_sized_tracks)
-        {
-            *start += preceding_growth;
-            *end += preceding_growth;
-            if is_auto_sized {
-                *end += additional_size;
+        let tracks = (0..self.track_count()).filter_map(|index| {
+            let track = self.topology.track(index)?;
+            let start = track.start() + preceding_growth;
+            let mut end = track.end() + preceding_growth;
+            if auto_sized_tracks[index] {
+                end += additional_size;
                 preceding_growth += additional_size;
             }
-        }
-        self
+            Some((start, end, !track.is_active()))
+        });
+        GridAxisTopology::from_track_geometry(tracks)
+            .map(|topology| Self { topology })
+            .unwrap_or(self)
     }
 }
 
@@ -798,9 +778,9 @@ impl<'a> LayoutBuilder<'a> {
             GridLanesAxis::Columns => &style.grid_template_columns,
             GridLanesAxis::Rows => &style.grid_template_rows,
         };
-        let taffy_line_offsets = match axis {
-            GridLanesAxis::Columns => layout.columns.line_offsets(),
-            GridLanesAxis::Rows => layout.rows.line_offsets(),
+        let grid_axis_topology = match axis {
+            GridLanesAxis::Columns => layout.columns.clone(),
+            GridLanesAxis::Rows => layout.rows.clone(),
         };
         // Taffy's two-dimensional placement can introduce an implicit axis
         // before reporting its track details.  In Grid Lanes that axis is not
@@ -892,11 +872,6 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
             .flatten();
-        let gap_gutters = layout.gap_decoration_gutters(style);
-        let taffy_gutters = match axis {
-            GridLanesAxis::Columns => &gap_gutters.columns,
-            GridLanesAxis::Rows => &gap_gutters.rows,
-        };
         let geometry = resolved_grid_axis
             .and_then(GridLanesTrackGeometry::from_resolved_subgrid_axis)
             .or_else(|| {
@@ -916,10 +891,7 @@ impl<'a> LayoutBuilder<'a> {
                     .or(auto_row_geometry)
                     .or(auto_column_geometry)
                     .or_else(|| {
-                        GridLanesTrackGeometry::from_grid_layout_offsets(
-                            &taffy_line_offsets,
-                            taffy_gutters,
-                        )
+                        GridLanesTrackGeometry::from_grid_axis_topology(&grid_axis_topology)
                     })
             });
         let Some(geometry) = geometry else {
@@ -992,22 +964,21 @@ impl<'a> LayoutBuilder<'a> {
                     .map(|template| template.line_names.clone())
             })
             .or_else(|| grid_lanes_explicit_line_names(grid_axis_tracks));
+        let final_grid_axis_topology = geometry.topology();
         let mut final_grid_axis_line_names =
             grid_axis_line_names.clone().unwrap_or_else(|| match axis {
                 GridLanesAxis::Columns => layout.column_line_names.clone(),
                 GridLanesAxis::Rows => layout.row_line_names.clone(),
             });
-        let final_grid_axis_offsets = geometry.line_offsets();
-        final_grid_axis_line_names.resize_with(final_grid_axis_offsets.len(), Vec::new);
-        final_grid_axis_line_names.truncate(final_grid_axis_offsets.len());
+        final_grid_axis_line_names
+            .resize_with(final_grid_axis_topology.track_count() + 1, Vec::new);
+        final_grid_axis_line_names.truncate(final_grid_axis_topology.track_count() + 1);
         layout.set_physical_grid_axis_topology(
             match axis {
                 GridLanesAxis::Columns => GridAxis::Column,
                 GridLanesAxis::Rows => GridAxis::Row,
             },
-            final_grid_axis_offsets,
-            geometry.track_sizes(),
-            vec![false; geometry.track_count()],
+            final_grid_axis_topology,
             final_grid_axis_line_names,
         );
 
@@ -1056,7 +1027,7 @@ impl<'a> LayoutBuilder<'a> {
                 None => (
                     grid_lanes_shortest_range(
                         &lane_ends,
-                        &geometry.active,
+                        &geometry.active_tracks(),
                         span,
                         auto_placement_cursor,
                         flow_tolerance,
@@ -1340,8 +1311,12 @@ impl<'a> LayoutBuilder<'a> {
                 layout.height =
                     PhysicalContentHeight::new(content_box_pt(stacking_range.end_points()));
             }
-            layout.rows =
-                GridAxisTopology::new(vec![layout.height.points()], Vec::new(), vec![false]);
+            layout.rows = GridAxisTopology::from_track_layout(
+                vec![layout.height.points()],
+                Vec::new(),
+                vec![false],
+            )
+            .expect("one Grid Lanes stacking track has valid topology");
             layout.content_height = layout.height.points();
         } else {
             // Row lanes establish the physical block-axis track geometry. A
@@ -1356,18 +1331,11 @@ impl<'a> LayoutBuilder<'a> {
             {
                 layout.height = PhysicalContentHeight::new(content_box_pt(
                     geometry
-                        .ends
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| layout.height.points()),
+                        .topology
+                        .track(geometry.track_count().saturating_sub(1))
+                        .map_or_else(|| layout.height.points(), |track| track.end()),
                 ));
-                let line_offsets = geometry.line_offsets();
-                let track_sizes = geometry.track_sizes();
-                layout.rows = GridAxisTopology::from_line_offsets(
-                    line_offsets,
-                    track_sizes.clone(),
-                    vec![false; track_sizes.len()],
-                );
+                layout.rows = geometry.topology();
                 layout.content_height = layout.height.points();
             }
         }
@@ -1438,13 +1406,7 @@ impl<'a> LayoutBuilder<'a> {
         }
         match axis {
             GridLanesAxis::Columns => {
-                let line_offsets = geometry.line_offsets();
-                let track_sizes = geometry.track_sizes();
-                layout.columns = GridAxisTopology::from_line_offsets(
-                    line_offsets,
-                    track_sizes.clone(),
-                    vec![false; track_sizes.len()],
-                );
+                layout.columns = geometry.topology();
                 let mut names = resolved_grid_axis
                     .map(|axis| axis.physical_line_names().to_vec())
                     .or_else(|| {
@@ -1458,18 +1420,12 @@ impl<'a> LayoutBuilder<'a> {
                             .map(|template| template.line_names.clone())
                     })
                     .unwrap_or_else(|| layout.column_line_names.clone());
-                names.resize_with(layout.columns.line_offsets().len(), Vec::new);
-                names.truncate(layout.columns.line_offsets().len());
+                names.resize_with(layout.columns.track_count() + 1, Vec::new);
+                names.truncate(layout.columns.track_count() + 1);
                 layout.column_line_names = names;
             }
             GridLanesAxis::Rows if !has_auto_row_geometry => {
-                let line_offsets = geometry.line_offsets();
-                let track_sizes = geometry.track_sizes();
-                layout.rows = GridAxisTopology::from_line_offsets(
-                    line_offsets,
-                    track_sizes.clone(),
-                    vec![false; track_sizes.len()],
-                );
+                layout.rows = geometry.topology();
                 let mut names = resolved_grid_axis
                     .map(|axis| axis.physical_line_names().to_vec())
                     .or_else(|| {
@@ -1483,8 +1439,8 @@ impl<'a> LayoutBuilder<'a> {
                             .map(|template| template.line_names.clone())
                     })
                     .unwrap_or_else(|| layout.row_line_names.clone());
-                names.resize_with(layout.rows.line_offsets().len(), Vec::new);
-                names.truncate(layout.rows.line_offsets().len());
+                names.resize_with(layout.rows.track_count() + 1, Vec::new);
+                names.truncate(layout.rows.track_count() + 1);
                 layout.row_line_names = names;
             }
             GridLanesAxis::Rows => {}
@@ -2236,14 +2192,10 @@ impl<'a> LayoutBuilder<'a> {
             },
         )?;
         let geometry = match axis {
-            GridLanesAxis::Columns => GridLanesTrackGeometry::from_grid_layout_offsets(
-                &layout.columns.line_offsets(),
-                &layout.gap_decoration_gutters(&materialized_style).columns,
-            ),
-            GridLanesAxis::Rows => GridLanesTrackGeometry::from_grid_layout_offsets(
-                &layout.rows.line_offsets(),
-                &layout.gap_decoration_gutters(&materialized_style).rows,
-            ),
+            GridLanesAxis::Columns => {
+                GridLanesTrackGeometry::from_grid_axis_topology(&layout.columns)
+            }
+            GridLanesAxis::Rows => GridLanesTrackGeometry::from_grid_axis_topology(&layout.rows),
         }?;
         Some(geometry)
     }
@@ -3670,7 +3622,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_auto_fit_track_collapses_both_adjacent_gutters() {
+    fn collapsed_auto_fit_track_merges_its_adjacent_gutters() {
         let geometry = GridLanesTrackGeometry::from_track_sizes_with_active(
             &[37.5, 37.5, 0.0, 37.5],
             7.5,
@@ -3678,8 +3630,27 @@ mod tests {
         )
         .expect("non-empty track list has geometry");
 
-        assert_eq!(geometry.starts, vec![0.0, 45.0, 82.5, 82.5]);
-        assert_eq!(geometry.ends, vec![37.5, 82.5, 82.5, 120.0]);
+        assert_eq!(
+            geometry.topology.line_offsets(),
+            vec![0.0, 45.0, 90.0, 90.0, 127.5]
+        );
+        assert_eq!(geometry.topology.track_sizes(), vec![37.5, 37.5, 0.0, 37.5]);
+    }
+
+    #[test]
+    fn topology_round_trip_retains_gutter_before_zero_sized_lane() {
+        let geometry = GridLanesTrackGeometry::from_track_sizes(&[100.0, 0.0], 20.0)
+            .expect("non-empty track list has geometry");
+
+        let topology = geometry.topology();
+        assert_eq!(topology.track_sizes(), vec![100.0, 0.0]);
+        assert_eq!(topology.interior_gutters(), vec![20.0]);
+        assert_eq!(topology.line_offsets(), vec![0.0, 120.0, 120.0]);
+
+        let round_trip = GridLanesTrackGeometry::from_grid_axis_topology(&topology)
+            .expect("canonical topology has lane geometry");
+        assert_eq!(round_trip.topology.line_offsets(), vec![0.0, 120.0, 120.0]);
+        assert_eq!(round_trip.topology.track_sizes(), vec![100.0, 0.0]);
     }
 
     #[test]
@@ -3776,11 +3747,20 @@ mod tests {
 
             assert_eq!(resolution.active_line(2), 1);
             assert_eq!(resolution.active_line(4), 3);
-            assert_eq!(expanded.starts, vec![0.0, 20.0, 25.0, 60.0]);
-            assert_eq!(expanded.ends, vec![20.0, 20.0, 55.0, 100.0]);
-            assert_eq!(expanded.active, vec![true, false, true, true]);
             assert_eq!(
-                grid_lanes_shortest_range(&[10.0, 0.0, 5.0, 0.0], &expanded.active, 1, 1, 0.0),
+                expanded.topology.line_offsets(),
+                vec![0.0, 20.0, 25.0, 60.0, 100.0]
+            );
+            assert_eq!(expanded.topology.track_sizes(), vec![20.0, 0.0, 30.0, 40.0]);
+            assert_eq!(expanded.active_tracks(), vec![true, false, true, true]);
+            assert_eq!(
+                grid_lanes_shortest_range(
+                    &[10.0, 0.0, 5.0, 0.0],
+                    &expanded.active_tracks(),
+                    1,
+                    1,
+                    0.0,
+                ),
                 3..4
             );
         }

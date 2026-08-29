@@ -340,10 +340,8 @@ impl<'a> LayoutBuilder<'a> {
         // dimensions are still part of their preferred widths.
         // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
         let containing_block_height = self
-            .definite_block_size_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(PercentageBasis::indefinite);
+            .block_percentage_context_stack
+            .current_percentage_basis();
         let replaced_width = match replaced_element_kind(element) {
             Some(ReplacedElementKind::Canvas) => Some(
                 used_canvas(

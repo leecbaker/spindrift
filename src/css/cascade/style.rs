@@ -716,7 +716,10 @@ impl<'a> ElementCascadeContext<'a> {
                         origin: stylesheet.origin,
                         specificity: stylesheet
                             .specificity_override
-                            .unwrap_or(matching_specificity),
+                            .unwrap_or_else(|| {
+                                matching_specificity
+                                    .saturating_add(rule.routed_pseudo_specificity)
+                            }),
                         stylesheet_index,
                         rule,
                         scope_proximity,
@@ -1423,7 +1426,7 @@ fn apply_forced_color_used_values(
             bottom: CSS_PX_TO_PT,
             left: CSS_PX_TO_PT,
         };
-        style.border_width_values = CssEdges::all(width);
+        style.border_width_values = PhysicalEdges::all(width);
         style.border_width = CSS_PX_TO_PT;
     }
     style.outline_color = style
@@ -2927,6 +2930,8 @@ fn apply_marker_rules_from_rule_set<'a>(
     marker_style.marker_style = None;
     marker_style.before_style = None;
     marker_style.after_style = None;
+    marker_style.scroll_marker_style = None;
+    marker_style.scroll_marker_group_style = None;
     marker_style.footnote_call_style = None;
     marker_style.footnote_marker_style = None;
     marker_style.first_line_style = None;
@@ -2964,6 +2969,7 @@ fn apply_generated_pseudo_rules_with_context<'a>(
         |stylesheet| &stylesheet.before_rules,
         |stylesheet| &stylesheet.before_marker_rules,
         parent_ch_advance,
+        true,
     )
     .map(Box::new);
     style.after_style = generated_pseudo_style_with_context(
@@ -2973,6 +2979,27 @@ fn apply_generated_pseudo_rules_with_context<'a>(
         |stylesheet| &stylesheet.after_rules,
         |stylesheet| &stylesheet.after_marker_rules,
         parent_ch_advance,
+        true,
+    )
+    .map(Box::new);
+    style.scroll_marker_style = generated_pseudo_style_with_context(
+        style,
+        stylesheets,
+        cascade,
+        |stylesheet| &stylesheet.scroll_marker_rules,
+        |_stylesheet| &[],
+        parent_ch_advance,
+        true,
+    )
+    .map(Box::new);
+    style.scroll_marker_group_style = generated_pseudo_style_with_context(
+        style,
+        stylesheets,
+        cascade,
+        |stylesheet| &stylesheet.scroll_marker_group_rules,
+        |_stylesheet| &[],
+        parent_ch_advance,
+        false,
     )
     .map(Box::new);
 }
@@ -2984,6 +3011,7 @@ fn generated_pseudo_style_with_context<'a>(
     rule_set: fn(&Stylesheet) -> &[StyleRule],
     marker_rule_set: fn(&Stylesheet) -> &[StyleRule],
     parent_ch_advance: LayoutLength,
+    requires_generated_content: bool,
 ) -> Option<ComputedStyle> {
     cascade.collect_matching_rules(stylesheets, rule_set);
     if cascade.matching_rules.is_empty() {
@@ -2998,6 +3026,8 @@ fn generated_pseudo_style_with_context<'a>(
     pseudo_style.display = Display::INLINE;
     pseudo_style.before_style = None;
     pseudo_style.after_style = None;
+    pseudo_style.scroll_marker_style = None;
+    pseudo_style.scroll_marker_group_style = None;
     pseudo_style.marker_style = None;
     pseudo_style.footnote_call_style = None;
     pseudo_style.footnote_marker_style = None;
@@ -3027,7 +3057,7 @@ fn generated_pseudo_style_with_context<'a>(
         parent_ch_advance,
         marker_rule_set,
     );
-    pseudo_style.content.is_generated().then_some(pseudo_style)
+    (!requires_generated_content || pseudo_style.content.is_generated()).then_some(pseudo_style)
 }
 
 fn apply_footnote_pseudo_rules_with_context<'a>(

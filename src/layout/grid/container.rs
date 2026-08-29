@@ -8,6 +8,7 @@ use super::*;
 use crate::layout::assets::FragmentainerOrdinal;
 use crate::layout::baseline::PhysicalTopBaselineOffset;
 use crate::layout::block::{DefiniteBlockBreakContext, should_prebreak_definite_block};
+use crate::units::content_box_to_margin_box_length;
 
 /// Resolve the pre-layout scrollport reservation shared by Grid's intrinsic,
 /// final sizing, and overflow-clip phases. Quire's static PDF UA uses overlay
@@ -56,7 +57,158 @@ fn grid_total_content_height(
     ))
 }
 
+/// Resolve the fixed content-height contribution of a size-contained Grid
+/// before its real items participate in final track sizing.
+///
+/// Both normal Grid layout and a floated Grid's pure block-size query need
+/// this prepass. Keeping it at the track-sizing boundary ensures that a float
+/// does not acquire a second, subtly different containment interpretation.
+#[allow(clippy::too_many_arguments)]
+fn grid_size_contained_content_height(
+    layout: &mut LayoutBuilder<'_>,
+    style: &ComputedStyle,
+    contains_size: bool,
+    stylesheets: &Stylesheets<'_>,
+    grid_content_width: PhysicalContentWidth,
+    definite_content_height: Option<PhysicalContentHeight>,
+    scrollbar_reservation: ScrollbarGutterReservation,
+    available_block_size: f32,
+) -> Option<PhysicalContentHeight> {
+    if !contains_size {
+        return None;
+    }
+    let empty_grid_height = layout
+        .compute_grid_layout(
+            style,
+            &[],
+            stylesheets,
+            grid_content_width,
+            grid_scrollport_content_height_basis(definite_content_height, scrollbar_reservation),
+            GridLayoutPurpose::IntrinsicProbe,
+        )
+        .map(|layout| layout.height)
+        .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(0.0)));
+    Some(
+        grid_scrollport_content_height_basis(definite_content_height, scrollbar_reservation)
+            .unwrap_or_else(|| {
+                PhysicalContentHeight::new(constrain_content_height(
+                    style,
+                    empty_grid_height.content_box_length(),
+                    PercentageBasis::definite(layout_pt(available_block_size)),
+                ))
+            }),
+    )
+}
+
 impl<'a> LayoutBuilder<'a> {
+    /// Measure an automatic floated Grid's margin-box block size without
+    /// entering its paint or item-replay phases.
+    ///
+    /// Float placement has already frozen the used physical content width.
+    /// Grid track sizing alone determines the container's used automatic
+    /// block size at that width; final layout subsequently performs the sole
+    /// authoritative descendant replay. This is deliberately a value query,
+    /// not a cache of speculative layout state.
+    /// <https://www.w3.org/TR/CSS22/visudet.html#root-height>
+    /// <https://www.w3.org/TR/css-grid-1/#grid-container-size>
+    pub(in crate::layout) fn measure_floated_grid_margin_box_height(
+        &mut self,
+        element: &Element,
+        placed_style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        content_width: PhysicalContentWidth,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+    ) -> Option<MarginBoxLength> {
+        #[cfg(feature = "layout-profile")]
+        let _profile = crate::layout::layout_profile::grid_float_block_size_measurement_scope();
+        let child_boxes = child_boxes?;
+        let mut replay_style = placed_style.clone();
+        suppress_replayed_item_margins(&mut replay_style);
+        let mut used_style =
+            GridUsedStyle::from_normalized(self.style_with_current_viewport_lengths(&replay_style));
+        if layout_containment_applies_to_element(element, &used_style)
+            || paint_containment_applies_to_element(element, &used_style)
+        {
+            used_style.grid_template_rows.resolve_contained_subgrid();
+            used_style.grid_template_columns.resolve_contained_subgrid();
+        }
+
+        let authored_borders = used_border_widths(&used_style);
+        let containing_inline_size = content_box_to_border_box_length(
+            content_width.content_box_length(),
+            non_content_pt(
+                used_style.padding.left
+                    + used_style.padding.right
+                    + authored_borders.left
+                    + authored_borders.right,
+            ),
+        )
+        .points();
+        let box_metrics = apply_used_box_metrics(
+            &mut used_style,
+            PercentageBasis::definite(layout_pt(containing_inline_size)),
+        );
+        let style = &used_style;
+        let scrollbar_reservation = grid_scrollbar_reservation(style);
+        let containment = used_property_containment(element, style);
+        let horizontal_extras = box_metrics.horizontal_non_content_length().points();
+        let vertical_extras = box_metrics.vertical_non_content_length().points();
+        let grid_content_width =
+            grid_scrollport_content_width(content_width, scrollbar_reservation);
+        let definite_content_height = non_replaced_aspect_ratio_content_height(
+            style,
+            content_width.points(),
+            horizontal_extras,
+            vertical_extras,
+        )
+        .map(|height| {
+            PhysicalContentHeight::new(constrain_content_height(
+                style,
+                content_box_pt(height),
+                PercentageBasis::definite(layout_pt(containing_inline_size)),
+            ))
+        });
+        let (children, _) = grid_child_lists_from_boxes(child_boxes);
+        let children = self.prepare_grid_children(children);
+        let size_contained_content_height = grid_size_contained_content_height(
+            self,
+            style,
+            containment.size,
+            stylesheets,
+            grid_content_width,
+            definite_content_height,
+            scrollbar_reservation,
+            containing_inline_size,
+        );
+        let grid_layout = self.compute_grid_layout(
+            style,
+            &children,
+            stylesheets,
+            grid_content_width,
+            size_contained_content_height.or_else(|| {
+                grid_scrollport_content_height_basis(definite_content_height, scrollbar_reservation)
+            }),
+            GridLayoutPurpose::FloatBlockSizeMeasurement,
+        )?;
+        let content_height = size_contained_content_height.unwrap_or_else(|| {
+            PhysicalContentHeight::new(constrain_content_height(
+                style,
+                grid_layout.height.content_box_length(),
+                PercentageBasis::definite(layout_pt(containing_inline_size)),
+            ))
+        });
+        let content_height = grid_total_content_height(
+            content_height,
+            definite_content_height,
+            scrollbar_reservation,
+        );
+        Some(content_box_to_margin_box_length(
+            content_height.content_box_length(),
+            box_metrics.vertical_non_content_length(),
+            layout_pt(placed_style.margin.top + placed_style.margin.bottom),
+        ))
+    }
+
     /// Lay out a CSS grid container, preserving a flex item's post-flexing
     /// definiteness when grid is the root formatting context of a replayed
     /// flex item.
@@ -293,37 +445,16 @@ impl<'a> LayoutBuilder<'a> {
         // apply), then lay out the real items into that resulting used size.
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
         // <https://www.w3.org/TR/css-grid-1/#algo-overview>
-        let size_contained_content_height = if containment.size {
-            let empty_grid_height = self
-                .compute_grid_layout(
-                    style,
-                    &[],
-                    stylesheets,
-                    PhysicalContentWidth::new(content_box_pt(inner_width)),
-                    grid_scrollport_content_height_basis(
-                        definite_content_height,
-                        scrollbar_reservation,
-                    ),
-                    GridLayoutPurpose::IntrinsicProbe,
-                )
-                .map(|layout| layout.height)
-                .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(0.0)));
-            Some(
-                grid_scrollport_content_height_basis(
-                    definite_content_height,
-                    scrollbar_reservation,
-                )
-                .unwrap_or_else(|| {
-                    PhysicalContentHeight::new(constrain_content_height(
-                        style,
-                        empty_grid_height.content_box_length(),
-                        PercentageBasis::definite(layout_pt(available_outer_height)),
-                    ))
-                }),
-            )
-        } else {
-            None
-        };
+        let size_contained_content_height = grid_size_contained_content_height(
+            self,
+            style,
+            containment.size,
+            stylesheets,
+            PhysicalContentWidth::new(content_box_pt(inner_width)),
+            definite_content_height,
+            scrollbar_reservation,
+            available_outer_height,
+        );
         let grid_content_height_basis = size_contained_content_height.or(definite_content_height);
         // The principal box of an auto-sized size-contained grid has the
         // empty-grid height, but its real grid items are still formatted.
@@ -584,8 +715,8 @@ impl<'a> LayoutBuilder<'a> {
                     content_height: PhysicalContentHeight::new(content_box_pt(
                         total_content_height,
                     )),
-                    column_line_offsets: &grid_layout.columns.line_offsets(),
-                    row_line_offsets: &grid_layout.rows.line_offsets(),
+                    columns: &grid_layout.columns,
+                    rows: &grid_layout.rows,
                 },
                 containing_block,
             ));
@@ -637,6 +768,8 @@ impl<'a> LayoutBuilder<'a> {
                     content_height: PhysicalContentHeight::new(content_box_pt(
                         total_content_height,
                     )),
+                    columns: &grid_layout.columns,
+                    rows: &grid_layout.rows,
                     column_line_offsets: &grid_layout.columns.line_offsets(),
                     row_line_offsets: &grid_layout.rows.line_offsets(),
                     positioning_containing_block: establishes_positioning_containing_block
@@ -1543,8 +1676,8 @@ impl<'a> LayoutBuilder<'a> {
                     content_height: PhysicalContentHeight::new(content_box_pt(
                         total_content_height,
                     )),
-                    column_line_offsets: &grid_layout.columns.line_offsets(),
-                    row_line_offsets: &grid_layout.rows.line_offsets(),
+                    columns: &grid_layout.columns,
+                    rows: &grid_layout.rows,
                 },
                 containing_block,
             ));
@@ -1587,6 +1720,8 @@ impl<'a> LayoutBuilder<'a> {
                     content_height: PhysicalContentHeight::new(content_box_pt(
                         total_content_height,
                     )),
+                    columns: &grid_layout.columns,
+                    rows: &grid_layout.rows,
                     column_line_offsets: &grid_layout.columns.line_offsets(),
                     row_line_offsets: &grid_layout.rows.line_offsets(),
                     positioning_containing_block: establishes_positioning_containing_block

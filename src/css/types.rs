@@ -8,8 +8,10 @@ pub(crate) use crate::units::{
     LayoutLength, PercentageBasis, SemanticLengthExt, layout_points, layout_pt,
 };
 
+mod alignment;
 mod background;
 mod border_image;
+mod borders;
 mod box_model;
 mod columns;
 mod compositing;
@@ -17,15 +19,18 @@ mod computed;
 mod containment;
 mod counters;
 mod display;
+mod flex;
 mod fonts;
 mod gaps;
 mod generated_content;
 mod grid;
 mod images;
+mod inline;
 mod language;
 mod lengths;
 mod line;
 mod lists;
+mod overflow;
 mod paged_media;
 mod positioning;
 mod primitives;
@@ -35,12 +40,16 @@ mod shapes;
 mod sides;
 mod sizing;
 mod source;
+mod tables;
 mod text;
 mod text_decoration;
 mod transforms;
+mod writing_modes;
 
+pub(crate) use alignment::*;
 pub(crate) use background::*;
 pub(crate) use border_image::*;
+pub(crate) use borders::*;
 pub(crate) use box_model::*;
 pub(crate) use columns::*;
 pub(crate) use compositing::*;
@@ -48,15 +57,18 @@ pub(crate) use computed::*;
 pub(crate) use containment::*;
 pub(crate) use counters::*;
 pub(crate) use display::*;
+pub(crate) use flex::*;
 pub(crate) use fonts::*;
 pub(crate) use gaps::*;
 pub(crate) use generated_content::*;
 pub(crate) use grid::*;
 pub(crate) use images::*;
+pub(crate) use inline::*;
 pub(crate) use language::*;
 pub(crate) use lengths::*;
 pub(crate) use line::*;
 pub(crate) use lists::*;
+pub(crate) use overflow::*;
 pub(crate) use paged_media::*;
 pub(crate) use positioning::*;
 pub use primitives::*;
@@ -66,9 +78,11 @@ pub(crate) use shapes::*;
 pub(crate) use sides::*;
 pub(crate) use sizing::*;
 pub use source::*;
+pub(crate) use tables::*;
 pub(crate) use text::*;
 pub(crate) use text_decoration::*;
 pub(crate) use transforms::*;
+pub(crate) use writing_modes::*;
 
 /// Projects deferred viewport-relative CSS lengths into layout lengths.
 ///

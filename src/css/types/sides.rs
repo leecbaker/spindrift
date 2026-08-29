@@ -493,3 +493,27 @@ mod tests {
         }
     }
 }
+
+/// Four physical CSS edges in top/right/bottom/left order.
+///
+/// CSS Box Model Level 3 defines physical margin, padding, and border edge
+/// properties in this order:
+/// <https://www.w3.org/TR/css-box-3/#the-margin-properties>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PhysicalEdges<T> {
+    pub top: T,
+    pub right: T,
+    pub bottom: T,
+    pub left: T,
+}
+
+impl<T: Clone> PhysicalEdges<T> {
+    pub(crate) fn all(value: T) -> Self {
+        Self {
+            top: value.clone(),
+            right: value.clone(),
+            bottom: value.clone(),
+            left: value,
+        }
+    }
+}

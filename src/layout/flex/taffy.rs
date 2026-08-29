@@ -1,6 +1,9 @@
 use super::*;
 use crate::layout::taffy_bridge;
 
+mod alignment;
+pub(super) use alignment::*;
+
 type FlexLogicalInlinePercentageBasis = LogicalInlinePercentageBasis<FlexAvailableSizeSource>;
 
 /// Wraps a raw Taffy layout result in the Taffy coordinate space.
@@ -484,6 +487,22 @@ pub(super) fn measure_flex_item(
     )
 }
 
+/// Adapt Quire's typed flex-item estimate to Taffy 0.14's leaf-layout
+/// callback. Only physical top-edge baselines are supplied; vertical-writing
+/// and last-baseline reconciliation remain Quire-owned.
+pub(super) fn taffy_flex_measurement(
+    input: ::taffy::tree::LayoutInput,
+    estimate: Option<&mut FlexItemEstimate>,
+) -> ::taffy::tree::LayoutOutput {
+    let baselines = estimate
+        .as_deref()
+        .map(|estimate| (*estimate).legacy_metrics())
+        .map(|metrics| (metrics.first_baseline, metrics.last_baseline))
+        .unwrap_or((None, None));
+    let size = measure_flex_item(input.known_dimensions, input.available_space, estimate);
+    taffy_bridge::measured_leaf_output(size, baselines.0, baselines.1)
+}
+
 /// Converts a CSS optional size to Taffy's `Dimension`.
 ///
 /// CSS Values defines the `<length-percentage> | auto` shape used by flex item
@@ -491,8 +510,11 @@ pub(super) fn measure_flex_item(
 /// <https://www.w3.org/TR/css-values-4/#mixed-percentages>.
 pub(super) fn taffy_optional_dimension(
     value: css::ComputedLengthPercentageOrAuto,
-) -> taffy_layout::Dimension {
-    taffy_flex_optional_dimension(value, FlexTaffyPercentagePolicy::PreservePurePercentage)
+) -> taffy_layout::LengthPercentageAuto {
+    taffy_bridge::min_max_constraint(taffy_flex_optional_dimension(
+        value,
+        FlexTaffyPercentagePolicy::PreservePurePercentage,
+    ))
 }
 
 fn taffy_dimension_from_length_percentage(
@@ -519,10 +541,10 @@ fn taffy_dimension_from_length_percentage(
 pub(super) fn taffy_min_dimension(
     value: css::ComputedLengthPercentageOrAuto,
     percentage_basis: FlexAvailablePercentageBasis,
-) -> taffy_layout::Dimension {
+) -> taffy_layout::LengthPercentageAuto {
     used_length_percentage_or_auto(value, percentage_basis)
-        .map(|length| taffy_layout::Dimension::length(length.points()))
-        .unwrap_or_else(|| taffy_layout::Dimension::length(0.0))
+        .map(|length| taffy_layout::LengthPercentageAuto::length(length.points()))
+        .unwrap_or_else(|| taffy_layout::LengthPercentageAuto::length(0.0))
 }
 
 /// Resolve a table flex item's authored length/percentage minimum without
@@ -539,7 +561,7 @@ pub(super) fn table_length_percentage_min_dimension(
     value: css::ComputedLengthPercentageOrAuto,
     percentage_basis: FlexAvailablePercentageBasis,
     table_min_content: ContentBoxLength,
-) -> taffy_layout::Dimension {
+) -> taffy_layout::LengthPercentageAuto {
     debug_assert!(matches!(
         value,
         css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
@@ -549,7 +571,7 @@ pub(super) fn table_length_percentage_min_dimension(
     let authored = used_length_percentage_or_auto(value, percentage_basis)
         .unwrap_or(table_min_layout)
         .max(table_min_layout);
-    taffy_layout::Dimension::length(authored.points())
+    taffy_layout::LengthPercentageAuto::length(authored.points())
 }
 
 /// Computes Taffy's automatic minimum size for a flex item.
@@ -566,17 +588,17 @@ pub(super) fn flex_min_size_dimension(
     estimated_min_content: ContentBoxLength,
     estimated_max_content: ContentBoxLength,
     context: FlexMinSizeDimensionContext<'_>,
-) -> taffy_layout::Dimension {
+) -> taffy_layout::LengthPercentageAuto {
     let Some(automatic_minimum) = resolve_automatic_flex_minimum(specified.clone(), context) else {
-        return taffy_intrinsic_dimension_with_basis_and_stretch(
+        return taffy_bridge::min_max_constraint(taffy_intrinsic_dimension_with_basis_and_stretch(
             specified,
             context.percentage_basis,
             estimated_min_content,
             estimated_max_content,
             context.stretch,
-        );
+        ));
     };
-    taffy_layout::Dimension::length(automatic_minimum.used_content_box.points())
+    taffy_layout::LengthPercentageAuto::length(automatic_minimum.used_content_box.points())
 }
 
 /// The resolved content-based automatic minimum of one flex-item axis.
@@ -1954,7 +1976,7 @@ mod tests {
 
         assert_eq!(
             taffy_optional_dimension(percent.clone()),
-            taffy_layout::Dimension::percent(0.5),
+            taffy_layout::LengthPercentageAuto::percent(0.5),
         );
         assert_eq!(
             taffy_optional_dimension_with_basis(percent.clone(), definite_basis),
@@ -1972,7 +1994,7 @@ mod tests {
 
         assert_eq!(
             taffy_optional_dimension(fixed.clone()),
-            taffy_layout::Dimension::length(12.0),
+            taffy_layout::LengthPercentageAuto::length(12.0),
         );
         assert_eq!(
             taffy_optional_dimension_with_basis(fixed, indefinite_basis),
@@ -2122,11 +2144,11 @@ mod tests {
 
         assert_eq!(
             taffy_min_dimension(fifty_percent.clone(), width_basis),
-            taffy_layout::Dimension::length(100.0)
+            taffy_layout::LengthPercentageAuto::length(100.0)
         );
         assert_eq!(
             taffy_min_dimension(fifty_percent, height_basis),
-            taffy_layout::Dimension::length(40.0)
+            taffy_layout::LengthPercentageAuto::length(40.0)
         );
     }
 

@@ -357,7 +357,7 @@ mod tests {
             left: 4.0,
         };
         style.box_values.margin =
-            css::CssEdges::all(css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::PhysicalEdges::all(css::ComputedLengthPercentageOrAuto::LengthPercentage(
                 css::ComputedLengthPercentage::from_points(4.0),
             ));
         style.page = css::PageAssignment::Named(css::PageName::new("chapter".to_string()));
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(style.margin, css::Edges::ZERO);
         assert_eq!(
             style.box_values.margin,
-            css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO)
+            css::PhysicalEdges::all(css::ComputedLengthPercentageOrAuto::ZERO)
         );
         assert!(!style.page.is_specified());
         assert_eq!(style.page, css::PageAssignment::Unspecified);

@@ -500,7 +500,7 @@ fn format_page_counter_i32(
     counter_styles: &HashMap<String, CounterStyleRule>,
 ) -> String {
     let style = style.unwrap_or(ListStyleType::Decimal);
-    list::counter_text(style, value, counter_styles).unwrap_or_else(|| value.to_string())
+    counter_styles::counter_text(style, value, counter_styles).unwrap_or_else(|| value.to_string())
 }
 
 fn resolve_target_counter_value(

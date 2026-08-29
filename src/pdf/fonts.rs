@@ -676,8 +676,8 @@ fn mapped_glyph_widths(
     };
     let units_per_em = font.units_per_em.max(1) as f32;
     source_gid_to_cid
-        .iter()
-        .filter_map(|(_source_gid, cid)| {
+        .values()
+        .filter_map(|cid| {
             face.glyph_hor_advance(ttf_parser::GlyphId(*cid))
                 .map(|width| (width as f32 * 1000.0 / units_per_em).round() as i32)
         })

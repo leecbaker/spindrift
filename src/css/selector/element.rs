@@ -444,6 +444,11 @@ impl SelectorElement for StyleElement<'_> {
             QuirePseudoClass::TargetWithin => {
                 self.signature().is_target || self.signature().has_target_descendant
             }
+            // The static renderer's current target is its fragment-navigation
+            // target. Relative marker state needs layout geometry and is
+            // therefore supplied only once a render-scoped topology exists.
+            QuirePseudoClass::TargetCurrent => self.signature().is_target,
+            QuirePseudoClass::TargetBefore | QuirePseudoClass::TargetAfter => false,
             QuirePseudoClass::Open => self.is_open(),
             QuirePseudoClass::Defined => true,
             QuirePseudoClass::Enabled => {

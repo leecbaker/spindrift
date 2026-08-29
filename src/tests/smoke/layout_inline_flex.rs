@@ -2153,6 +2153,43 @@ async fn grid_auto_fit_collapses_empty_fixed_repeat_tracks() {
 }
 
 #[tokio::test]
+async fn grid_auto_fit_merges_gutters_around_an_empty_interior_track() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: repeat(auto-fit, 20pt); grid-template-rows: 10pt; column-gap: 5pt; width: 70pt }\
+         .a { grid-column: 1; background: red }\
+         .b { grid-column: 3; background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("first auto-fit grid item should paint");
+    let blue = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("third auto-fit grid item should paint");
+
+    assert!((red.x() - 10.0).abs() < 0.01, "first item: {red:?}");
+    assert!((red.width() - 20.0).abs() < 0.01, "first item: {red:?}");
+    assert!(
+        (blue.x() - 35.0).abs() < 0.01,
+        "the collapsed middle track should preserve one merged gutter: {blue:?}"
+    );
+    assert!((blue.width() - 20.0).abs() < 0.01, "third item: {blue:?}");
+}
+
+#[tokio::test]
 async fn grid_auto_template_rows_and_columns_size_to_items() {
     let document = Html::from_string(
         "<style>\
@@ -2337,6 +2374,39 @@ async fn rtl_grid_auto_placement_starts_at_inline_start_column() {
         (blue.x() - 10.0).abs() < 0.01,
         "third RTL auto-placed item should occupy the leftmost track: {blue:?}"
     );
+}
+
+#[tokio::test]
+async fn rtl_grid_keeps_unequal_tracks_in_physical_order() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; direction: rtl; grid-template-columns: [right] 10pt [middle] 20pt [left] 30pt [end]; grid-template-rows: 10pt; column-gap: 5pt; width: 70pt }\
+         .a { grid-column: right / middle; background: red }\
+         .b { background: green }\
+         .c { grid-column: left / end; background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects()
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
+    };
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
+
+    assert!((red.x() - 70.0).abs() < 0.01 && (red.width() - 10.0).abs() < 0.01);
+    assert!((green.x() - 45.0).abs() < 0.01 && (green.width() - 20.0).abs() < 0.01);
+    assert!((blue.x() - 10.0).abs() < 0.01 && (blue.width() - 30.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -3579,6 +3649,44 @@ async fn grid_percentage_gap_final_layout_resolves_against_content_box() {
     assert!(
         (first.y() - (third.y() + third.height()) - 18.0).abs() < 0.01,
         "row gap should resolve against the 180pt content height for final item layout: first={first:?}, third={third:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_final_item_sizing_excludes_the_following_gutter() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 220pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 100pt 40pt; grid-template-rows: 20pt 20pt; column-gap: 20pt; row-gap: 5pt; width: 160pt }\
+         .percentage { grid-column: 1 / 2; grid-row: 1; width: calc(10pt + 50%); background: red }\
+         .ratio { grid-column: 1 / 2; grid-row: 2; width: auto; height: 20pt; aspect-ratio: 2; justify-self: stretch; background: green }\
+         </style>\
+         <div class=\"grid\"><div class=\"percentage\"></div><div class=\"ratio\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("mixed-percentage Grid item should paint");
+    let green = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+        .expect("aspect-ratio Grid item should paint");
+
+    assert!(
+        (red.width() - 60.0).abs() < 0.01,
+        "percentage item: {red:?}"
+    );
+    assert!(
+        (green.width() - 100.0).abs() < 0.01,
+        "ratio item: {green:?}"
     );
 }
 
@@ -5072,11 +5180,11 @@ async fn grid_layout_places_backward_named_implicit_span_before_distributed_auto
     let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
-        (red.x() - 14.25).abs() < 0.01 && (red.width() - 65.0).abs() < 0.01,
+        (red.x() - 5.0).abs() < 0.01 && (red.width() - 60.0).abs() < 0.01,
         "startward implicit span should use distribution after trailing empty auto-fit tracks collapse: {red:?}"
     );
     assert!(
-        (blue.x() - 66.25).abs() < 0.01 && (blue.width() - 20.0).abs() < 0.01,
+        (blue.x() - 65.0).abs() < 0.01 && (blue.width() - 20.0).abs() < 0.01,
         "occupied auto-fit track should use the distributed collapsed-track geometry: {blue:?}"
     );
 }
@@ -5116,8 +5224,8 @@ async fn grid_layout_places_negative_named_implicit_row_before_auto_fit_grid() {
         "positive explicit auto-fit row references should shift after the prepended implicit row: {blue:?}"
     );
     assert!(
-        (red.y() - (blue.y() + blue.height() + 5.0)).abs() < 0.01,
-        "line 2 should remain below the synthesized startward implicit row after trailing empty auto-fit tracks collapse: red={red:?}, blue={blue:?}"
+        (red.y() - (blue.y() + blue.height()) - 5.0).abs() < 0.01,
+        "line 2 should remain below the synthesized startward implicit row by the merged auto-fit gutter: red={red:?}, blue={blue:?}"
     );
 }
 
@@ -6665,6 +6773,38 @@ async fn absolute_grid_child_left_offset_resolves_against_grid_area() {
         (fourth.x() - third.x() - 200.0).abs() < 0.01,
         "left offset should resolve from each column grid area in the second row: third={third:?}, fourth={fourth:?}"
     );
+}
+
+#[tokio::test]
+async fn absolute_grid_area_excludes_the_following_gutter_in_ltr_and_rtl() {
+    for (direction, expected_x) in [("ltr", 10.0), ("rtl", 70.0)] {
+        let document = Html::from_string(format!(
+            "<style>\
+             @page {{ size: 220pt 100pt; margin: 10pt }}\
+             body {{ margin: 0 }}\
+             .grid {{ display: grid; position: relative; direction: {direction}; grid-template-columns: 100pt 40pt; grid-template-rows: 10pt; column-gap: 20pt; width: 160pt }}\
+             .abs {{ position: absolute; grid-column: 1 / 2; left: 0; right: 0; height: 8pt; background: green }}\
+             </style>\
+             <div class=\"grid\"><div class=\"abs\"></div></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let green = document.pages[0]
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+            .expect("absolutely positioned grid child should paint");
+        assert!(
+            (green.x() - expected_x).abs() < 0.01,
+            "{direction} area should start at its physical track edge: {green:?}"
+        );
+        assert!(
+            (green.width() - 100.0).abs() < 0.01,
+            "{direction} area must exclude its following gutter: {green:?}"
+        );
+    }
 }
 
 #[tokio::test]

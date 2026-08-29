@@ -448,13 +448,12 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
             .flatten();
-            let margin_collapse_style = self
-                .definite_block_size_stack
-                .last()
-                .is_some_and(|basis| {
-                    height_behaves_as_auto_for_margin_collapse(&child_style, *basis)
-                })
-                .then(|| Self::dom_auto_height_margin_collapse_style(&child_style));
+            let margin_collapse_style = height_behaves_as_auto_for_margin_collapse(
+                &child_style,
+                self.block_percentage_context_stack
+                    .current_percentage_basis(),
+            )
+            .then(|| Self::dom_auto_height_margin_collapse_style(&child_style));
             let margin_collapse_style = margin_collapse_style.as_deref().unwrap_or(&child_style);
             let self_collapsing_child = is_flow_child
                 && !self.has_in_flow_marker_line(child_element, &child_style)
@@ -742,7 +741,9 @@ impl<'a> LayoutBuilder<'a> {
                 let replay_origin_y = self.cursor_y - child_style.margin.top;
                 let replay_separation = replay
                     .clearance_boundary()
-                    .map(|border_top| AdjoiningFloatReplaySeparation::Clearance { border_top })
+                    .map(|boundary| AdjoiningFloatReplaySeparation::Clearance {
+                        border_top: boundary.border_top(),
+                    })
                     .unwrap_or_else(|| {
                         self.adjoining_float_replay_separated_by_following_child(
                             &replay,
@@ -787,23 +788,21 @@ impl<'a> LayoutBuilder<'a> {
                 && dom_state.adjoining_float_replay.is_none()
                 && dom_state.replaying_adjoining_until.is_none()
             {
-                Some(
-                    PendingAdjoiningFloatReplayCandidate {
-                        meta: AdjoiningFloatReplayCandidateMeta {
-                            index: dom_state.child_node_index,
-                            element_index: dom_state.element_index.saturating_sub(1),
-                            previous_flow_bottom_margin: dom_state.previous_flow_bottom_margin,
-                            seen_flow_child: dom_state.seen_flow_child,
-                            trim_block_start_adjoining_margins: dom_state
-                                .trim_block_start_adjoining_margins,
-                            collapsed_end_margin: dom_state.collapsed_end_margin,
-                            previous_child_page_end: None,
-                            float_run: dom_state.float_run,
-                            previous_break_after: dom_state.previous_break_after,
-                        },
-                    }
-                    .arm(self),
-                )
+                Some(PendingAdjoiningFloatReplayCandidate {
+                    snapshot: Box::new(self.snapshot()),
+                    meta: AdjoiningFloatReplayCandidateMeta {
+                        index: dom_state.child_node_index,
+                        element_index: dom_state.element_index.saturating_sub(1),
+                        previous_flow_bottom_margin: dom_state.previous_flow_bottom_margin,
+                        seen_flow_child: dom_state.seen_flow_child,
+                        trim_block_start_adjoining_margins: dom_state
+                            .trim_block_start_adjoining_margins,
+                        collapsed_end_margin: dom_state.collapsed_end_margin,
+                        previous_child_page_end: None,
+                        float_run: dom_state.float_run,
+                        previous_break_after: dom_state.previous_break_after,
+                    },
+                })
             } else {
                 None
             };
@@ -1062,15 +1061,8 @@ impl<'a> LayoutBuilder<'a> {
                 .float_contexts
                 .last()
                 .is_some_and(|context| context.shapes.len() > float_shape_count_before);
-            if emitted_float && let Some(mut candidate) = adjoining_candidate {
-                if self.last_block_layout_outcome.margin_collapse_boundary
-                    == BlockMarginCollapseBoundary::SeparatedByClearance
-                    && let Some(border_box) = self.last_block_layout_outcome.static_border_box
-                {
-                    candidate
-                        .record_clearance_boundary(PageTopBlockPosition::new(border_box.max_y()));
-                }
-                dom_state.adjoining_float_replay = Some(candidate);
+            if emitted_float && let Some(candidate) = adjoining_candidate {
+                dom_state.adjoining_float_replay = Some(candidate.arm(self));
             }
             if is_flow_child {
                 let child_start_separated_by_clearance = child_uses_block_layout

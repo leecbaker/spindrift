@@ -1,4 +1,4 @@
-use super::model::{GridItemArea, GridItemLayout};
+use super::model::{GridAxisTopology, GridItemArea, GridItemLayout};
 use super::*;
 
 /// Correct same-page grid self-alignment values outside Taffy's model.
@@ -17,8 +17,8 @@ pub(super) fn apply_grid_self_alignment_corrections(
     children: &[GridChild<'_>],
     container_width: PhysicalContentWidth,
     container_height: f32,
-    column_line_offsets: &[f32],
-    row_line_offsets: &[f32],
+    columns: &GridAxisTopology,
+    rows: &GridAxisTopology,
     items: &mut [GridItemLayout],
 ) {
     if WritingModeAxes::new(container_style.writing_mode, container_style.direction)
@@ -38,7 +38,7 @@ pub(super) fn apply_grid_self_alignment_corrections(
             container_style.justify_content,
             container_width,
             area,
-            column_line_offsets,
+            columns,
             item.width(),
         ) {
             item.set_axis_geometry(GridAxis::Column, x, item.width());
@@ -50,7 +50,7 @@ pub(super) fn apply_grid_self_alignment_corrections(
             container_style.align_content,
             container_height,
             area,
-            row_line_offsets,
+            rows,
             item.height(),
         ) {
             item.set_axis_geometry(GridAxis::Row, y, item.height());
@@ -64,7 +64,7 @@ fn horizontal_self_alignment_offset(
     justify_content: css::JustifyContent,
     container_width: PhysicalContentWidth,
     area: GridItemArea,
-    column_line_offsets: &[f32],
+    columns: &GridAxisTopology,
     item_width: f32,
 ) -> Option<f32> {
     let side = match justify_self.keyword {
@@ -84,9 +84,9 @@ fn horizontal_self_alignment_offset(
             axis: PhysicalAxis::Horizontal,
             content_alignment: justify_content,
             container_size: container_width.points(),
-            line_offsets: column_line_offsets,
-            start_line: usize::from(area.column_start).saturating_sub(1),
-            end_line: usize::from(area.column_end).saturating_sub(1),
+            topology: columns,
+            start_line: area.column_start,
+            end_line: area.column_end,
         },
         item_width,
     )
@@ -98,7 +98,7 @@ fn vertical_self_alignment_offset(
     align_content: css::AlignContent,
     container_height: f32,
     area: GridItemArea,
-    row_line_offsets: &[f32],
+    rows: &GridAxisTopology,
     item_height: f32,
 ) -> Option<f32> {
     let side = match align_self.keyword {
@@ -116,9 +116,9 @@ fn vertical_self_alignment_offset(
             axis: PhysicalAxis::Vertical,
             content_alignment: align_content,
             container_size: container_height,
-            line_offsets: row_line_offsets,
-            start_line: usize::from(area.row_start).saturating_sub(1),
-            end_line: usize::from(area.row_end).saturating_sub(1),
+            topology: rows,
+            start_line: area.row_start,
+            end_line: area.row_end,
         },
         item_height,
     )
@@ -139,8 +139,8 @@ pub(super) fn apply_grid_aspect_ratio_item_size_corrections(
     children: &[GridChild<'_>],
     container_width: PhysicalContentWidth,
     container_height: f32,
-    column_line_offsets: &[f32],
-    row_line_offsets: &[f32],
+    columns: &GridAxisTopology,
+    rows: &GridAxisTopology,
     items: &mut [GridItemLayout],
 ) {
     for (child, item) in children.iter().zip(items) {
@@ -177,35 +177,19 @@ pub(super) fn apply_grid_aspect_ratio_item_size_corrections(
                 container_style.justify_content,
             )
         };
-        let Some(area_x) = content_aligned_grid_line_offset(
+        let Some((area_x, area_right)) = columns.aligned_area_bounds(
             horizontal_content_alignment,
             container_width.points(),
-            column_line_offsets,
-            usize::from(area.column_start).saturating_sub(1),
+            area.column_start,
+            area.column_end,
         ) else {
             continue;
         };
-        let Some(area_right) = content_aligned_grid_line_offset(
-            horizontal_content_alignment,
-            container_width.points(),
-            column_line_offsets,
-            usize::from(area.column_end).saturating_sub(1),
-        ) else {
-            continue;
-        };
-        let Some(area_y) = content_aligned_grid_line_offset(
+        let Some((area_y, area_bottom)) = rows.aligned_area_bounds(
             vertical_content_alignment,
             container_height,
-            row_line_offsets,
-            usize::from(area.row_start).saturating_sub(1),
-        ) else {
-            continue;
-        };
-        let Some(area_bottom) = content_aligned_grid_line_offset(
-            vertical_content_alignment,
-            container_height,
-            row_line_offsets,
-            usize::from(area.row_end).saturating_sub(1),
+            area.row_start,
+            area.row_end,
         ) else {
             continue;
         };
@@ -355,8 +339,8 @@ pub(super) struct GridFinalItemPercentagePlacement<'a> {
     pub(super) container_style: &'a ComputedStyle,
     pub(super) container_width: PhysicalContentWidth,
     pub(super) container_height: f32,
-    pub(super) column_line_offsets: &'a [f32],
-    pub(super) row_line_offsets: &'a [f32],
+    pub(super) columns: &'a GridAxisTopology,
+    pub(super) rows: &'a GridAxisTopology,
 }
 
 pub(super) fn apply_grid_deferred_percentage_item_size_corrections(
@@ -395,35 +379,19 @@ pub(super) fn apply_grid_deferred_percentage_item_size_corrections(
                 placement.container_style.align_content,
             )
         };
-        let Some(area_x) = content_aligned_grid_line_offset(
+        let Some((area_x, area_right)) = placement.columns.aligned_area_bounds(
             horizontal_content_alignment,
             placement.container_width.points(),
-            placement.column_line_offsets,
-            usize::from(area.column_start).saturating_sub(1),
+            area.column_start,
+            area.column_end,
         ) else {
             continue;
         };
-        let Some(area_right) = content_aligned_grid_line_offset(
-            horizontal_content_alignment,
-            placement.container_width.points(),
-            placement.column_line_offsets,
-            usize::from(area.column_end).saturating_sub(1),
-        ) else {
-            continue;
-        };
-        let Some(area_y) = content_aligned_grid_line_offset(
+        let Some((area_y, area_bottom)) = placement.rows.aligned_area_bounds(
             vertical_content_alignment,
             placement.container_height,
-            placement.row_line_offsets,
-            usize::from(area.row_start).saturating_sub(1),
-        ) else {
-            continue;
-        };
-        let Some(area_bottom) = content_aligned_grid_line_offset(
-            vertical_content_alignment,
-            placement.container_height,
-            placement.row_line_offsets,
-            usize::from(area.row_end).saturating_sub(1),
+            area.row_start,
+            area.row_end,
         ) else {
             continue;
         };
@@ -631,9 +599,9 @@ struct SelfAlignmentAxisContext<'a> {
     axis: PhysicalAxis,
     content_alignment: css::ContentAlignment,
     container_size: f32,
-    line_offsets: &'a [f32],
-    start_line: usize,
-    end_line: usize,
+    topology: &'a GridAxisTopology,
+    start_line: u16,
+    end_line: u16,
 }
 
 fn self_alignment_offset_for_side(
@@ -644,16 +612,10 @@ fn self_alignment_offset_for_side(
     if side.axis() != context.axis {
         return None;
     }
-    let area_start = content_aligned_grid_line_offset(
+    let (area_start, area_end) = context.topology.aligned_area_bounds(
         context.content_alignment,
         context.container_size,
-        context.line_offsets,
         context.start_line,
-    )?;
-    let area_end = content_aligned_grid_line_offset(
-        context.content_alignment,
-        context.container_size,
-        context.line_offsets,
         context.end_line,
     )?;
     let item_size = item_size.max(0.0);

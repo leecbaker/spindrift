@@ -671,9 +671,11 @@ impl<'a> LayoutBuilder<'a> {
             })
             .flatten();
             let mut margin_collapse_style = None;
-            if self.definite_block_size_stack.last().is_some_and(|basis| {
-                height_behaves_as_auto_for_margin_collapse(&child_style, *basis)
-            }) {
+            if height_behaves_as_auto_for_margin_collapse(
+                &child_style,
+                self.block_percentage_context_stack
+                    .current_percentage_basis(),
+            ) {
                 let mut used_style = (*child_style).clone();
                 used_style
                     .box_values
@@ -974,7 +976,9 @@ impl<'a> LayoutBuilder<'a> {
                 let replay_origin_y = self.cursor_y - child_style.margin.top;
                 let replay_separation = replay
                     .clearance_boundary()
-                    .map(|border_top| AdjoiningFloatReplaySeparation::Clearance { border_top })
+                    .map(|boundary| AdjoiningFloatReplaySeparation::Clearance {
+                        border_top: boundary.border_top(),
+                    })
                     .unwrap_or_else(|| {
                         self.adjoining_float_replay_separated_by_following_child(
                             &replay,
@@ -1029,22 +1033,20 @@ impl<'a> LayoutBuilder<'a> {
                 && adjoining_float_replay.is_none()
                 && replaying_adjoining_until.is_none()
             {
-                Some(
-                    PendingAdjoiningFloatReplayCandidate {
-                        meta: AdjoiningFloatReplayCandidateMeta {
-                            index: child_box_index,
-                            element_index: 0,
-                            previous_flow_bottom_margin,
-                            seen_flow_child,
-                            trim_block_start_adjoining_margins,
-                            collapsed_end_margin,
-                            previous_child_page_end: previous_child_page_end.clone(),
-                            float_run,
-                            previous_break_after,
-                        },
-                    }
-                    .arm(self),
-                )
+                Some(PendingAdjoiningFloatReplayCandidate {
+                    snapshot: Box::new(self.snapshot()),
+                    meta: AdjoiningFloatReplayCandidateMeta {
+                        index: child_box_index,
+                        element_index: 0,
+                        previous_flow_bottom_margin,
+                        seen_flow_child,
+                        trim_block_start_adjoining_margins,
+                        collapsed_end_margin,
+                        previous_child_page_end: previous_child_page_end.clone(),
+                        float_run,
+                        previous_break_after,
+                    },
+                })
             } else {
                 None
             };
@@ -1577,15 +1579,8 @@ impl<'a> LayoutBuilder<'a> {
                 .float_contexts
                 .last()
                 .is_some_and(|context| context.shapes.len() > float_shape_count_before);
-            if emitted_float && let Some(mut candidate) = adjoining_candidate {
-                if self.last_block_layout_outcome.margin_collapse_boundary
-                    == BlockMarginCollapseBoundary::SeparatedByClearance
-                    && let Some(border_box) = self.last_block_layout_outcome.static_border_box
-                {
-                    candidate
-                        .record_clearance_boundary(PageTopBlockPosition::new(border_box.max_y()));
-                }
-                adjoining_float_replay = Some(candidate);
+            if emitted_float && let Some(candidate) = adjoining_candidate {
+                adjoining_float_replay = Some(candidate.arm(self));
             }
             if is_flow_child {
                 let child_start_separated_by_clearance = child_uses_block_layout

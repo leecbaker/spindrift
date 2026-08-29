@@ -65,8 +65,7 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     /// as a layout-only controller; percentage constraints resolve later.
     pub(in crate::layout) direct_automatic_block_size_constraint:
         Option<crate::units::ContentBoxLength>,
-    pub(in crate::layout) definite_content_height: Option<DefinitePhysicalContentHeight>,
-    pub(in crate::layout) descendant_percentage_height_basis: Option<BlockSizePercentageBasis>,
+    pub(in crate::layout) descendant_percentage_height_context: DescendantBlockPercentageContext,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

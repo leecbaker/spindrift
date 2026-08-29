@@ -395,32 +395,12 @@ impl FontSystem {
                         first_cluster_glyph = false;
                         continue;
                     }
-                    let emitted_glyph_id =
-                        if matches!(style.text_layout_policy(), TextLayoutPolicy::Vertical(_)) {
-                            // The shaper has already selected any OpenType
-                            // vertical alternate. Replacing a Unicode space
-                            // separator with the horizontal U+0020 glyph here
-                            // would discard that selection, including the `vert`
-                            // form required for transformed vertical units.
-                            // <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>
-                            glyph_id
-                        } else {
-                            unicode
-                                .chars()
-                                .next()
-                                .filter(|_| unicode.chars().count() == 1)
-                                .and_then(|character| {
-                                    css_space_separator_blank_glyph(&face, character)
-                                })
-                                .map(|glyph| glyph.0)
-                                .unwrap_or(glyph_id)
-                        };
                     first_cluster_glyph = false;
                     glyphs.push(RenderedGlyph {
-                        kind: RenderedGlyphKind::Paint(emitted_glyph_id),
+                        kind: RenderedGlyphKind::Paint(glyph_id),
                         x_advance: glyph.advance,
                         nominal_x_advance: face
-                            .glyph_hor_advance(ttf_parser::GlyphId(emitted_glyph_id))
+                            .glyph_hor_advance(ttf_parser::GlyphId(glyph_id))
                             .map(|advance| advance as f32 * scale)
                             .unwrap_or(glyph.advance),
                         x_offset: glyph.x,
@@ -817,6 +797,13 @@ impl FontSystem {
         let shaping_text = shaping_text.as_ref();
         let default_style = ranges[0].1;
         let default_authored_style = default_style.authored();
+        let has_cursive_face_transition = text.chars().any(character_has_cursive_shaping_behavior)
+            && ranges.windows(2).any(|pair| {
+                matches!(
+                    pair[0].1.boundary_effect(pair[1].1),
+                    InlineBoundaryEffect::ShapingInputChange
+                )
+            });
         self.with_reusable_parley_layout(|this, layout| {
             let parley_styles = ranges
                 .iter()
@@ -1044,6 +1031,13 @@ impl FontSystem {
                 ) else {
                     continue;
                 };
+                let contextual_glyphs = this.selected_face_contextual_glyphs(
+                    &text,
+                    run_range.clone(),
+                    run_style,
+                    has_cursive_face_transition,
+                    letter_spacing,
+                );
                 if let ControlFallbackCluster::RehomeSimpleVisibleFragment { character } =
                     control_fallback_cluster
                     && let Some((rehomed_run, dropped_advance)) = this
@@ -1243,32 +1237,12 @@ impl FontSystem {
                         } else {
                             candidate_unicode
                         };
-                        let emitted_glyph_id = if matches!(
-                            run_style.authored().text_layout_policy(),
-                            TextLayoutPolicy::Vertical(_)
-                        ) {
-                            // Preserve the selected vertical alternate rather
-                            // than replacing it with the horizontal U+0020
-                            // glyph. See the equivalent single-style shaping
-                            // path for the CSS Writing Modes rationale.
-                            glyph_id
-                        } else {
-                            unicode
-                                .chars()
-                                .next()
-                                .filter(|_| unicode.chars().count() == 1)
-                                .and_then(|character| {
-                                    css_space_separator_blank_glyph(&face, character)
-                                })
-                                .map(|glyph| glyph.0)
-                                .unwrap_or(glyph_id)
-                        };
                         first_cluster_glyph = false;
                         glyphs.push(RenderedGlyph {
-                            kind: RenderedGlyphKind::Paint(emitted_glyph_id),
+                            kind: RenderedGlyphKind::Paint(glyph_id),
                             x_advance: glyph.advance,
                             nominal_x_advance: face
-                                .glyph_hor_advance(ttf_parser::GlyphId(emitted_glyph_id))
+                                .glyph_hor_advance(ttf_parser::GlyphId(glyph_id))
                                 .map(|advance| advance as f32 * scale)
                                 .unwrap_or(glyph.advance),
                             x_offset: glyph.x,
@@ -1282,6 +1256,18 @@ impl FontSystem {
                 }
                 if glyphs.is_empty() {
                     continue;
+                }
+                if let Some(contextual_glyphs) = contextual_glyphs
+                    && contextual_glyphs.len() == glyphs.len()
+                {
+                    // Preserve the ranged backend's paint origin and authored
+                    // cluster ownership, but replace its isolated glyph forms
+                    // with forms selected in the complete logical context.
+                    for (glyph, contextual) in glyphs.iter_mut().zip(contextual_glyphs) {
+                        let unicode = std::mem::take(&mut glyph.unicode);
+                        *glyph = contextual;
+                        glyph.unicode = unicode;
+                    }
                 }
                 let mut font_size = run.font_size();
                 apply_synthetic_position_fallback(
@@ -1570,6 +1556,75 @@ impl FontSystem {
             shaping_contexts,
             source_positions,
         })
+    }
+
+    /// Shape a selected font-face range with its complete cursive context.
+    ///
+    /// CSS Fonts limits the face that paints a character, not the neighboring
+    /// characters that OpenType sees while selecting its contextual form.
+    /// A ranged backend style otherwise shapes every face run in isolation,
+    /// which makes an Arabic letter lose its joining form when its neighbors
+    /// are selected from a different `unicode-range` face.  The returned
+    /// glyphs retain only the selected source range; callers keep the
+    /// backend's range placement and authored source provenance.
+    /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>
+    /// <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+    fn selected_face_contextual_glyphs(
+        &mut self,
+        text: &str,
+        range: Range<usize>,
+        style: &SelectedFaceStyleView<'_>,
+        has_cursive_face_transition: bool,
+        letter_spacing: ShapingLetterSpacing,
+    ) -> Option<Vec<RenderedGlyph>> {
+        has_cursive_face_transition.then_some(())?;
+        let range_text = text.get(range.clone())?;
+        range_text
+            .chars()
+            .any(character_has_cursive_shaping_behavior)
+            .then_some(())?;
+
+        let mut contextual_style = style.authored().clone();
+        contextual_style.font_family = style.font_family().clone();
+        // This cannot borrow the reusable layout scratch: callers are
+        // converting a borrowed Parley line from the primary ranged pass.
+        // A small local layout keeps the contextual probe independent.
+        let parley_style = self.shaping_style_for_selected_face_view(style);
+        let font_family_source = self.resolved_parley_font_family_source_for_family(
+            style.font_family(),
+            contextual_style.font_weight,
+            contextual_style.font_style,
+            contextual_style.font_width,
+        );
+        let feature_context = self.font_feature_context_for_selected_face(style);
+        let mut layout = ParleyLayout::default();
+        let mut builder: parley::RangedBuilder<'_, FontPalette> = self
+            .parley_layout_context
+            .ranged_builder(&mut self.parley_font_context, text, 1.0, false);
+        push_parley_default_style(&mut builder, &parley_style, &font_family_source);
+        push_parley_text_spacing_default_with_context(
+            &mut builder,
+            text,
+            &contextual_style,
+            letter_spacing.requested_for(&contextual_style),
+            feature_context.as_ref(),
+        );
+        builder.build_into(&mut layout, text);
+        layout.break_all_lines(None);
+        let line = layout.lines().next()?;
+        let glyphs = self
+            .rendered_text_runs_for_parley_line(text, line, &contextual_style, letter_spacing)
+            .into_iter()
+            .flat_map(|run| run.glyphs.into_iter().zip(run.glyph_source_ranges))
+            .filter_map(|(glyph, source_range)| {
+                source_range
+                    .is_some_and(|source_range| {
+                        source_range.start < range.end && range.start < source_range.end
+                    })
+                    .then_some(glyph)
+            })
+            .collect::<Vec<_>>();
+        (!glyphs.is_empty()).then_some(glyphs)
     }
 
     /// Select concrete families for presentation-sensitive grapheme clusters.

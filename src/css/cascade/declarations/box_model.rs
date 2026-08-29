@@ -281,7 +281,7 @@ pub(in crate::css) fn set_padding_box_side(
 /// <https://www.w3.org/TR/css-cascade-5/#computed> and
 /// <https://www.w3.org/TR/CSS22/box.html#padding-properties>.
 pub(in crate::css) fn legacy_edge_lengths(
-    values: CssEdges<ComputedLengthPercentage>,
+    values: PhysicalEdges<ComputedLengthPercentage>,
 ) -> Option<Edges> {
     Some(Edges {
         top: values.top.length_if_no_percent()?,
@@ -298,7 +298,7 @@ pub(in crate::css) fn legacy_edge_lengths(
 /// <https://www.w3.org/TR/css-cascade-5/#computed> and
 /// <https://www.w3.org/TR/CSS22/box.html#margin-properties>.
 pub(in crate::css) fn legacy_margin_edges(
-    values: CssEdges<ComputedLengthPercentageOrAuto>,
+    values: PhysicalEdges<ComputedLengthPercentageOrAuto>,
 ) -> Edges {
     Edges {
         top: values.top.length_if_no_percent().unwrap_or(0.0),

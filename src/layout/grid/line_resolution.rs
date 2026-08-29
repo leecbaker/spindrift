@@ -97,14 +97,20 @@ fn collect_explicit_grid_line_names(
     Some(())
 }
 
-pub(super) fn grid_line_static_offset(
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ResolvedGridStaticLine {
+    pub(super) line_index: i32,
+    pub(super) offset: f32,
+}
+
+pub(super) fn grid_line_static_position(
     tracks: &css::GridTrackList,
     auto_tracks: &css::GridAutoTrackList,
     placement: &css::GridPlacement,
     gap: css::ComputedGap,
     content_alignment: css::ContentAlignment,
     container_size: f32,
-) -> Option<f32> {
+) -> Option<ResolvedGridStaticLine> {
     let (components, trailing_names) = match tracks {
         css::GridTrackList::Tracks {
             components,
@@ -124,12 +130,33 @@ pub(super) fn grid_line_static_offset(
         gap,
         container_size,
     )?;
-    content_aligned_grid_line_offset(
+    let offset = content_aligned_grid_line_offset(
         content_alignment,
         container_size,
         &line_offsets.offsets,
         line_offsets.offset_index(line_index)?,
+    )?;
+    Some(ResolvedGridStaticLine { line_index, offset })
+}
+
+#[cfg(test)]
+pub(super) fn grid_line_static_offset(
+    tracks: &css::GridTrackList,
+    auto_tracks: &css::GridAutoTrackList,
+    placement: &css::GridPlacement,
+    gap: css::ComputedGap,
+    content_alignment: css::ContentAlignment,
+    container_size: f32,
+) -> Option<f32> {
+    grid_line_static_position(
+        tracks,
+        auto_tracks,
+        placement,
+        gap,
+        content_alignment,
+        container_size,
     )
+    .map(|line| line.offset)
 }
 
 pub(super) fn grid_line_static_offset_index(
@@ -525,20 +552,6 @@ fn definite_grid_track_size(size: css::GridTrackSize, container_size: f32) -> Op
 /// repeated tracks:
 /// <https://www.w3.org/TR/css-grid-1/#abspos-items> and
 /// <https://www.w3.org/TR/css-grid-1/#auto-repeat>.
-pub(super) fn grid_line_offsets_from_track_layout(sizes: &[f32], gutters: &[f32]) -> Vec<f32> {
-    let mut offsets = Vec::with_capacity(sizes.len() + 1);
-    let mut offset = 0.0;
-    offsets.push(offset);
-    for (index, size) in sizes.iter().enumerate() {
-        offset += *size;
-        if index + 1 < sizes.len() {
-            offset += gutters.get(index).cloned().unwrap_or(0.0);
-        }
-        offsets.push(offset);
-    }
-    offsets
-}
-
 /// Resolve a Grid gap against a definite content-box dimension.
 ///
 /// Track and line-offset algorithms remain scalar coordinate arithmetic; this

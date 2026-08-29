@@ -67,10 +67,8 @@ impl<'a> LayoutBuilder<'a> {
         let available_width = (self.content_right - self.content_left).max(1.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
         let containing_block_height = self
-            .definite_block_size_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(PercentageBasis::indefinite);
+            .block_percentage_context_stack
+            .current_percentage_basis();
         apply_used_box_metrics_for_logical_inline_basis(
             &mut used_style,
             self.current_content_logical_inline_percentage_basis(),
@@ -167,10 +165,8 @@ impl<'a> LayoutBuilder<'a> {
             element,
             style,
             available_width,
-            self.definite_block_size_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(PercentageBasis::indefinite),
+            self.block_percentage_context_stack
+                .current_percentage_basis(),
             self.base_url,
             self.root_url,
             self.resource_cache,
@@ -217,14 +213,13 @@ impl<'a> LayoutBuilder<'a> {
                 )
             {
                 if let Some(asset) = image.svg {
-                    let mut group = svg_replaced_group_with_font_system(
+                    let mut group = svg_replaced_group(
                         &asset,
                         paint_space_rect(image_x, image_y, content_width, content_height),
                         style.object_fit,
                         style.object_position.clone(),
                         style.object_view_box.clone(),
                         overflow,
-                        &mut self.font_system,
                     );
                     if let Some(clip) = content_contour
                         .as_ref()
@@ -347,14 +342,13 @@ impl<'a> LayoutBuilder<'a> {
                 {
                     self.push_primitive_in_band(PaintBand::InFlowBlock, primitive);
                 } else if let Some(asset) = image.svg {
-                    let group = svg_replaced_group_with_font_system(
+                    let group = svg_replaced_group(
                         &asset,
                         paint_space_rect(image_x, image_y, content_width, content_height),
                         style.object_fit,
                         style.object_position.clone(),
                         style.object_view_box.clone(),
                         overflow,
-                        &mut self.font_system,
                     );
                     self.push_svg_group_in_band(PaintBand::InFlowBlock, group);
                 } else {
@@ -415,10 +409,8 @@ impl<'a> LayoutBuilder<'a> {
             element,
             style,
             available_width,
-            self.definite_block_size_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(PercentageBasis::indefinite),
+            self.block_percentage_context_stack
+                .current_percentage_basis(),
         ) else {
             return;
         };
@@ -462,10 +454,13 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/SVG2/coords.html#ViewportSpace>
             let viewport_asset =
                 asset.with_replaced_viewport(content_box_size_pt(content_width, content_height));
-            let mut group = viewport_asset.paint_inline_group_with_font_system(
+            let mut group = viewport_asset.paint_group_for_source_rect_with_viewport_clip(
                 paint_space_rect(content_x, content_y, content_width, content_height),
+                crate::svg::SvgSourceRect::new(
+                    crate::svg::SvgSourcePoint::new(0.0, 0.0),
+                    viewport_asset.source_viewport_size(),
+                ),
                 false,
-                &mut self.font_system,
             );
             if let Some(clip) = overflow_edge
                 .as_ref()

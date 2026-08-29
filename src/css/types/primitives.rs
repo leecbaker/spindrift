@@ -1178,6 +1178,8 @@ pub(crate) struct Stylesheet {
     pub after_marker_rules: Vec<StyleRule>,
     pub before_rules: Vec<StyleRule>,
     pub after_rules: Vec<StyleRule>,
+    pub scroll_marker_rules: Vec<StyleRule>,
+    pub scroll_marker_group_rules: Vec<StyleRule>,
     pub footnote_call_rules: Vec<StyleRule>,
     pub footnote_marker_rules: Vec<StyleRule>,
     pub first_line_rules: Vec<StyleRule>,
@@ -1703,6 +1705,10 @@ pub(crate) struct StyleRule {
     /// tests. The cascade uses the specificity of the branch that matched.
     #[allow(dead_code)]
     pub specificity: u32,
+    /// Specificity contributed by routed pseudo-elements that are matched
+    /// against their originating element rather than represented in the
+    /// selector tree.
+    pub routed_pseudo_specificity: u32,
     pub order: usize,
     pub layer_name: Option<LayerName>,
     pub scopes: Vec<ScopeRule>,

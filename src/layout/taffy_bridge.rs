@@ -40,6 +40,48 @@ pub(in crate::layout) fn box_sizing(value: BoxSizing) -> taffy_layout::BoxSizing
     }
 }
 
+/// Convert a resolved scalar Taffy size into a min/max constraint.
+///
+/// Taffy 0.14 intentionally separates preferred `Dimension` values from
+/// min/max `LengthPercentageAuto` constraints.  Quire resolves intrinsic and
+/// mixed CSS sizing values before this boundary, so callers of this adapter
+/// may only pass a scalar length, percentage, or `auto` value.
+pub(in crate::layout) fn min_max_constraint(
+    value: taffy_layout::Dimension,
+) -> taffy_layout::LengthPercentageAuto {
+    match value.expand() {
+        taffy::style::ExpandedDimension::Length(value) => {
+            taffy_layout::LengthPercentageAuto::length(value)
+        }
+        taffy::style::ExpandedDimension::Percent(value) => {
+            taffy_layout::LengthPercentageAuto::percent(value)
+        }
+        taffy::style::ExpandedDimension::Auto => taffy_layout::LengthPercentageAuto::auto(),
+        value => {
+            unreachable!("min/max Taffy constraint must be resolved before conversion: {value:?}")
+        }
+    }
+}
+
+/// Form Taffy 0.14's leaf-layout result from Quire's measured content-box
+/// geometry.  Taffy has no logical-writing-mode baseline channel, so callers
+/// pass a baseline only when it is a physical top-edge offset for horizontal
+/// text.
+pub(in crate::layout) fn measured_leaf_output(
+    size: taffy_layout::Size<f32>,
+    first_baseline: Option<f32>,
+    last_baseline: Option<f32>,
+) -> taffy::tree::LayoutOutput {
+    taffy::tree::LayoutOutput::from_sizes_and_baselines(
+        size,
+        taffy::geometry::Rect::ZERO,
+        taffy::tree::Baselines {
+            first: first_baseline,
+            last: last_baseline,
+        },
+    )
+}
+
 /// Convert CSS alignment safety into Taffy's alignment safety.
 pub(in crate::layout) fn alignment_safety(
     safety: AlignmentSafety,
@@ -192,6 +234,21 @@ pub(in crate::layout) fn gap<Source>(
             .unwrap_or_else(|| {
                 taffy_layout::LengthPercentage::length(value.length_max_zero().points())
             }),
+    }
+}
+
+/// Resolve a gap at the Quire-to-Taffy scalar boundary.
+///
+/// `gap` deliberately returns a Taffy length rather than forwarding a
+/// percentage.  The CSS percentage basis is a Quire-owned decision, so the
+/// expanded value must consequently always be an absolute length here.
+pub(in crate::layout) fn resolved_gap<Source>(
+    value: css::ComputedGap,
+    percentage_basis: PercentageBasis<ContentBoxLength, Source>,
+) -> f32 {
+    match gap(value, percentage_basis).expand() {
+        taffy::style::ExpandedLengthPercentage::Length(value) => value,
+        _ => unreachable!("Quire resolves a gap percentage before entering Taffy"),
     }
 }
 
@@ -394,5 +451,35 @@ mod tests {
             .left,
             taffy_layout::LengthPercentage::length(15.0)
         );
+    }
+
+    #[test]
+    fn min_max_constraint_retains_only_scalar_percentage_bases() {
+        assert_eq!(
+            min_max_constraint(taffy_layout::Dimension::length(12.0)),
+            taffy_layout::LengthPercentageAuto::length(12.0),
+        );
+        assert_eq!(
+            min_max_constraint(taffy_layout::Dimension::percent(0.5)),
+            taffy_layout::LengthPercentageAuto::percent(0.5),
+        );
+        assert!(min_max_constraint(taffy_layout::Dimension::auto()).is_auto());
+    }
+
+    #[test]
+    fn measured_leaf_output_transports_both_horizontal_baselines() {
+        let output = measured_leaf_output(
+            taffy_layout::Size {
+                width: 30.0,
+                height: 12.0,
+            },
+            Some(8.0),
+            Some(10.0),
+        );
+
+        assert_eq!(output.size.width, 30.0);
+        assert_eq!(output.size.height, 12.0);
+        assert_eq!(output.baselines.first, Some(8.0));
+        assert_eq!(output.baselines.last, Some(10.0));
     }
 }

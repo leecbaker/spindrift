@@ -3818,16 +3818,16 @@ async fn supports_text_align_justify_all_on_final_line() {
 
 #[tokio::test]
 async fn wpt_text_align_end_rtl_aligns_to_physical_left() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
-    if !std::path::Path::new(ahem).exists() {
-        return;
-    }
+    let ahem = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/wpt/css/css-fonts/Ahem.ttf"
+    );
     let target = Html::from_string(format!(
         "<style>@page {{ size: 500pt 200pt; margin: 0 }} body {{ margin: 0 }}\
          @font-face {{ font-family: Ahem; src: url(file://{ahem}) }}\
          .test, .ref {{ border: 1px solid orange; margin: 20px; width: 300px; color: orange; font: 25px/1 Ahem }}\
-         .test {{ text-align: end; direction: rtl; }} .ref {{ text-align: left; }}</style>\
-         <div class=\"test\">TESTI</div><div class=\"ref\">REFER</div>"
+         .test {{ text-align: end; }} .ref {{ text-align: left; }}</style>\
+         <div class=\"test\" dir=\"rtl\">TESTI</div><div class=\"ref\">REFER</div>"
     ))
     .render(&RenderOptions::default())
     .await
@@ -7191,10 +7191,10 @@ async fn explicit_line_height_overrides_loaded_font_metrics() {
 
 #[tokio::test]
 async fn trailing_ideographic_space_hangs_and_paints_inline_background() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
-    if !std::path::Path::new(ahem).exists() {
-        return;
-    }
+    let ahem = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/wpt/css/css-fonts/Ahem.ttf"
+    );
 
     let document = Html::from_string(format!(
         "<style>@page {{ size: 200pt 200pt; margin: 0 }} body {{ margin: 0 }}\

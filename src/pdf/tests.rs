@@ -2480,7 +2480,10 @@ fn pdf_font_embedding_prunes_unused_fonts_and_merges_byte_identical_font_plans()
     assert_eq!(rendered.matches("/FontFile2").count(), 1);
     assert!(rendered.contains("/RF1 "));
     assert!(!rendered.contains("/RF2 "));
-    assert!(rendered.matches("Tj").count() >= 2);
+    assert!(
+        rendered.matches("Tj").count() + rendered.matches("TJ").count() >= 2,
+        "content={rendered}"
+    );
     assert!(rendered.contains(&format!("<{cid_a:04X}> <0041>")));
     assert!(rendered.contains(&format!("<{cid_b:04X}> <0042>")));
 }
@@ -2607,7 +2610,7 @@ fn pdf_font_embedding_materializes_a_static_variable_instance() {
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
-        fonts: vec![font.clone()],
+        fonts: vec![font],
         bookmarks: Vec::new(),
         image_store: Box::default(),
     };
@@ -3470,22 +3473,22 @@ fn pdf_text_runs_transform_per_glyph_origins_with_the_run_matrix() {
 }
 
 #[test]
-fn pdf_advance_only_tab_is_not_subset_or_painted_and_preserves_actual_text() {
+fn pdf_advance_only_separator_is_not_subset_or_painted_and_preserves_actual_text() {
     let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
     let mut page = Page::new(120.0, 80.0);
     page.push_line(RenderedLine::new(
-        "\tA".to_string(),
+        "\u{2002}A".to_string(),
         10.0,
         40.0,
         12.0,
         Some(0),
         CssColor::BLACK,
         vec![RenderedTextRun {
-            text: Rc::from("\tA"),
-            actual_text: Some(Rc::from("\tA")),
+            text: Rc::from("\u{2002}A"),
+            actual_text: Some(Rc::from("\u{2002}A")),
             x_offset: 0.0,
             y_offset: 0.0,
             text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
@@ -3500,7 +3503,7 @@ fn pdf_advance_only_tab_is_not_subset_or_painted_and_preserves_actual_text() {
                         nominal_x_advance: 0.0,
                         x_offset: 0.0,
                         y_offset: 0.0,
-                        unicode: "\t".to_string(),
+                        unicode: "\u{2002}".to_string(),
                     },
                     test_rendered_glyph(glyph_a, "A"),
                 ]
@@ -3532,7 +3535,7 @@ fn pdf_advance_only_tab_is_not_subset_or_painted_and_preserves_actual_text() {
     assert!(rendered.contains(" TJ"), "{rendered}");
     assert!(rendered.contains(&format!("<{cid_a:04X}>")), "{rendered}");
     assert!(rendered.contains("/ActualText"), "{rendered}");
-    assert!(rendered.contains("<FEFF00090041>"), "{rendered}");
+    assert!(rendered.contains("<FEFF20020041>"), "{rendered}");
 }
 
 #[test]

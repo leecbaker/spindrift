@@ -744,7 +744,7 @@ fn subgrid_axis_from_parent(
     let inherit_parent_line_names = !grid_lanes_placement.is_some_and(|placement| {
         placement.is_automatic() && placement.grid_axis() == child_parent_physical_axis
     });
-    ResolvedGridAxis::from_parent_layout(offsets, track_sizes, gutters, line_names).subgrid_slice(
+    ResolvedGridAxis::from_parent_layout(offsets, &track_sizes, gutters, line_names).subgrid_slice(
         start,
         end,
         local_names,

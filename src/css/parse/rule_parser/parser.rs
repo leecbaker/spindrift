@@ -2,6 +2,7 @@ use cssparser::{AtRuleParser, DeclarationParser, ToCss};
 
 use super::at_rules::collect_container_style_rules;
 use super::*;
+use crate::css::selector::QuirePseudoElement;
 use crate::css::{
     FontPaletteDefinition, LayerName, LayerOrder, LayerSegment, PropertyRegistrationRule,
     StylesheetOrigin, StylesheetScopeAnchor,
@@ -15,6 +16,8 @@ pub(in crate::css) enum ParsedCssRule {
     AfterMarker(StyleRule),
     Before(StyleRule),
     After(StyleRule),
+    ScrollMarker(StyleRule),
+    ScrollMarkerGroup(StyleRule),
     FootnoteCall(StyleRule),
     FootnoteMarker(StyleRule),
     FirstLine(StyleRule),
@@ -38,10 +41,64 @@ pub(in crate::css) enum RoutedPseudoElement {
     AfterMarker,
     Before,
     After,
+    ScrollMarker,
+    ScrollMarkerGroup,
     FootnoteCall,
     FootnoteMarker,
     FirstLine,
     FirstLetter,
+}
+
+impl RoutedPseudoElement {
+    /// CSS Selectors counts each pseudo-element as one type selector. A
+    /// `::before::marker` or `::after::marker` selector contains both tree
+    /// pseudo-elements even though it is matched against the originating
+    /// element.
+    /// <https://www.w3.org/TR/selectors-4/#specificity-rules>
+    const fn specificity(self) -> u32 {
+        match self {
+            Self::BeforeMarker | Self::AfterMarker => 2,
+            Self::Marker
+            | Self::Before
+            | Self::After
+            | Self::ScrollMarker
+            | Self::ScrollMarkerGroup
+            | Self::FootnoteCall
+            | Self::FootnoteMarker
+            | Self::FirstLine
+            | Self::FirstLetter => 1,
+        }
+    }
+
+    const fn into_parsed_rule(self, rule: StyleRule) -> ParsedCssRule {
+        match self {
+            Self::Marker => ParsedCssRule::Marker(rule),
+            Self::BeforeMarker => ParsedCssRule::BeforeMarker(rule),
+            Self::AfterMarker => ParsedCssRule::AfterMarker(rule),
+            Self::Before => ParsedCssRule::Before(rule),
+            Self::After => ParsedCssRule::After(rule),
+            Self::ScrollMarker => ParsedCssRule::ScrollMarker(rule),
+            Self::ScrollMarkerGroup => ParsedCssRule::ScrollMarkerGroup(rule),
+            Self::FootnoteCall => ParsedCssRule::FootnoteCall(rule),
+            Self::FootnoteMarker => ParsedCssRule::FootnoteMarker(rule),
+            Self::FirstLine => ParsedCssRule::FirstLine(rule),
+            Self::FirstLetter => ParsedCssRule::FirstLetter(rule),
+        }
+    }
+}
+
+fn routed_pseudo_from_selector(pseudo: &QuirePseudoElement) -> RoutedPseudoElement {
+    match pseudo {
+        QuirePseudoElement::Marker => RoutedPseudoElement::Marker,
+        QuirePseudoElement::Before => RoutedPseudoElement::Before,
+        QuirePseudoElement::After => RoutedPseudoElement::After,
+        QuirePseudoElement::ScrollMarker => RoutedPseudoElement::ScrollMarker,
+        QuirePseudoElement::ScrollMarkerGroup => RoutedPseudoElement::ScrollMarkerGroup,
+        QuirePseudoElement::FootnoteCall => RoutedPseudoElement::FootnoteCall,
+        QuirePseudoElement::FootnoteMarker => RoutedPseudoElement::FootnoteMarker,
+        QuirePseudoElement::FirstLine => RoutedPseudoElement::FirstLine,
+        QuirePseudoElement::FirstLetter => RoutedPseudoElement::FirstLetter,
+    }
 }
 
 pub(in crate::css) struct CssRuleParser<'a> {
@@ -69,39 +126,216 @@ pub(in crate::css) struct CssRuleParser<'a> {
 }
 
 #[derive(Clone)]
-pub(in crate::css) struct NestingContext {
+struct SelectorRoute {
     selector_text: String,
     selector: SelectorList<QuireSelectorImpl>,
+    routed_pseudo: Option<RoutedPseudoElement>,
+}
+
+impl SelectorRoute {
+    fn selector_specificity(&self) -> u32 {
+        self.selector
+            .slice()
+            .iter()
+            .map(|branch| branch.specificity())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(
+                self.routed_pseudo
+                    .map(RoutedPseudoElement::specificity)
+                    .unwrap_or(0),
+            )
+    }
+
+    fn with_resolved_parent(
+        &self,
+        nesting_parent: &SelectorList<QuireSelectorImpl>,
+    ) -> Option<Self> {
+        let selector = self.selector.replace_parent_selector(nesting_parent);
+        let mut selector_text = String::new();
+        selector.to_css(&mut selector_text).ok()?;
+        Some(Self {
+            selector_text,
+            selector,
+            routed_pseudo: self.routed_pseudo,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct SelectorRoutes(Vec<SelectorRoute>);
+
+impl SelectorRoutes {
+    /// Add a route while coalescing selector-list branches that target the
+    /// same generated box. This preserves the source order of branches within
+    /// each resulting selector list.
+    fn push_route(routes: &mut Vec<SelectorRoute>, route: SelectorRoute) -> Option<()> {
+        let Some(existing) = routes
+            .iter_mut()
+            .find(|existing| existing.routed_pseudo == route.routed_pseudo)
+        else {
+            routes.push(route);
+            return Some(());
+        };
+
+        let mut branches = existing.selector.slice().to_vec();
+        branches.extend_from_slice(route.selector.slice());
+        let selector = SelectorList::from_iter(branches.into_iter());
+        let mut selector_text = String::new();
+        selector.to_css(&mut selector_text).ok()?;
+        existing.selector = selector;
+        existing.selector_text = selector_text;
+        Some(())
+    }
+
+    fn nesting_parent(&self) -> Option<SelectorList<QuireSelectorImpl>> {
+        let branches = self
+            .0
+            .iter()
+            .filter(|route| route.routed_pseudo.is_none())
+            .flat_map(|route| route.selector.slice().iter().cloned())
+            .collect::<Vec<_>>();
+        (!branches.is_empty()).then(|| SelectorList::from_iter(branches.into_iter()))
+    }
+
+    /// Turn a successfully parsed selector list into normal and generated
+    /// pseudo-element routes. Normal branches retain their original parsed
+    /// representation; only a validated generated pseudo branch is serialized
+    /// and reparsed as the selector for its originating element.
+    fn from_parsed_selector_list(
+        selector: SelectorList<QuireSelectorImpl>,
+        selector_parser: &QuireSelectorParser,
+        parse_relative: ParseRelative,
+    ) -> Option<Self> {
+        let mut grouped = Vec::<(Option<RoutedPseudoElement>, Vec<_>)>::new();
+        for branch in selector.slice() {
+            let routed_pseudo = branch.pseudo_element().map(routed_pseudo_from_selector);
+            let routed_branch = if let Some(pseudo) = routed_pseudo {
+                let mut source = String::new();
+                branch.to_css(&mut source).ok()?;
+                let source = super::pseudo_elements::strip_routed_pseudo_selector(&source, pseudo)?;
+                let mut input = ParserInput::new(&source);
+                let mut parser = Parser::new(&mut input);
+                let selector =
+                    SelectorList::parse(selector_parser, &mut parser, parse_relative).ok()?;
+                parser.expect_exhausted().ok()?;
+                if selector.slice().len() != 1 {
+                    return None;
+                }
+                selector.slice()[0].clone()
+            } else {
+                branch.clone()
+            };
+            if let Some((_, branches)) = grouped
+                .iter_mut()
+                .find(|(existing, _)| *existing == routed_pseudo)
+            {
+                branches.push(routed_branch);
+            } else {
+                grouped.push((routed_pseudo, vec![routed_branch]));
+            }
+        }
+
+        grouped
+            .into_iter()
+            .map(|(routed_pseudo, branches)| {
+                let selector = SelectorList::from_iter(branches.into_iter());
+                let mut selector_text = String::new();
+                selector.to_css(&mut selector_text).ok()?;
+                Some(SelectorRoute {
+                    selector_text,
+                    selector,
+                    routed_pseudo,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self)
+    }
+
+    /// The selector crate rejects chained tree-abiding pseudo-elements such as
+    /// `::before::marker`. After the complete prelude fails, parse each
+    /// ordinary branch independently and use source routing only for those
+    /// exact exceptional forms (and CSS Overflow target state after
+    /// `::scroll-marker`). This keeps a mixed list such as the UA
+    /// `::marker, ::before::marker` rule valid without bypassing parser
+    /// semantics for its ordinary branch.
+    fn from_source_fallback(
+        selector_text: &str,
+        selector_parser: &QuireSelectorParser,
+        parse_relative: ParseRelative,
+    ) -> Option<Self> {
+        let mut routes = Vec::new();
+        for source in super::pseudo_elements::split_selector_list(selector_text) {
+            let mut input = ParserInput::new(source);
+            let mut parser = Parser::new(&mut input);
+            match SelectorList::parse(selector_parser, &mut parser, parse_relative) {
+                Ok(selector) => {
+                    parser.expect_exhausted().ok()?;
+                    let parsed =
+                        Self::from_parsed_selector_list(selector, selector_parser, parse_relative)?;
+                    for route in parsed.0 {
+                        Self::push_route(&mut routes, route)?;
+                    }
+                }
+                Err(_) => {
+                    let (pseudo, source) =
+                        super::pseudo_elements::source_only_routed_pseudo_route(source)?;
+                    let mut input = ParserInput::new(&source);
+                    let mut parser = Parser::new(&mut input);
+                    let selector =
+                        SelectorList::parse(selector_parser, &mut parser, parse_relative).ok()?;
+                    parser.expect_exhausted().ok()?;
+                    if selector.slice().len() != 1 {
+                        return None;
+                    }
+                    let selector = selector.slice()[0].clone();
+                    let mut selector_text = String::new();
+                    selector.to_css(&mut selector_text).ok()?;
+                    Self::push_route(
+                        &mut routes,
+                        SelectorRoute {
+                            selector_text,
+                            selector: SelectorList::from_iter(std::iter::once(selector)),
+                            routed_pseudo: Some(pseudo),
+                        },
+                    )?;
+                }
+            }
+        }
+
+        if routes.is_empty() {
+            None
+        } else {
+            Some(Self(routes))
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(in crate::css) struct NestingContext {
+    routes: SelectorRoutes,
     /// Pseudo-element branches cannot be represented by CSS Nesting's `&`.
     /// Direct declarations retain the complete selector list above.
     nesting_parent: Option<SelectorList<QuireSelectorImpl>>,
 }
 
 impl NestingContext {
-    fn new(selector_text: String, selector: SelectorList<QuireSelectorImpl>) -> Self {
-        let branches = selector
-            .slice()
-            .iter()
-            .filter(|branch| !branch.has_pseudo_element())
-            .cloned()
-            .collect::<Vec<_>>();
-        let nesting_parent =
-            (!branches.is_empty()).then(|| SelectorList::from_iter(branches.into_iter()));
+    fn new(routes: SelectorRoutes) -> Self {
+        let nesting_parent = routes.nesting_parent();
         Self {
-            selector_text,
-            selector,
+            routes,
             nesting_parent,
         }
     }
 
-    fn resolve(
-        &self,
-        relative: SelectorList<QuireSelectorImpl>,
-    ) -> Option<(String, SelectorList<QuireSelectorImpl>)> {
-        let selector = relative.replace_parent_selector(self.nesting_parent.as_ref()?);
-        let mut selector_text = String::new();
-        selector.to_css(&mut selector_text).ok()?;
-        Some((selector_text, selector))
+    fn resolve(&self, relative: SelectorRoutes) -> Option<SelectorRoutes> {
+        let nesting_parent = self.nesting_parent.as_ref()?;
+        relative
+            .0
+            .iter()
+            .map(|route| route.with_resolved_parent(nesting_parent))
+            .collect::<Option<Vec<_>>>()
+            .map(SelectorRoutes)
     }
 }
 
@@ -229,46 +463,41 @@ impl<'a> CssRuleParser<'a> {
 
     fn style_rules(
         &self,
-        selector_text: String,
-        selector: SelectorList<QuireSelectorImpl>,
+        routes: SelectorRoutes,
         declarations: Declarations,
     ) -> Vec<ParsedCssRule> {
-        let routed_rules = split_pseudo_element_rule(
-            &selector_text,
-            &self
-                .namespaces
-                .borrow()
-                .selector_parser()
-                .with_parent_selector(),
-            &declarations,
-            self.current_layer.clone(),
-            self.current_scopes.clone(),
-            self.selector_scope_anchor,
-        );
-        if !routed_rules.is_empty() {
-            return routed_rules;
-        }
-        let specificity = selector
-            .slice()
-            .iter()
-            .map(|branch| branch.specificity())
-            .max()
-            .unwrap_or(0);
-        vec![ParsedCssRule::Style(StyleRule {
-            selector_text,
-            selector,
-            stylesheet_scope_anchor: self.selector_scope_anchor,
-            declarations,
-            specificity,
-            order: 0,
-            layer_name: self.current_layer.clone(),
-            scopes: self.current_scopes.clone(),
-        })]
+        routes
+            .0
+            .into_iter()
+            .map(|route| {
+                let specificity = route.selector_specificity();
+                let routed_pseudo = route.routed_pseudo;
+                let routed_pseudo_specificity = route
+                    .routed_pseudo
+                    .map(RoutedPseudoElement::specificity)
+                    .unwrap_or(0);
+                let rule = StyleRule {
+                    selector_text: route.selector_text,
+                    selector: route.selector,
+                    stylesheet_scope_anchor: self.selector_scope_anchor,
+                    declarations: declarations.clone(),
+                    specificity,
+                    routed_pseudo_specificity,
+                    order: 0,
+                    layer_name: self.current_layer.clone(),
+                    scopes: self.current_scopes.clone(),
+                };
+                match routed_pseudo {
+                    Some(pseudo) => pseudo.into_parsed_rule(rule),
+                    None => ParsedCssRule::Style(rule),
+                }
+            })
+            .collect()
     }
 }
 
 impl<'a, 'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser<'a> {
-    type Prelude = (String, SelectorList<QuireSelectorImpl>);
+    type Prelude = SelectorRoutes;
     type QualifiedRule = ParsedCssRule;
     type Error = SelectorParseErrorKind<'i>;
 
@@ -278,6 +507,7 @@ impl<'a, 'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser<'a> {
     ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
         self.namespace_prelude_open = false;
         let start = input.position();
+        let initial_state = input.state();
         let parse_relative = if self.nesting.is_some() {
             ParseRelative::ForNesting
         } else if self.current_scopes.is_empty() {
@@ -294,78 +524,43 @@ impl<'a, 'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser<'a> {
             .borrow()
             .selector_parser()
             .with_parent_selector();
-        let initial_state = input.state();
-        match SelectorList::parse(&selector_parser, input, parse_relative) {
-            Ok(selector) => {
-                if let Some(nesting) = &self.nesting {
-                    nesting
-                        .resolve(selector)
-                        .ok_or_else(|| input.new_custom_error(SelectorParseErrorKind::InvalidState))
-                } else {
-                    let selector_text = input.slice_from(start).trim().to_string();
-                    Ok((selector_text, selector))
-                }
-            }
+        let routes = match SelectorList::parse(&selector_parser, input, parse_relative) {
+            Ok(selector) => SelectorRoutes::from_parsed_selector_list(
+                selector,
+                &selector_parser,
+                parse_relative,
+            )
+            .ok_or_else(|| input.new_custom_error(SelectorParseErrorKind::InvalidState))?,
             Err(original_error) => {
                 input.reset(&initial_state);
                 while !input.is_exhausted() {
                     input.next_including_whitespace_and_comments()?;
                 }
-                let selector_text = input.slice_from(start).trim().to_string();
-                if !selector_text.contains("::before::marker")
-                    && !selector_text.contains("::after::marker")
-                {
-                    return Err(original_error);
-                }
-                // Selectors parses tree-abiding pseudo-elements as terminal.
-                // Nested marker rules are routed against the originating
-                // element, so validate and compile their element selector here.
-                // Compile one routing selector per selector-list entry. A
-                // single rule can combine ordinary and nested markers, as in
-                // the CSS Lists required UA rule for
-                // `::marker, ::before::marker, ::after::marker`; stripping
-                // the nested pseudos from the whole list would leave empty
-                // selector entries and make the fallback fail.
-                // https://drafts.csswg.org/css-lists-3/#marker-properties
-                let routing_selector = super::pseudo_elements::split_selector_list(&selector_text)
-                    .into_iter()
-                    .map(|selector| {
-                        let selector = selector
-                            .replace("::before::marker", "")
-                            .replace("::after::marker", "")
-                            .replace("::marker", "");
-                        let selector = selector.trim();
-                        if selector.is_empty() {
-                            "*".to_string()
-                        } else {
-                            selector.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut routing_input = ParserInput::new(&routing_selector);
-                let mut routing_parser = Parser::new(&mut routing_input);
-                let selector =
-                    SelectorList::parse(&selector_parser, &mut routing_parser, parse_relative)
-                        .map_err(|_| original_error)?;
-                if let Some(nesting) = &self.nesting {
-                    nesting
-                        .resolve(selector)
-                        .ok_or_else(|| input.new_custom_error(SelectorParseErrorKind::InvalidState))
-                } else {
-                    Ok((selector_text, selector))
-                }
+                let selector_text = input.slice_from(start).trim();
+                SelectorRoutes::from_source_fallback(
+                    selector_text,
+                    &selector_parser,
+                    parse_relative,
+                )
+                .ok_or(original_error)?
             }
+        };
+        if let Some(nesting) = &self.nesting {
+            nesting
+                .resolve(routes)
+                .ok_or_else(|| input.new_custom_error(SelectorParseErrorKind::InvalidState))
+        } else {
+            Ok(routes)
         }
     }
 
     fn parse_block<'t>(
         &mut self,
-        (selector_text, selector): Self::Prelude,
+        routes: Self::Prelude,
         _start: &ParserState,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::QualifiedRule, cssparser::ParseError<'i, Self::Error>> {
-        let nesting = NestingContext::new(selector_text, selector);
+        let nesting = NestingContext::new(routes);
         let mut parser = self.with_nesting(nesting);
         let nested = parse_nested_style_block(input, &mut parser);
         Ok(ParsedCssRule::Nested(nested))
@@ -431,7 +626,7 @@ impl<'a, 'p, 'i> AtRuleParser<'i> for NestedStyleBodyParser<'a, 'p> {
 }
 
 impl<'a, 'p, 'i> cssparser::QualifiedRuleParser<'i> for NestedStyleBodyParser<'a, 'p> {
-    type Prelude = (String, SelectorList<QuireSelectorImpl>);
+    type Prelude = SelectorRoutes;
     type QualifiedRule = NestedStyleItem;
     type Error = SelectorParseErrorKind<'i>;
 
@@ -510,8 +705,7 @@ fn parse_nested_style_block<'a, 'i, 't>(
             NestedStyleItem::Rule(rule) => {
                 if !declarations.is_empty() {
                     rules.extend(parser.style_rules(
-                        context.selector_text.clone(),
-                        context.selector.clone(),
+                        context.routes.clone(),
                         std::mem::replace(
                             &mut declarations,
                             Declarations::new().with_urls(parser.base_url, parser.root_url),
@@ -523,7 +717,7 @@ fn parse_nested_style_block<'a, 'i, 't>(
         }
     }
     if !declarations.is_empty() {
-        rules.extend(parser.style_rules(context.selector_text, context.selector, declarations));
+        rules.extend(parser.style_rules(context.routes, declarations));
     }
     rules
 }

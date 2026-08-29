@@ -1,5 +1,40 @@
 use super::super::*;
 
+fn has_table_or_replaced_descendant(element: &Element) -> bool {
+    element.children.iter().any(|child| {
+        let NodeKind::Element(child_element) = &child.kind else {
+            return false;
+        };
+        is_table_or_replaced_element(child_element)
+            || has_table_or_replaced_descendant(child_element)
+    })
+}
+
+fn has_table_or_replaced_descendant_box(child_boxes: &[box_tree::FormattingBox<'_>]) -> bool {
+    child_boxes.iter().any(|child| match child {
+        box_tree::FormattingBox::Table(_) | box_tree::FormattingBox::Replaced(_) => true,
+        box_tree::FormattingBox::AtomicInline(box_) => {
+            is_table_or_replaced_element(box_.core.element)
+                || has_table_or_replaced_descendant_box(&box_.core.children)
+        }
+        box_tree::FormattingBox::Block(box_) => {
+            has_table_or_replaced_descendant_box(&box_.core.children)
+        }
+        box_tree::FormattingBox::Inline(box_) => {
+            has_table_or_replaced_descendant_box(&box_.core.children)
+        }
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+            has_table_or_replaced_descendant_box(&box_.core.children)
+        }
+        box_tree::FormattingBox::AnonymousBlock(box_) => {
+            has_table_or_replaced_descendant_box(&box_.children)
+        }
+        box_tree::FormattingBox::Flex(box_) => {
+            has_table_or_replaced_descendant_box(&box_.core.children)
+        }
+        box_tree::FormattingBox::Text(_) => false,
+    })
+}
 impl<'a> LayoutBuilder<'a> {
     /// Measure the final outer extent that an avoid-constrained child occupies
     /// in its fragmentation context's block direction.
@@ -225,6 +260,7 @@ impl<'a> LayoutBuilder<'a> {
             table_fragment,
             true,
             principal_box_paint_mode,
+            None,
         );
         if self.pages.len() <= pages_before {
             return;
@@ -283,6 +319,7 @@ impl<'a> LayoutBuilder<'a> {
             table_fragment,
             true,
             principal_box_paint_mode,
+            None,
         );
         if avoid_box_fits_empty_page {
             self.avoid_inside_retry_depth -= 1;

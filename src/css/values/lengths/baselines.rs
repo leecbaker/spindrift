@@ -127,18 +127,18 @@ pub(crate) fn parse_vertical_align(value: &str, font_size: f32) -> Option<Vertic
         "top" => Some(
             vertical_align
                 .with_baseline_shift(BaselineShift::Top)
-                .with_table_cell_align(TableCellVerticalAlign::Top),
+                .with_table_cell_align(TableCellVerticalAlignKeyword::Top),
         ),
         "center" => Some(vertical_align.with_baseline_shift(BaselineShift::Center)),
         "middle" => Some(
             vertical_align
                 .with_alignment_baseline(AlignmentBaseline::Metric(BaselineMetric::Middle))
-                .with_table_cell_align(TableCellVerticalAlign::Middle),
+                .with_table_cell_align(TableCellVerticalAlignKeyword::Middle),
         ),
         "bottom" => Some(
             vertical_align
                 .with_baseline_shift(BaselineShift::Bottom)
-                .with_table_cell_align(TableCellVerticalAlign::Bottom),
+                .with_table_cell_align(TableCellVerticalAlignKeyword::Bottom),
         ),
         "text-top" => Some(
             vertical_align

@@ -90,8 +90,20 @@ pub(in crate::layout) fn freeze_float_replay_width(
 pub(in crate::layout) fn freeze_float_replay_height(
     style: &mut ComputedStyle,
     containing_block_height: BlockSizePercentageBasis,
-    preserve_quirks_auto_height: bool,
+    _preserve_quirks_auto_height: bool,
 ) -> Option<ContentBoxLength> {
+    // `auto` remains auto during float replay. A replay has a definite scratch
+    // fragmentainer, but that must not turn an automatic float into a
+    // fill-available page-height box merely because the original containing
+    // block was definite. Quirks mode affects percentage descendants, not the
+    // float's own used `height`.
+    // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
+    if matches!(
+        style.box_values.height.value(),
+        css::ComputedLengthPercentageOrAuto::Auto
+    ) {
+        return None;
+    }
     let vertical_non_content = non_content_pt(
         style.padding.top
             + style.padding.bottom
@@ -103,17 +115,7 @@ pub(in crate::layout) fn freeze_float_replay_height(
         style.box_sizing,
         containing_block_height,
         vertical_non_content,
-    )
-    .or_else(|| {
-        // This is deliberately not part of standards-mode float sizing.
-        // Browser quirks mode retains a definite containing-block height
-        // through an auto-height float so descendant percentage heights can
-        // resolve. HTML does not fully specify quirks layout behavior.
-        // <https://html.spec.whatwg.org/multipage/parsing.html>
-        (preserve_quirks_auto_height && style.box_values.height.is_auto())
-            .then(|| containing_block_height.value())
-            .flatten()
-    })?;
+    )?;
     let replay_height = match style.box_sizing {
         BoxSizing::ContentBox => content_height.points(),
         BoxSizing::BorderBox => {
@@ -234,10 +236,8 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
         // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
         let containing_block_height_basis = self
-            .definite_block_size_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(PercentageBasis::indefinite);
+            .block_percentage_context_stack
+            .current_percentage_basis();
         let specified_content_height = used_content_box_size_with_basis(
             style.box_values.height.value().clone(),
             style.box_sizing,
@@ -261,7 +261,9 @@ impl<'a> LayoutBuilder<'a> {
             });
         let measure_intrinsic_widths = |layout: &mut Self, available_width: f32| {
             if let Some(basis) = intrinsic_height_basis {
-                layout.definite_block_size_stack.push(basis);
+                layout
+                    .block_percentage_context_stack
+                    .push_percentage_basis(basis);
             }
             let sizes = if style.writing_mode.has_vertical_lines()
                 && !style.display.is_flex()
@@ -292,7 +294,7 @@ impl<'a> LayoutBuilder<'a> {
                 )
             };
             if intrinsic_height_basis.is_some() {
-                layout.definite_block_size_stack.pop();
+                layout.block_percentage_context_stack.pop();
             }
             sizes
         };
@@ -468,6 +470,24 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
 
+        // Grid's used automatic block size is established by final track
+        // sizing at the already-resolved float width. Query that pure sizing
+        // boundary directly, so the speculative float-height probe does not
+        // lay out and discard every Grid child before final paint replay.
+        // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
+        // <https://www.w3.org/TR/css-grid-1/#grid-container-size>
+        if style.display.is_grid()
+            && let Some(height) = self.measure_floated_grid_margin_box_height(
+                element,
+                style,
+                stylesheets,
+                PhysicalContentWidth::new(inline_size.content_width),
+                child_boxes,
+            )
+        {
+            return height;
+        }
+
         self.measure_auto_float_margin_box_height(
             element,
             style,
@@ -485,8 +505,7 @@ impl<'a> LayoutBuilder<'a> {
     /// generated-content interaction. In particular, it can retain earlier
     /// float exclusions while recursively estimating a later floated list.
     /// Replay instead uses the frozen used width and a fresh float context,
-    /// then rolls back pages, counters, generated content, positioned layers,
-    /// and paint through `LayoutSnapshot`.
+    /// then runs in an ownership-isolated speculative transaction.
     /// <https://www.w3.org/TR/CSS22/visudet.html#root-height> and
     /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
     fn measure_auto_float_margin_box_height(
@@ -517,7 +536,9 @@ impl<'a> LayoutBuilder<'a> {
             border_box_width_bits: inline_size.border_box_width.points().to_bits(),
             margin_box_width_bits: inline_size.margin_box_width.points().to_bits(),
             style_fingerprint: debug_fingerprint(placed_style),
-            percentage_basis_fingerprint: debug_fingerprint(&self.definite_block_size_stack.last()),
+            percentage_basis_fingerprint: debug_fingerprint(
+                &self.block_percentage_context_stack.current_context(),
+            ),
             counter_fingerprint: debug_fingerprint(&self.counter_set),
             quote_depth: self.quote_depth,
             page_index: self.pages.len(),
@@ -550,50 +571,50 @@ impl<'a> LayoutBuilder<'a> {
         #[cfg(feature = "layout-profile")]
         let _profile = crate::layout::layout_profile::float_auto_height_measurement_scope();
         self.active_auto_float_measurements.push(element_key);
-        // This replay measures a float's own BFC. Its lines cannot select an
-        // anchor for an outside marker owned by the surrounding principal
-        // flow.
-        let pending_outside_marker_anchors = self.pending_outside_marker_anchors.suspend();
-        let snapshot = self.snapshot();
         let probe_top = 10_000.0;
         let replay_style = float_replay_style(placed_style);
-
-        // The probe is a page-shaped, non-persistent formatting context. Its
-        // fragmentainer is made effectively unbounded so it measures the
-        // float's used block size rather than a page fragment.
-        self.current_page = Page::new(inline_size.border_box_width.points().max(1.0), probe_top);
-        self.content_left = placed_style.margin.left;
-        self.content_right = self.content_left + inline_size.border_box_width.points().max(1.0);
-        self.cursor_y = probe_top - placed_style.margin.top;
-        // The floated element is itself an orthogonal child of this
-        // formatting context. Keep the parent flow here: block layout records
-        // it before installing `placed_style` for descendants, and uses that
-        // relationship to resolve the float's auto logical inline size.
-        // Replacing it with the float's own flow makes a vertical float look
-        // parallel to itself and leaves its physical height at zero.
-        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
-        if !crate::layout::block::writing_modes_are_orthogonal(
-            self.containing_block_writing_mode,
-            placed_style.writing_mode,
-        ) {
-            self.containing_block_direction = placed_style.used_direction();
-            self.containing_block_writing_mode = placed_style.writing_mode;
-        }
-        self.fragmentation_suppression_depth += 1;
-        self.push_page_name_scope_suppression();
-        self.push_float_context();
-        self.preserve_scoped_paint_public_order = true;
-        self.layout_element_with_child_boxes_and_table_fragment(
-            element,
-            &replay_style,
-            stylesheets,
-            child_boxes,
-            table_fragment,
-        );
-        let border_box_height = (probe_top - placed_style.margin.top - self.cursor_y).max(0.0);
-        self.restore(snapshot);
-        self.pending_outside_marker_anchors
-            .restore(pending_outside_marker_anchors);
+        let border_box_height = self.with_speculative_layout(|layout| {
+            // The probe is a page-shaped, non-persistent formatting context. Its
+            // fragmentainer is made effectively unbounded so it measures the
+            // float's used block size rather than a page fragment.
+            layout.current_page =
+                Page::new(inline_size.border_box_width.points().max(1.0), probe_top);
+            layout.content_left = placed_style.margin.left;
+            layout.content_right =
+                layout.content_left + inline_size.border_box_width.points().max(1.0);
+            layout.cursor_y = probe_top - placed_style.margin.top;
+            // The floated element is itself an orthogonal child of this
+            // formatting context. Keep the parent flow here: block layout records
+            // it before installing `placed_style` for descendants, and uses that
+            // relationship to resolve the float's auto logical inline size.
+            // Replacing it with the float's own flow makes a vertical float look
+            // parallel to itself and leaves its physical height at zero.
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+            if !crate::layout::block::writing_modes_are_orthogonal(
+                layout.containing_block_writing_mode,
+                placed_style.writing_mode,
+            ) {
+                layout.containing_block_direction = placed_style.used_direction();
+                layout.containing_block_writing_mode = placed_style.writing_mode;
+            }
+            layout.fragmentation_suppression_depth += 1;
+            layout.push_page_name_scope_suppression();
+            layout.push_float_context();
+            layout.preserve_scoped_paint_public_order = true;
+            layout.layout_element_with_child_boxes_and_table_fragment(
+                element,
+                &replay_style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+            );
+            let border_box_height =
+                (probe_top - placed_style.margin.top - layout.cursor_y).max(0.0);
+            layout.pop_float_context();
+            layout.pop_page_name_scope_suppression();
+            layout.fragmentation_suppression_depth -= 1;
+            border_box_height
+        });
         let popped = self.active_auto_float_measurements.pop();
         debug_assert_eq!(popped, Some(element_key));
 
@@ -664,10 +685,8 @@ impl<'a> LayoutBuilder<'a> {
         let content_height = constrain_content_height(
             style,
             content_box_pt(0.0),
-            self.definite_block_size_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(PercentageBasis::indefinite),
+            self.block_percentage_context_stack
+                .current_percentage_basis(),
         );
         margin_box_pt(
             style.margin.top

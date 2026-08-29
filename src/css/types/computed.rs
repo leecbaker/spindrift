@@ -1684,7 +1684,7 @@ pub(crate) struct ComputedStyle {
     pub padding: Edges,
     pub border_width: f32,
     pub border_widths: Edges,
-    pub border_width_values: CssEdges<ComputedLengthPercentage>,
+    pub border_width_values: PhysicalEdges<ComputedLengthPercentage>,
     pub border_color: CssColorOrCurrentColor,
     pub border_colors: BorderColors,
     pub border_styles: BorderStyles,
@@ -1710,7 +1710,7 @@ pub(crate) struct ComputedStyle {
     pub caption_side: CaptionSide,
     pub table_layout: TableLayout,
     pub empty_cells: EmptyCells,
-    pub border_spacing: TableBorderSpacing,
+    pub border_spacing: CascadedTableBorderSpacing,
     pub background: Background,
     pub object_fit: ObjectFit,
     pub object_view_box: ObjectViewBox,
@@ -1824,8 +1824,10 @@ pub(crate) struct ComputedStyle {
     pub scroll_snap_type: ScrollSnapType,
     pub scroll_snap_align: ScrollSnapAlign,
     pub scroll_snap_stop: ScrollSnapStop,
-    pub scroll_padding: CssEdges<ScrollPadding>,
-    pub scroll_margin: CssEdges<ComputedLengthPercentage>,
+    pub scroll_target_group: ScrollTargetGroup,
+    pub scroll_marker_group: Option<ScrollMarkerGroup>,
+    pub scroll_padding: PhysicalEdges<ScrollPadding>,
+    pub scroll_margin: PhysicalEdges<ComputedLengthPercentage>,
     pub overflow_clip_margin: OverflowClipMargin,
     pub overflow_wrap: OverflowWrap,
     pub line_break: LineBreak,
@@ -1855,6 +1857,8 @@ pub(crate) struct ComputedStyle {
     pub content: Content,
     pub before_style: Option<Box<ComputedStyle>>,
     pub after_style: Option<Box<ComputedStyle>>,
+    pub scroll_marker_style: Option<Box<ComputedStyle>>,
+    pub scroll_marker_group_style: Option<Box<ComputedStyle>>,
     /// Author-cascaded GCPM `::footnote-call` style. Its default generated
     /// counter content is created only when the element is a footnote.
     pub footnote_call_style: Option<Box<ComputedStyle>>,
@@ -2301,7 +2305,7 @@ impl ComputedStyle {
             // corresponding resolved edge widths remain zero until a
             // non-suppressing line style makes them usable by layout.
             // <https://www.w3.org/TR/css-backgrounds-3/#border-width>
-            border_width_values: CssEdges::all(ComputedLengthPercentage::from_points(
+            border_width_values: PhysicalEdges::all(ComputedLengthPercentage::from_points(
                 3.0 * CSS_PX_TO_PT,
             )),
             border_color: CssColorOrCurrentColor::CurrentColor,
@@ -2323,7 +2327,7 @@ impl ComputedStyle {
             caption_side: CaptionSide::Top,
             table_layout: TableLayout::Auto,
             empty_cells: EmptyCells::Show,
-            border_spacing: TableBorderSpacing::INITIAL,
+            border_spacing: CascadedTableBorderSpacing::INITIAL,
             background: Background::initial(),
             object_fit: ObjectFit::Fill,
             object_view_box: ObjectViewBox::NONE,
@@ -2420,8 +2424,10 @@ impl ComputedStyle {
             scroll_snap_type: ScrollSnapType::None,
             scroll_snap_align: ScrollSnapAlign::default(),
             scroll_snap_stop: ScrollSnapStop::Normal,
-            scroll_padding: CssEdges::all(ScrollPadding::Auto),
-            scroll_margin: CssEdges::all(ComputedLengthPercentage::ZERO),
+            scroll_target_group: ScrollTargetGroup::None,
+            scroll_marker_group: None,
+            scroll_padding: PhysicalEdges::all(ScrollPadding::Auto),
+            scroll_margin: PhysicalEdges::all(ComputedLengthPercentage::ZERO),
             overflow_clip_margin: OverflowClipMargin::ZERO,
             overflow_wrap: OverflowWrap::Normal,
             line_break: LineBreak::Auto,
@@ -2439,6 +2445,8 @@ impl ComputedStyle {
             content: Content::Normal,
             before_style: None,
             after_style: None,
+            scroll_marker_style: None,
+            scroll_marker_group_style: None,
             footnote_call_style: None,
             footnote_marker_style: None,
             first_line_style: None,
@@ -2748,6 +2756,8 @@ impl ComputedStyle {
                 self.marker_style.as_deref(),
                 self.before_style.as_deref(),
                 self.after_style.as_deref(),
+                self.scroll_marker_style.as_deref(),
+                self.scroll_marker_group_style.as_deref(),
                 self.first_line_style.as_deref(),
                 self.first_letter_style.as_deref(),
                 self.footnote_call_style.as_deref(),
@@ -2765,6 +2775,8 @@ impl ComputedStyle {
             self.marker_style.as_deref(),
             self.before_style.as_deref(),
             self.after_style.as_deref(),
+            self.scroll_marker_style.as_deref(),
+            self.scroll_marker_group_style.as_deref(),
             self.footnote_call_style.as_deref(),
             self.footnote_marker_style.as_deref(),
             self.first_line_style.as_deref(),
@@ -3562,7 +3574,7 @@ mod tests {
     fn effective_zoom_scales_fixed_border_spacing_once_without_scaling_percentages() {
         let mut style = ComputedStyle::initial();
         style.effective_zoom = EffectiveZoom(2.0);
-        style.border_spacing = TableBorderSpacing::NonAuthor(BorderSpacing {
+        style.border_spacing = CascadedTableBorderSpacing::NonAuthor(BorderSpacing {
             horizontal: ComputedLengthPercentage::from_affine(layout_pt(7.0), 0.25, true),
             vertical: ComputedLengthPercentage::from_points(11.0),
         });

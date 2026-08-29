@@ -66,20 +66,20 @@ pub(crate) fn parse_border_radius(value: &str, font_size: f32) -> Option<BorderR
     };
     Some(BorderRadius {
         top_left: CornerRadius {
-            x: horizontal.top,
-            y: vertical.top,
+            horizontal: horizontal.top,
+            vertical: vertical.top,
         },
         top_right: CornerRadius {
-            x: horizontal.right,
-            y: vertical.right,
+            horizontal: horizontal.right,
+            vertical: vertical.right,
         },
         bottom_right: CornerRadius {
-            x: horizontal.bottom,
-            y: vertical.bottom,
+            horizontal: horizontal.bottom,
+            vertical: vertical.bottom,
         },
         bottom_left: CornerRadius {
-            x: horizontal.left,
-            y: vertical.left,
+            horizontal: horizontal.left,
+            vertical: vertical.left,
         },
     })
 }
@@ -98,12 +98,12 @@ pub(crate) fn parse_corner_radius(value: &str, font_size: f32) -> Option<CornerR
         .collect::<Option<Vec<_>>>()?;
     match radii.as_slice() {
         [all] => Some(CornerRadius {
-            x: all.clone(),
-            y: all.clone(),
+            horizontal: all.clone(),
+            vertical: all.clone(),
         }),
         [x, y] => Some(CornerRadius {
-            x: x.clone(),
-            y: y.clone(),
+            horizontal: x.clone(),
+            vertical: y.clone(),
         }),
         _ => None,
     }
@@ -270,7 +270,10 @@ pub(crate) fn parse_corner_shapes(value: &str) -> Option<CornerShapes> {
     }
 }
 
-pub(crate) fn parse_radius_components(value: &str, font_size: f32) -> Option<EdgesOf<CssRadius>> {
+pub(crate) fn parse_radius_components(
+    value: &str,
+    font_size: f32,
+) -> Option<EdgesOf<CornerRadiusComponent>> {
     let radii = split_css_component_values(value)
         .into_iter()
         .map(|part| parse_radius_value(part, font_size))
@@ -304,14 +307,14 @@ pub(crate) fn parse_radius_components(value: &str, font_size: f32) -> Option<Edg
     }
 }
 
-pub(crate) fn parse_radius_value(value: &str, font_size: f32) -> Option<CssRadius> {
+pub(crate) fn parse_radius_value(value: &str, font_size: f32) -> Option<CornerRadiusComponent> {
     let value = parse_computed_length_percentage(value, font_size)?;
     // CSS accepts a calculation whose computed result is outside this
     // property's range, then clamps it at used-value time.  Rejecting it here
     // would incorrectly retain an earlier declaration such as `10px` for
     // `border-radius: calc(-10px)`.
     // <https://drafts.csswg.org/css-values-4/#calc-range>
-    Some(CssRadius { value })
+    Some(CornerRadiusComponent { value })
 }
 
 #[derive(Debug, Clone, Copy)]

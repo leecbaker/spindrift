@@ -1899,3 +1899,69 @@ impl ResolveViewportLengths for GradientColorHint {
         self.position.resolve_viewport_lengths(basis);
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundRepeatAxis {
+    Repeat,
+    Space,
+    Round,
+    NoRepeat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundRepeat {
+    Repeat,
+    NoRepeat,
+    RepeatX,
+    RepeatY,
+    Axes {
+        x: BackgroundRepeatAxis,
+        y: BackgroundRepeatAxis,
+    },
+}
+
+impl BackgroundRepeat {
+    pub(crate) fn new(x: BackgroundRepeatAxis, y: BackgroundRepeatAxis) -> Self {
+        match (x, y) {
+            (BackgroundRepeatAxis::Repeat, BackgroundRepeatAxis::Repeat) => Self::Repeat,
+            (BackgroundRepeatAxis::NoRepeat, BackgroundRepeatAxis::NoRepeat) => Self::NoRepeat,
+            (BackgroundRepeatAxis::Repeat, BackgroundRepeatAxis::NoRepeat) => Self::RepeatX,
+            (BackgroundRepeatAxis::NoRepeat, BackgroundRepeatAxis::Repeat) => Self::RepeatY,
+            (x, y) => Self::Axes { x, y },
+        }
+    }
+
+    pub(crate) fn x_axis(self) -> BackgroundRepeatAxis {
+        match self {
+            Self::Repeat | Self::RepeatX => BackgroundRepeatAxis::Repeat,
+            Self::NoRepeat | Self::RepeatY => BackgroundRepeatAxis::NoRepeat,
+            Self::Axes { x, .. } => x,
+        }
+    }
+
+    pub(crate) fn y_axis(self) -> BackgroundRepeatAxis {
+        match self {
+            Self::Repeat | Self::RepeatY => BackgroundRepeatAxis::Repeat,
+            Self::NoRepeat | Self::RepeatX => BackgroundRepeatAxis::NoRepeat,
+            Self::Axes { y, .. } => y,
+        }
+    }
+
+    /// Returns whether the background image repeats on the physical x axis.
+    ///
+    /// CSS Backgrounds and Borders defines `repeat`, `space`, and `round` as
+    /// repeated styles; only `no-repeat` suppresses additional tiles:
+    /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-repeat>.
+    pub(crate) fn repeats_x(self) -> bool {
+        self.x_axis() != BackgroundRepeatAxis::NoRepeat
+    }
+
+    /// Returns whether the background image repeats on the physical y axis.
+    ///
+    /// CSS Backgrounds and Borders defines `repeat`, `space`, and `round` as
+    /// repeated styles; only `no-repeat` suppresses additional tiles:
+    /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-repeat>.
+    pub(crate) fn repeats_y(self) -> bool {
+        self.y_axis() != BackgroundRepeatAxis::NoRepeat
+    }
+}

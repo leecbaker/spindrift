@@ -5,6 +5,7 @@ pub(in crate::layout) mod children;
 mod fragmentation;
 mod geometry;
 mod intrinsic;
+mod margin_collapse;
 mod phase;
 #[cfg(test)]
 mod tests;
@@ -17,5 +18,5 @@ pub(in crate::layout) use self::children::state::{
 };
 pub(in crate::layout) use self::fragmentation::*;
 pub(in crate::layout) use self::geometry::*;
+pub(in crate::layout) use self::margin_collapse::*;
 pub(in crate::layout) use self::phase::*;
-pub(in crate::layout) use crate::layout::flow_helpers::height_behaves_as_auto_for_margin_collapse;

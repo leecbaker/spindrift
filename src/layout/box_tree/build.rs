@@ -653,7 +653,23 @@ fn append_iterative_element_build<'a>(
             policy: footnote_policy,
         });
     } else {
-        parent.built.boxes.push(built.box_);
+        let scroll_marker_group = build_scroll_marker_group(&built.box_);
+        let placement = built
+            .box_
+            .style()
+            .scroll_marker_group
+            .map(|group| group.placement);
+        match (placement, scroll_marker_group) {
+            (Some(css::ScrollMarkerGroupPlacement::Before), Some(group)) => {
+                parent.built.boxes.push(group);
+                parent.built.boxes.push(built.box_);
+            }
+            (Some(css::ScrollMarkerGroupPlacement::After), Some(group)) => {
+                parent.built.boxes.push(built.box_);
+                parent.built.boxes.push(group);
+            }
+            _ => parent.built.boxes.push(built.box_),
+        }
     }
     parent.built.footnotes.extend(built.footnotes);
     parent.built.counter_events.push(built.counter_event);
@@ -1517,7 +1533,9 @@ fn push_generated_pseudo_box<'a>(
     style.marker_counter_origin = match kind {
         GeneratedPseudoKind::Before => css::MarkerCounterOrigin::Before,
         GeneratedPseudoKind::After => css::MarkerCounterOrigin::After,
-        GeneratedPseudoKind::FootnoteCall => css::MarkerCounterOrigin::Principal,
+        GeneratedPseudoKind::FootnoteCall
+        | GeneratedPseudoKind::ScrollMarkerGroup
+        | GeneratedPseudoKind::ScrollMarker => css::MarkerCounterOrigin::Principal,
     };
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         style.abspos_static_source = css::StaticPositionSource::from_display(style.display);
@@ -1558,6 +1576,24 @@ fn build_generated_pseudo_box<'a>(
     style: Box<ComputedStyle>,
     kind: GeneratedPseudoKind,
 ) -> Option<MutableFormattingBox<'a>> {
+    build_generated_pseudo_box_with_children(
+        originating_element,
+        originating_signature,
+        originating_clear,
+        style,
+        kind,
+        Vec::new(),
+    )
+}
+
+fn build_generated_pseudo_box_with_children<'a>(
+    originating_element: &'a Element,
+    originating_signature: ElementSignature,
+    originating_clear: Clear,
+    style: Box<ComputedStyle>,
+    kind: GeneratedPseudoKind,
+    children: Vec<MutableFormattingBox<'a>>,
+) -> Option<MutableFormattingBox<'a>> {
     if style.display.is_none() {
         return None;
     }
@@ -1568,7 +1604,6 @@ fn build_generated_pseudo_box<'a>(
         kind,
     }));
     let marker = marker_box(&style);
-    let children = Vec::new();
 
     if style.display.is_table() && style.display.is_inline_or_run_in_level() {
         let fragment = build_table_fragment(
@@ -1658,6 +1693,100 @@ fn build_generated_pseudo_box<'a>(
             fragment_edges: InlineBoxFragmentEdges::ALL,
         }))
     }
+}
+
+/// An automatic marker's immutable source relationship. The marker box is an
+/// external child of its owner's generated group, but its CSS inheritance,
+/// generated content, and counters continue to originate at this element.
+struct AutomaticScrollMarker<'a> {
+    element: &'a Element,
+    signature: ElementSignature,
+    originating_clear: Clear,
+    style: ComputedStyle,
+}
+
+fn is_scroll_container(style: &ComputedStyle) -> bool {
+    style.overflow_x.is_scrollable() || style.overflow_y.is_scrollable()
+}
+
+fn collect_automatic_scroll_markers<'a>(
+    box_: &MutableFormattingBox<'a>,
+    is_owner: bool,
+    output: &mut Vec<AutomaticScrollMarker<'a>>,
+) {
+    if let Some(core) = box_.element_core() {
+        // A nested scrolling box owns (or discards) its own automatic markers;
+        // they must never leak to an outer scroll container's generated group.
+        if !is_owner && is_scroll_container(&core.style) {
+            return;
+        }
+        if !is_owner
+            && matches!(core.source, BoxSource::Principal)
+            && let Some(style) = core.style.scroll_marker_style.as_deref()
+            && style.content.is_generated()
+        {
+            output.push(AutomaticScrollMarker {
+                element: core.element,
+                signature: core.signature.clone(),
+                originating_clear: core.style.clear,
+                style: style.clone(),
+            });
+        }
+    }
+    for child in box_.children() {
+        collect_automatic_scroll_markers(child, false, output);
+    }
+}
+
+/// Materialize the external generated sibling required by CSS Overflow 5.
+/// This deliberately runs before the parent's anonymous-box normalization, so
+/// the group becomes a real flex/grid/table sibling of the scroll container.
+fn build_scroll_marker_group<'a>(
+    scroll_container: &MutableFormattingBox<'a>,
+) -> Option<MutableFormattingBox<'a>> {
+    let core = scroll_container.element_core()?;
+    if !matches!(core.source, BoxSource::Principal)
+        || !is_scroll_container(&core.style)
+        || core.style.scroll_marker_group.is_none()
+    {
+        return None;
+    }
+    let group_style = core.style.scroll_marker_group_style.as_deref()?;
+    if group_style.display.is_none() {
+        return None;
+    }
+
+    let mut sources = Vec::new();
+    collect_automatic_scroll_markers(scroll_container, true, &mut sources);
+    let markers = sources
+        .into_iter()
+        .filter_map(|marker| {
+            let mut style = Box::new(marker.style);
+            style.marker_counter_origin = css::MarkerCounterOrigin::Principal;
+            build_generated_pseudo_box_with_children(
+                marker.element,
+                marker.signature,
+                marker.originating_clear,
+                style,
+                GeneratedPseudoKind::ScrollMarker,
+                Vec::new(),
+            )
+        })
+        .collect();
+
+    let mut style = Box::new(group_style.clone());
+    // The group is a sibling in the scroll container's parent. A standalone
+    // inline box cannot contain the ordered marker list in normal flow.
+    style.display = style.display.blockified();
+    style.marker_counter_origin = css::MarkerCounterOrigin::Principal;
+    build_generated_pseudo_box_with_children(
+        core.element,
+        core.signature.clone(),
+        core.style.clear,
+        style,
+        GeneratedPseudoKind::ScrollMarkerGroup,
+        markers,
+    )
 }
 
 /// Select the rendered-legend candidate while the direct child formatting

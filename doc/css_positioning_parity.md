@@ -5,7 +5,11 @@
 An absolutely positioned Grid descendant uses its Grid positioning containing
 block. When its grid placement is automatic, the containing-block edges are
 the Grid container's padding edges; percentage dimensions resolve against
-that resulting Grid area. This follows [CSS Grid §9.1](https://drafts.csswg.org/css-grid-1/#abspos)
+that resulting Grid area. Definite placement uses the first occupied track's
+start edge and the final occupied track's end edge, so it includes crossed
+interior gutters but excludes any gutter following the area. This geometry is
+kept in physical order and applies equally in LTR and RTL. This follows
+[CSS Grid §9.1](https://drafts.csswg.org/css-grid-1/#abspos)
 and [CSS Positioned Layout §2.1](https://drafts.csswg.org/css-position-3/#abspos-containing-block).
 
 ## Compatibility outline paint ordering

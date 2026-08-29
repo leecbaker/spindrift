@@ -21,6 +21,11 @@ use baseline::{GridBaselineResolution, GridBaselineSet};
 use children::*;
 use contributions::*;
 use fragmentation::*;
+#[allow(unused_imports)]
+pub(in crate::layout) use gap_decorations::{
+    grid_axis_gutters_from_topology, grid_gap_decoration_gutters_from_topologies,
+    grid_gap_decoration_primitives, grid_gap_rule_paint_segments, grid_gap_rule_segment_primitives,
+};
 use intrinsic::*;
 use item_adjustment::{
     apply_grid_replaced_item_size_corrections, grid_subject_self_end_side,

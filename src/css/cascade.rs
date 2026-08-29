@@ -16,16 +16,6 @@ mod background;
 mod columns;
 mod declarations;
 
-/// Parse a CSS `text-shadow` declaration for SVG's retained text adapter.
-///
-/// SVG text enters Quire after the SVG parser has normalized inheritance, but
-/// it still uses the same CSS value grammar as HTML text shadows.
-pub(crate) fn parse_svg_text_shadow(
-    value: &str,
-    font_size: f32,
-) -> Option<Vec<crate::css::TextShadow>> {
-    declarations::parse_text_shadow(value, font_size)
-}
 mod properties;
 mod style;
 pub(in crate::css) mod variables;

@@ -1,4 +1,4 @@
-use super::model::{GridItemArea, GridItemLayout};
+use super::model::{GridAxisTopology, GridItemArea, GridItemLayout};
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +89,141 @@ pub(super) struct GridBaselinePlan {
     shims: Vec<GridBaselineSizingShim>,
 }
 
+/// Per-row baseline-sharing state derived from placed Grid items.
+///
+/// Grid baseline groups are identified by a logical row edge: first-baseline
+/// groups use an item's row-start line and last-baseline groups use its
+/// row-end line. Keeping one slot per placed row line avoids allocating a
+/// temporary list of groups or their participant items for every layout pass.
+#[derive(Debug, Clone, Copy, Default)]
+struct GridBaselineGroupState {
+    sharing_count: usize,
+    greatest_distance: f32,
+    target_baseline: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GridBaselineLineGroups {
+    first: GridBaselineGroupState,
+    last: GridBaselineGroupState,
+}
+
+struct GridBaselineGroupTable {
+    lines: Vec<GridBaselineLineGroups>,
+}
+
+impl GridBaselineGroupTable {
+    fn measure(
+        rows: &GridAxisTopology,
+        estimates: &[GridItemEstimate],
+        resolutions: &[GridBaselineResolution],
+        items: &[GridItemLayout],
+    ) -> Self {
+        let mut table = Self {
+            // Grid line numbers are one-based and a last-baseline group can
+            // use the final line after the last track.
+            lines: vec![GridBaselineLineGroups::default(); rows.track_count().saturating_add(2)],
+        };
+        for (index, item) in items.iter().enumerate() {
+            let Some(area) = item.area else {
+                continue;
+            };
+            for baseline_set in [GridBaselineSet::First, GridBaselineSet::Last] {
+                if !resolutions[index]
+                    .self_alignment(GridAxis::Row)
+                    .shares(baseline_set)
+                {
+                    continue;
+                }
+                let baseline = grid_item_border_box_baseline(&estimates[index], item, baseline_set);
+                let distance = match baseline_set {
+                    GridBaselineSet::First => baseline,
+                    GridBaselineSet::Last => (item.height() - baseline).max(0.0),
+                };
+                let Some(group) = table.group_mut(area, baseline_set) else {
+                    continue;
+                };
+                group.sharing_count += 1;
+                group.greatest_distance = group.greatest_distance.max(distance);
+            }
+        }
+        table
+    }
+
+    fn group(
+        &self,
+        area: GridItemArea,
+        baseline_set: GridBaselineSet,
+    ) -> Option<&GridBaselineGroupState> {
+        self.lines
+            .get(Self::line_index(area, baseline_set)?)
+            .map(|groups| match baseline_set {
+                GridBaselineSet::First => &groups.first,
+                GridBaselineSet::Last => &groups.last,
+            })
+    }
+
+    fn group_mut(
+        &mut self,
+        area: GridItemArea,
+        baseline_set: GridBaselineSet,
+    ) -> Option<&mut GridBaselineGroupState> {
+        self.lines
+            .get_mut(Self::line_index(area, baseline_set)?)
+            .map(|groups| match baseline_set {
+                GridBaselineSet::First => &mut groups.first,
+                GridBaselineSet::Last => &mut groups.last,
+            })
+    }
+
+    fn line_index(area: GridItemArea, baseline_set: GridBaselineSet) -> Option<usize> {
+        match baseline_set {
+            GridBaselineSet::First => Some(usize::from(area.row_start)),
+            GridBaselineSet::Last => Some(usize::from(area.row_end)),
+        }
+    }
+
+    fn set_alignment_targets(
+        &mut self,
+        rows: &GridAxisTopology,
+        align_content: css::AlignContent,
+        container_height: f32,
+        items: &[GridItemLayout],
+    ) {
+        for (line, groups) in self.lines.iter_mut().enumerate() {
+            let Ok(line) = u16::try_from(line) else {
+                continue;
+            };
+            for baseline_set in [GridBaselineSet::First, GridBaselineSet::Last] {
+                let group = match baseline_set {
+                    GridBaselineSet::First => &mut groups.first,
+                    GridBaselineSet::Last => &mut groups.last,
+                };
+                if group.sharing_count < 2 {
+                    continue;
+                }
+                let (row_start, row_end) = match baseline_set {
+                    GridBaselineSet::First => (line, 0),
+                    GridBaselineSet::Last => (0, line),
+                };
+                let row_edge = grid_row_baseline_edge(
+                    items,
+                    rows,
+                    align_content,
+                    container_height,
+                    row_start,
+                    row_end,
+                    baseline_set,
+                );
+                group.target_baseline = Some(match baseline_set {
+                    GridBaselineSet::First => row_edge + group.greatest_distance,
+                    GridBaselineSet::Last => row_edge - group.greatest_distance,
+                });
+            }
+        }
+    }
+}
+
 impl GridBaselinePlan {
     pub(super) fn shim(&self, index: usize) -> Option<GridBaselineSizingShim> {
         self.shims.get(index).copied()
@@ -157,9 +292,9 @@ pub(super) fn grid_baseline_sizing_may_need_shims(
 /// baseline table is measured by the inline adapter.
 pub(super) fn grid_baseline_plan(
     container_style: &ComputedStyle,
-    _children: &[GridChild<'_>],
     estimates: &[GridItemEstimate],
     resolutions: &[GridBaselineResolution],
+    rows: &GridAxisTopology,
     items: &[GridItemLayout],
 ) -> GridBaselinePlan {
     let mut plan = GridBaselinePlan {
@@ -170,53 +305,33 @@ pub(super) fn grid_baseline_plan(
     {
         return plan;
     }
-    for baseline_set in [GridBaselineSet::First, GridBaselineSet::Last] {
-        let mut groups = Vec::<(u16, u16)>::new();
-        for item in items {
-            let Some(area) = item.area else {
+    let groups = GridBaselineGroupTable::measure(rows, estimates, resolutions, items);
+    for (index, item) in items.iter().enumerate() {
+        let Some(area) = item.area else {
+            continue;
+        };
+        for baseline_set in [GridBaselineSet::First, GridBaselineSet::Last] {
+            if !resolutions[index]
+                .self_alignment(GridAxis::Row)
+                .shares(baseline_set)
+            {
+                continue;
+            }
+            let Some(group) = groups.group(area, baseline_set) else {
                 continue;
             };
-            let group = grid_baseline_group_key(area, baseline_set);
-            if !groups.contains(&group) {
-                groups.push(group);
-            }
-        }
-        for (row_start, row_end) in groups {
-            let participants = items
-                .iter()
-                .enumerate()
-                .filter(|(index, item)| {
-                    grid_item_in_baseline_group(item, row_start, row_end, baseline_set)
-                        && resolutions[*index]
-                            .self_alignment(GridAxis::Row)
-                            .shares(baseline_set)
-                })
-                .collect::<Vec<_>>();
-            if participants.len() < 2 {
+            if group.sharing_count < 2 {
                 continue;
             }
-            let greatest_distance = participants
-                .iter()
-                .map(|(index, item)| {
-                    let baseline =
-                        grid_item_border_box_baseline(&estimates[*index], item, baseline_set);
-                    match baseline_set {
-                        GridBaselineSet::First => baseline,
-                        GridBaselineSet::Last => (item.height() - baseline).max(0.0),
-                    }
-                })
-                .fold(0.0_f32, f32::max);
-            for (index, item) in participants {
-                let baseline = grid_item_border_box_baseline(&estimates[index], item, baseline_set);
-                let distance = match baseline_set {
-                    GridBaselineSet::First => baseline,
-                    GridBaselineSet::Last => (item.height() - baseline).max(0.0),
-                };
-                let shim = (greatest_distance - distance).max(0.0);
-                match baseline_set {
-                    GridBaselineSet::First => plan.shims[index].top = shim,
-                    GridBaselineSet::Last => plan.shims[index].bottom = shim,
-                }
+            let baseline = grid_item_border_box_baseline(&estimates[index], item, baseline_set);
+            let distance = match baseline_set {
+                GridBaselineSet::First => baseline,
+                GridBaselineSet::Last => (item.height() - baseline).max(0.0),
+            };
+            let shim = (group.greatest_distance - distance).max(0.0);
+            match baseline_set {
+                GridBaselineSet::First => plan.shims[index].top = shim,
+                GridBaselineSet::Last => plan.shims[index].bottom = shim,
             }
         }
     }
@@ -609,7 +724,9 @@ struct GridBaselineAlignmentContext<'a, 'box_tree> {
     children: &'a [GridChild<'box_tree>],
     estimates: &'a [GridItemEstimate],
     resolutions: &'a [GridBaselineResolution],
-    row_line_offsets: &'a [f32],
+    rows: &'a GridAxisTopology,
+    container_height: f32,
+    align_content: css::AlignContent,
 }
 /// Apply Quire-measured baseline self-alignment for simple grid rows.
 ///
@@ -625,7 +742,8 @@ pub(super) fn apply_grid_baseline_alignment(
     children: &[GridChild<'_>],
     estimates: &[GridItemEstimate],
     resolutions: &[GridBaselineResolution],
-    row_line_offsets: &[f32],
+    rows: &GridAxisTopology,
+    container_height: f32,
     items: &mut [GridItemLayout],
 ) {
     if WritingModeAxes::new(container_style.writing_mode, container_style.direction)
@@ -637,21 +755,57 @@ pub(super) fn apply_grid_baseline_alignment(
         children,
         estimates,
         resolutions,
-        row_line_offsets,
+        rows,
+        container_height,
+        align_content: container_style.align_content,
     };
-    for baseline_set in [GridBaselineSet::First, GridBaselineSet::Last] {
-        let mut row_groups = Vec::<(u16, u16)>::new();
-        for item in items.iter() {
-            let Some(area) = item.area else {
+    let mut groups = GridBaselineGroupTable::measure(rows, estimates, resolutions, items);
+    groups.set_alignment_targets(rows, context.align_content, container_height, items);
+    for (index, item) in items.iter_mut().enumerate() {
+        let Some(area) = item.area else {
+            continue;
+        };
+        for baseline_set in [GridBaselineSet::First, GridBaselineSet::Last] {
+            let participation = context.resolutions[index].self_alignment(GridAxis::Row);
+            let Some(group) = groups.group(area, baseline_set) else {
                 continue;
             };
-            let key = grid_baseline_group_key(area, baseline_set);
-            if !row_groups.contains(&key) {
-                row_groups.push(key);
+            if group.sharing_count < 2 {
+                if participation.requests(baseline_set) {
+                    let (row_start, row_end) = grid_baseline_group_key(area, baseline_set);
+                    apply_grid_baseline_self_alignment_fallback(
+                        item,
+                        &context.children[index].style,
+                        &context,
+                        row_start,
+                        row_end,
+                        baseline_set,
+                    );
+                }
+                continue;
             }
-        }
-        for (row_start, row_end) in row_groups {
-            align_grid_row_baseline_group(&context, items, row_start, row_end, baseline_set);
+            if participation.shares(baseline_set) {
+                let baseline =
+                    grid_item_border_box_baseline(&context.estimates[index], item, baseline_set);
+                item.set_axis_geometry(
+                    GridAxis::Row,
+                    group
+                        .target_baseline
+                        .expect("sharing group has an alignment target")
+                        - baseline,
+                    item.height(),
+                );
+            } else if participation.requests(baseline_set) {
+                let (row_start, row_end) = grid_baseline_group_key(area, baseline_set);
+                apply_grid_baseline_self_alignment_fallback(
+                    item,
+                    &context.children[index].style,
+                    &context,
+                    row_start,
+                    row_end,
+                    baseline_set,
+                );
+            }
         }
     }
 }
@@ -663,126 +817,23 @@ fn grid_baseline_group_key(area: GridItemArea, baseline_set: GridBaselineSet) ->
     }
 }
 
-fn align_grid_row_baseline_group(
-    context: &GridBaselineAlignmentContext<'_, '_>,
-    items: &mut [GridItemLayout],
-    row_start: u16,
-    row_end: u16,
-    baseline_set: GridBaselineSet,
-) {
-    let mut participant_count = 0_usize;
-    let mut largest_distance = None::<f32>;
-    for (index, item) in items.iter().enumerate() {
-        if !grid_item_in_baseline_group(item, row_start, row_end, baseline_set)
-            || !context.resolutions[index]
-                .self_alignment(GridAxis::Row)
-                .shares(baseline_set)
-        {
-            continue;
-        }
-        let baseline = grid_item_border_box_baseline(&context.estimates[index], item, baseline_set);
-        participant_count += 1;
-        let distance = match baseline_set {
-            GridBaselineSet::First => baseline,
-            GridBaselineSet::Last => (item.height() - baseline).max(0.0),
-        };
-        largest_distance = Some(
-            largest_distance
-                .map(|target| target.max(distance))
-                .unwrap_or(distance),
-        );
-    }
-    if participant_count < 2 {
-        // CSS Box Alignment falls a baseline self-alignment request back to
-        // safe self-start/self-end when no compatible sharing group remains.
-        // That includes items excluded by Grid's intrinsic-track cycle rule.
-        // Taffy cannot perform this fallback from Quire's measured baseline
-        // metadata, so apply it to every requesting border box here.
-        // <https://www.w3.org/TR/css-align-3/#baseline-align-self>
-        for (index, item) in items.iter_mut().enumerate() {
-            if !grid_item_in_baseline_group(item, row_start, row_end, baseline_set)
-                || !context.resolutions[index]
-                    .self_alignment(GridAxis::Row)
-                    .requests(baseline_set)
-            {
-                continue;
-            }
-            apply_grid_baseline_self_alignment_fallback(
-                item,
-                &context.children[index].style,
-                context.row_line_offsets,
-                row_start,
-                row_end,
-                baseline_set,
-            );
-        }
-        return;
-    }
-    let Some(largest_distance) = largest_distance else {
-        return;
-    };
-    let row_edge = grid_row_baseline_edge(
-        items,
-        context.row_line_offsets,
-        row_start,
-        row_end,
-        baseline_set,
-    );
-    let target_baseline = match baseline_set {
-        GridBaselineSet::First => row_edge + largest_distance,
-        GridBaselineSet::Last => row_edge - largest_distance,
-    };
-    for (index, item) in items.iter_mut().enumerate() {
-        if !grid_item_in_baseline_group(item, row_start, row_end, baseline_set)
-            || !context.resolutions[index]
-                .self_alignment(GridAxis::Row)
-                .shares(baseline_set)
-        {
-            continue;
-        }
-        let baseline = grid_item_border_box_baseline(&context.estimates[index], item, baseline_set);
-        item.set_axis_geometry(GridAxis::Row, target_baseline - baseline, item.height());
-    }
-    // Cyclic and otherwise incompatible baseline requests remain fallback
-    // aligned even when their row still has a compatible sharing group.
-    for (index, item) in items.iter_mut().enumerate() {
-        if !grid_item_in_baseline_group(item, row_start, row_end, baseline_set)
-            || !context.resolutions[index]
-                .self_alignment(GridAxis::Row)
-                .requests(baseline_set)
-            || context.resolutions[index]
-                .self_alignment(GridAxis::Row)
-                .shares(baseline_set)
-        {
-            continue;
-        }
-        apply_grid_baseline_self_alignment_fallback(
-            item,
-            &context.children[index].style,
-            context.row_line_offsets,
-            row_start,
-            row_end,
-            baseline_set,
-        );
-    }
-}
-
 fn apply_grid_baseline_self_alignment_fallback(
     item: &mut GridItemLayout,
     child_style: &ComputedStyle,
-    row_line_offsets: &[f32],
+    context: &GridBaselineAlignmentContext<'_, '_>,
     row_start: u16,
     row_end: u16,
     baseline_set: GridBaselineSet,
 ) {
-    let area_start = row_line_offsets
-        .get(usize::from(row_start).saturating_sub(1))
-        .copied()
-        .unwrap_or(item.y());
-    let area_end = row_line_offsets
-        .get(usize::from(row_end).saturating_sub(1))
-        .copied()
-        .unwrap_or(item.y() + item.height());
+    let (area_start, area_end) = context
+        .rows
+        .aligned_area_bounds(
+            context.align_content,
+            context.container_height,
+            row_start,
+            row_end,
+        )
+        .unwrap_or((item.y(), item.y() + item.height()));
     let y = match baseline_set {
         GridBaselineSet::First => {
             area_start
@@ -805,15 +856,17 @@ fn apply_grid_baseline_self_alignment_fallback(
 
 fn grid_row_baseline_edge(
     items: &[GridItemLayout],
-    row_line_offsets: &[f32],
+    rows: &GridAxisTopology,
+    align_content: css::AlignContent,
+    container_height: f32,
     row_start: u16,
     row_end: u16,
     baseline_set: GridBaselineSet,
 ) -> f32 {
     match baseline_set {
-        GridBaselineSet::First => row_line_offsets
-            .get(usize::from(row_start).saturating_sub(1))
-            .cloned()
+        GridBaselineSet::First => rows
+            .aligned_area_bounds(align_content, container_height, row_start, row_start + 1)
+            .map(|bounds| bounds.0)
             .unwrap_or_else(|| {
                 items
                     .iter()
@@ -829,9 +882,9 @@ fn grid_row_baseline_edge(
                     .reduce(f32::min)
                     .unwrap_or(0.0)
             }),
-        GridBaselineSet::Last => row_line_offsets
-            .get(usize::from(row_end).saturating_sub(1))
-            .cloned()
+        GridBaselineSet::Last => rows
+            .aligned_area_bounds(align_content, container_height, row_end - 1, row_end)
+            .map(|bounds| bounds.1)
             .unwrap_or_else(|| {
                 items
                     .iter()
@@ -1165,6 +1218,15 @@ mod tests {
         }
     }
 
+    fn baseline_test_rows(count: usize) -> GridAxisTopology {
+        GridAxisTopology::from_track_layout(
+            vec![30.0; count],
+            vec![0.0; count.saturating_sub(1)],
+            vec![false; count],
+        )
+        .expect("valid baseline test topology")
+    }
+
     #[test]
     fn baseline_sizing_eligibility_requires_a_horizontal_sharing_pair() {
         let first = baseline_test_item(
@@ -1263,18 +1325,99 @@ mod tests {
         second.first_baseline = Some(14.0);
         let plan = grid_baseline_plan(
             &style,
-            &[],
             &[first, second],
             &[
                 baseline_test_resolution(GridBaselineSet::First),
                 baseline_test_resolution(GridBaselineSet::First),
             ],
+            &baseline_test_rows(1),
             &items,
         );
 
         assert_eq!(plan.shim(0).unwrap().top, 6.0);
         assert_eq!(plan.shim(1).unwrap().top, 0.0);
         assert_eq!(plan.shim(0).unwrap().bottom, 0.0);
+    }
+
+    #[test]
+    fn baseline_group_table_keeps_first_and_last_row_edges_independent() {
+        let items = [
+            baseline_test_item(
+                GridItemArea {
+                    row_start: 1,
+                    row_end: 3,
+                    column_start: 1,
+                    column_end: 2,
+                },
+                0.0,
+                60.0,
+            ),
+            baseline_test_item(
+                GridItemArea {
+                    row_start: 1,
+                    row_end: 2,
+                    column_start: 2,
+                    column_end: 3,
+                },
+                0.0,
+                30.0,
+            ),
+            baseline_test_item(
+                GridItemArea {
+                    row_start: 2,
+                    row_end: 3,
+                    column_start: 1,
+                    column_end: 2,
+                },
+                30.0,
+                30.0,
+            ),
+        ];
+        let mut first = GridItemEstimate::fixed(20.0, 60.0);
+        first.first_baseline = Some(10.0);
+        first.last_baseline = Some(45.0);
+        let mut second = GridItemEstimate::fixed(20.0, 30.0);
+        second.first_baseline = Some(16.0);
+        let mut third = GridItemEstimate::fixed(20.0, 30.0);
+        third.last_baseline = Some(20.0);
+        let resolutions = [
+            GridBaselineResolution {
+                row_self: GridBaselineParticipation::Shares(GridBaselineSet::First),
+                column_self: GridBaselineParticipation::NotRequested,
+                row_content: GridBaselineParticipation::NotRequested,
+                column_content: GridBaselineParticipation::NotRequested,
+            },
+            baseline_test_resolution(GridBaselineSet::First),
+            baseline_test_resolution(GridBaselineSet::Last),
+        ];
+
+        let table = GridBaselineGroupTable::measure(
+            &baseline_test_rows(2),
+            &[first, second, third],
+            &resolutions,
+            &items,
+        );
+        assert_eq!(
+            table
+                .group(items[0].area.unwrap(), GridBaselineSet::First)
+                .unwrap()
+                .sharing_count,
+            2
+        );
+        assert_eq!(
+            table
+                .group(items[0].area.unwrap(), GridBaselineSet::Last)
+                .unwrap()
+                .sharing_count,
+            1
+        );
+        assert_eq!(
+            table
+                .group(items[2].area.unwrap(), GridBaselineSet::Last)
+                .unwrap()
+                .sharing_count,
+            1
+        );
     }
 
     #[test]

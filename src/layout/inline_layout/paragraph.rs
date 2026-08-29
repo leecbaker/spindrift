@@ -8,7 +8,7 @@ impl<'a> LayoutBuilder<'a> {
         context: InlineParagraphContext<'_>,
         line_index: usize,
         starts_after_forced_break: bool,
-        plaintext_direction_state: &mut Option<Direction>,
+        preceding_plaintext_line_direction: &mut Option<Direction>,
     ) -> InlineLayoutOutcome {
         // All inline paragraphs use the same CSS line-fitting engine. Parley
         // remains the text measurement, shaping, and fragment-splitting
@@ -20,7 +20,7 @@ impl<'a> LayoutBuilder<'a> {
             context,
             line_index,
             starts_after_forced_break,
-            plaintext_direction_state,
+            preceding_plaintext_line_direction,
         )
     }
 }

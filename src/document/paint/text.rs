@@ -63,6 +63,8 @@ pub(crate) enum RenderedTextPaintSegment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RenderedLineSource {
     Normal,
+    /// The generated `block-ellipsis` anonymous inline defined by CSS Overflow.
+    BlockEllipsis,
     RunIn,
     InlineAtom,
     Marker,
@@ -425,6 +427,43 @@ pub(in crate::document) fn rendered_lines_can_merge_as_inline_continuation(
     gap.abs() <= 0.1
 }
 
+/// Return whether two consecutive paint records meet at exactly the same
+/// visual text position.
+///
+/// This is deliberately independent of source provenance and whitespace. CSS
+/// layout has already kept the records separate for its own semantic reasons;
+/// joining them here only lets the PDF backend preserve its text cursor across
+/// that paint boundary instead of serializing a newly rounded absolute origin.
+/// The backend rechecks the individual text runs before reusing its cursor.
+pub(in crate::document) fn rendered_lines_can_merge_as_exact_paint_continuation(
+    left: &RenderedLine,
+    right: &RenderedLine,
+) -> bool {
+    if left.origin.y != right.origin.y
+        || right.origin.x < left.origin.x
+        || left.glyph_origin_adjustment != right.glyph_origin_adjustment
+        || left.color != right.color
+    {
+        return false;
+    }
+    // Combining page records changes their identity in the retained display
+    // list. It is therefore safe only within one source run, except for the
+    // generated CSS Overflow marker that must remain a separate anonymous
+    // inline but is defined to follow the remaining line content.
+    let shares_source_run = left
+        .source_run
+        .as_ref()
+        .zip(right.source_run.as_ref())
+        .is_some_and(|(left, right)| Rc::ptr_eq(left, right));
+    if !shares_source_run && right.source != RenderedLineSource::BlockEllipsis {
+        return false;
+    }
+    let left_end = rendered_line_visual_end(left);
+    let right_start = rendered_line_visual_start(right);
+    let tolerance = f32::EPSILON * (left_end.abs() + right_start.abs()).max(1.0) * 8.0;
+    (right_start - left_end).abs() <= tolerance
+}
+
 fn rendered_line_first_significant_font_id(line: &RenderedLine) -> Option<usize> {
     line.runs
         .iter()
@@ -673,6 +712,10 @@ pub type TextRunPoint = euclid::Point2D<f32, TextRunSpace>;
 /// vertical shaping can rotate that local text space. Keeping the displacement
 /// distinct from [`TextRunPoint`] makes the required inverse matrix conversion
 /// explicit at the SVG-to-PDF-text boundary.
+#[allow(
+    dead_code,
+    reason = "Retained for the text-matrix API's SVG-independent callers."
+)]
 pub type TextRunDisplacement = euclid::Vector2D<f32, TextRunSpace>;
 
 impl RenderedTextMatrix {
@@ -706,6 +749,10 @@ impl RenderedTextMatrix {
     /// Scale only the text-space inline axis. SVG `lengthAdjust="spacingAndGlyphs"`
     /// changes glyph geometry and advances along the text direction while
     /// preserving the block-axis glyph metrics.
+    #[allow(
+        dead_code,
+        reason = "Retained for future non-HTML text matrix consumers."
+    )]
     pub(crate) fn scaled_inline(self, factor: f32) -> Option<Self> {
         (factor.is_finite() && factor > 0.0).then(|| {
             Self(euclid::Transform2D::new(
@@ -725,6 +772,10 @@ impl RenderedTextMatrix {
     /// vertical extent of upright glyphs. Those glyphs retain an identity
     /// local text matrix, so the SVG adapter must scale this axis explicitly
     /// instead of treating it as a rotated horizontal run.
+    #[allow(
+        dead_code,
+        reason = "Retained for future non-HTML text matrix consumers."
+    )]
     pub(crate) fn scaled_block(self, factor: f32) -> Option<Self> {
         (factor.is_finite() && factor > 0.0).then(|| {
             Self(euclid::Transform2D::new(
@@ -756,6 +807,10 @@ impl RenderedTextMatrix {
     /// current text position, so the SVG adapter composes this local matrix
     /// before its outer SVG CTM.
     /// <https://www.w3.org/TR/SVG2/text.html#TSpanElementRotateAttribute>
+    #[allow(
+        dead_code,
+        reason = "Retained for future non-HTML text matrix consumers."
+    )]
     pub(crate) fn rotated_in_text_space(self, degrees: f32) -> Option<Self> {
         if !degrees.is_finite() {
             return None;
@@ -781,6 +836,10 @@ impl RenderedTextMatrix {
     /// inline/block coordinates. The SVG adapter uses this before applying
     /// the outer SVG CTM, so vertical text does not accidentally rotate its
     /// user-axis position list into the inline axis.
+    #[allow(
+        dead_code,
+        reason = "Retained for future non-HTML text matrix consumers."
+    )]
     pub(crate) fn inverse_transform_local_displacement(
         self,
         displacement: TextRunDisplacement,
@@ -807,7 +866,10 @@ pub enum RenderedGlyphKind {
     /// An ordinary paintable glyph from the selected font program.
     Paint(u16),
     VectorPath(u16),
-    /// A source-owned layout advance with no glyph to paint or subset.
+    /// A synthetic layout-control advance with no glyph to paint or subset.
+    ///
+    /// CSS text characters, including Unicode space separators, must use a
+    /// paintable glyph (or the selected font's `.notdef` glyph) instead.
     AdvanceOnly,
 }
 
@@ -904,7 +966,8 @@ mod tests {
 
     use super::{
         OpaqueTextGlyphCoverage, RenderedGlyph, RenderedGlyphKind, RenderedLine,
-        RenderedTextMatrix, RenderedTextPaintSegment, RenderedTextRun,
+        RenderedLineSource, RenderedTextMatrix, RenderedTextPaintSegment, RenderedTextRun,
+        rendered_lines_can_merge_as_exact_paint_continuation,
         split_rendered_line_for_opaque_text_coverage,
     };
     use crate::document::paint::geometry::PaintPoint;
@@ -981,6 +1044,48 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(line.origin(), PaintPoint::new(5.0, 6.0));
+    }
+
+    #[test]
+    fn exact_paint_continuation_requires_shared_visual_text_boundary() {
+        let source_run = Rc::new(());
+        let left = test_rendered_line().with_source_run(Rc::clone(&source_run));
+        let mut right = test_rendered_line();
+        right.source_run = Some(source_run);
+        right.origin = PaintPoint::new(17.0, 20.0);
+        right.text = "…".to_string();
+        right.runs[0].text = Rc::from("…");
+
+        assert!(rendered_lines_can_merge_as_exact_paint_continuation(
+            &left, &right
+        ));
+
+        right.origin = PaintPoint::new(17.01, 20.0);
+        assert!(!rendered_lines_can_merge_as_exact_paint_continuation(
+            &left, &right
+        ));
+
+        right.origin = PaintPoint::new(17.0, 20.01);
+        assert!(!rendered_lines_can_merge_as_exact_paint_continuation(
+            &left, &right
+        ));
+
+        right.origin = PaintPoint::new(17.0, 20.0);
+        right.color = CssColor::TRANSPARENT;
+        assert!(!rendered_lines_can_merge_as_exact_paint_continuation(
+            &left, &right
+        ));
+
+        right.color = CssColor::BLACK;
+        right.source_run = Some(Rc::new(()));
+        assert!(!rendered_lines_can_merge_as_exact_paint_continuation(
+            &left, &right
+        ));
+
+        right.source = RenderedLineSource::BlockEllipsis;
+        assert!(rendered_lines_can_merge_as_exact_paint_continuation(
+            &left, &right
+        ));
     }
 
     fn opaque_coverage_path() -> RenderedPath {

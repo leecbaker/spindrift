@@ -59,7 +59,7 @@ impl Drop for LayoutProfileDocument {
         let stats = document.stats;
         log::info!(
             target: "quire::layout_profile",
-            "document_us={} inline_line_measure_index_scans={} inline_line_measure_index_candidates={} inline_line_measure_index_builds={} inline_line_measure_index_build_us={} inline_line_measure_exact_remeasurements={} inline_line_measure_exact_remeasurement_bytes={} inline_line_measure_exact_remeasurement_us={} block_height_estimates={} block_height_estimate_us={} inline_intrinsic_measurements={} inline_intrinsic_measurement_us={} inline_opportunity_graph_builds={} inline_opportunity_graph_build_us={} float_intrinsic_width_calls={} float_intrinsic_width_us={} float_auto_height_cache_hits={} float_auto_height_cache_misses={} float_auto_height_measurements={} float_auto_height_measurement_us={} grid_layout_final_calls={} grid_layout_intrinsic_calls={} grid_layout_orthogonal_calls={} grid_layout_us={} grid_track_sizing_final_passes={} grid_track_sizing_intrinsic_passes={} grid_track_sizing_items={} grid_track_sizing_us={} grid_baseline_plan_calls={} grid_baseline_plan_items={} grid_baseline_plan_us={} grid_feedback_initial_sweeps={} grid_feedback_container_sweeps={} grid_feedback_column_sweeps={} grid_feedback_items={} grid_feedback_us={} grid_feedback_inline_corrections={} grid_feedback_block_corrections={} grid_item_replays={} grid_item_replay_us={}",
+            "document_us={} inline_line_measure_index_scans={} inline_line_measure_index_candidates={} inline_line_measure_index_builds={} inline_line_measure_index_build_us={} inline_line_measure_exact_remeasurements={} inline_line_measure_exact_remeasurement_bytes={} inline_line_measure_exact_remeasurement_us={} block_height_estimates={} block_height_estimate_us={} inline_intrinsic_measurements={} inline_intrinsic_measurement_us={} inline_opportunity_graph_builds={} inline_opportunity_graph_build_us={} float_intrinsic_width_calls={} float_intrinsic_width_us={} float_auto_height_cache_hits={} float_auto_height_cache_misses={} float_auto_height_measurements={} float_auto_height_measurement_us={} grid_float_block_size_measurements={} grid_float_block_size_measurement_us={} grid_layout_final_calls={} grid_layout_intrinsic_calls={} grid_layout_orthogonal_calls={} grid_layout_us={} grid_track_sizing_final_passes={} grid_track_sizing_intrinsic_passes={} grid_track_sizing_items={} grid_track_sizing_us={} grid_baseline_plan_calls={} grid_baseline_plan_items={} grid_baseline_plan_us={} grid_feedback_initial_sweeps={} grid_feedback_container_sweeps={} grid_feedback_column_sweeps={} grid_feedback_items={} grid_feedback_us={} grid_feedback_inline_corrections={} grid_feedback_block_corrections={} grid_item_replays={} grid_item_replay_us={}",
             document.started.elapsed().as_micros(),
             stats.inline_line_measure_index_scans,
             stats.inline_line_measure_index_candidates,
@@ -80,6 +80,8 @@ impl Drop for LayoutProfileDocument {
             stats.float_auto_height_cache_misses,
             stats.float_auto_height_measurement.calls,
             micros(stats.float_auto_height_measurement.elapsed),
+            stats.grid_float_block_size_measurement.calls,
+            micros(stats.grid_float_block_size_measurement.elapsed),
             stats.grid_layout_final.calls,
             stats.grid_layout_intrinsic.calls,
             stats.grid_layout_orthogonal_calls,
@@ -151,6 +153,13 @@ pub(in crate::layout) fn record_float_auto_height_cache_miss() {
 #[must_use = "the profile guard must cover the measured phase"]
 pub(in crate::layout) fn float_auto_height_measurement_scope() -> LayoutProfileScope {
     LayoutProfileScope::new(LayoutProfilePhase::FloatAutoHeightMeasurement, 0, None)
+}
+
+/// Measure Grid track sizing used exclusively to establish an auto-height
+/// float's block size. This deliberately excludes final Grid item replay.
+#[must_use = "the profile guard must cover the measured phase"]
+pub(in crate::layout) fn grid_float_block_size_measurement_scope() -> LayoutProfileScope {
+    LayoutProfileScope::new(LayoutProfilePhase::GridFloatBlockSizeMeasurement, 0, None)
 }
 
 #[must_use = "the profile guard must cover the measured phase"]
@@ -256,6 +265,7 @@ enum LayoutProfilePhase {
     InlineOpportunityGraphBuild,
     FloatIntrinsicWidth,
     FloatAutoHeightMeasurement,
+    GridFloatBlockSizeMeasurement,
     GridLayout(GridProfilePurpose),
     GridTrackSizing(GridProfilePurpose),
     GridBaselinePlan,
@@ -294,6 +304,7 @@ struct LayoutProfileStats {
     float_auto_height_cache_hits: u64,
     float_auto_height_cache_misses: u64,
     float_auto_height_measurement: TimedCount,
+    grid_float_block_size_measurement: TimedCount,
     grid_layout_final: TimedCount,
     grid_layout_intrinsic: TimedCount,
     grid_layout_orthogonal_calls: u64,
@@ -325,6 +336,9 @@ impl LayoutProfileStats {
             LayoutProfilePhase::FloatIntrinsicWidth => self.float_intrinsic_width.add(elapsed),
             LayoutProfilePhase::FloatAutoHeightMeasurement => {
                 self.float_auto_height_measurement.add(elapsed);
+            }
+            LayoutProfilePhase::GridFloatBlockSizeMeasurement => {
+                self.grid_float_block_size_measurement.add(elapsed);
             }
             LayoutProfilePhase::GridLayout(GridProfilePurpose::Final) => {
                 self.grid_layout_final.add(elapsed);
@@ -415,6 +429,10 @@ mod tests {
                 },
                 float_auto_height_cache_hits: stats.float_auto_height_cache_hits,
                 float_auto_height_cache_misses: stats.float_auto_height_cache_misses,
+                grid_float_block_size_measurement: TimedCount {
+                    calls: stats.grid_float_block_size_measurement.calls,
+                    ..TimedCount::default()
+                },
                 grid_layout_final: TimedCount {
                     calls: stats.grid_layout_final.calls,
                     ..TimedCount::default()
@@ -461,6 +479,7 @@ mod tests {
         drop(float_intrinsic_width_scope());
         record_float_auto_height_cache_hit();
         record_float_auto_height_cache_miss();
+        drop(grid_float_block_size_measurement_scope());
         let final_grid = grid_layout_scope(GridProfilePurpose::Final, 3, true);
         drop(grid_track_sizing_scope(3));
         drop(final_grid);
@@ -482,6 +501,7 @@ mod tests {
         assert_eq!(stats.float_intrinsic_width.calls, 1);
         assert_eq!(stats.float_auto_height_cache_hits, 1);
         assert_eq!(stats.float_auto_height_cache_misses, 1);
+        assert_eq!(stats.grid_float_block_size_measurement.calls, 1);
         assert_eq!(stats.grid_layout_final.calls, 1);
         assert_eq!(stats.grid_layout_intrinsic.calls, 1);
         assert_eq!(stats.grid_track_sizing_final.calls, 1);

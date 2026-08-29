@@ -42,6 +42,10 @@ behavior where the specs leave implementation details ambiguous.
   active floats through the shared float collision model. Table wrappers,
   flex/grid roots, replaced boxes, and orthogonal flows still need broader
   parity coverage.
+- A normal-flow inline line rechecks its complete used slab after
+  materialization. An atomic inline following a source-order float marker is
+  therefore retried at the first later float slab that can contain it, without
+  manufacturing an empty source line or treating the atom as float source.
 - In-flow block fragments produced by block-in-inline splitting query active
   float exclusions in their relatively positioned inline ancestor's visual
   coordinate space. Their parent normal-flow cursor and interposed float's

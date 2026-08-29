@@ -143,10 +143,8 @@ impl<'a> LayoutBuilder<'a> {
         );
         let _ = freeze_float_replay_height(
             &mut placed_style,
-            self.definite_block_size_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(PercentageBasis::indefinite),
+            self.block_percentage_context_stack
+                .current_percentage_basis(),
             child_element.document_compatibility_mode == dom::DocumentCompatibilityMode::Quirks,
         );
 
@@ -849,7 +847,198 @@ fn resolve_float_area(
             },
             shape_margin,
         ),
+        css::BasicShape::Path(path) => FloatArea::new(
+            FloatContour::Path {
+                subpaths: flatten_shape_path_data(&path.data, reference),
+                fill_rule: path.fill_rule,
+            },
+            shape_margin,
+        ),
+        css::BasicShape::Shape(shape) => FloatArea::new(
+            FloatContour::Path {
+                subpaths: flatten_shape_function(shape, reference),
+                fill_rule: shape.fill_rule,
+            },
+            shape_margin,
+        ),
     }
+}
+
+/// The maximum page-space distance between the retained CSS curve and its
+/// polyline wrap contour. This is substantially below a CSS pixel while
+/// avoiding a per-line analytical-curve intersection implementation.
+const SHAPE_PATH_FLATTEN_TOLERANCE: f64 = 0.01;
+
+fn flatten_shape_path_data(data: &str, reference: PageTopRect) -> Vec<Vec<PageTopPoint>> {
+    let Ok(path) = kurbo::BezPath::from_svg(data) else {
+        // The cascade validated this, but invalid input must remain an empty
+        // contour rather than accidentally reverting to a rectangle.
+        return Vec::new();
+    };
+    flatten_shape_bez_path(path, reference, css::CSS_PX_TO_PT as f64)
+}
+
+fn flatten_shape_function(
+    shape: &css::ShapeFunction,
+    reference: PageTopRect,
+) -> Vec<Vec<PageTopPoint>> {
+    let mut path = kurbo::BezPath::new();
+    let resolve_point = |point: &css::ShapePosition| {
+        kurbo::Point::new(
+            resolve_shape_length(&point.x, reference.width()) as f64,
+            resolve_shape_length(&point.y, reference.height()) as f64,
+        )
+    };
+    let mut current = resolve_point(&shape.origin);
+    let mut subpath_start = current;
+    let mut previous_control = None;
+    path.move_to(current);
+    for command in &shape.commands {
+        let absolute = |direction: css::ShapeCommandDirection, point: kurbo::Point| match direction
+        {
+            css::ShapeCommandDirection::To => point,
+            css::ShapeCommandDirection::By => current + (point - kurbo::Point::ORIGIN),
+        };
+        match command {
+            css::ShapeCommand::Move { direction, point } => {
+                current = absolute(*direction, resolve_point(point));
+                subpath_start = current;
+                previous_control = None;
+                path.move_to(current);
+            }
+            css::ShapeCommand::Line { direction, point } => {
+                current = absolute(*direction, resolve_point(point));
+                previous_control = None;
+                path.line_to(current);
+            }
+            css::ShapeCommand::HorizontalLine { direction, value } => {
+                let value = resolve_shape_length(value, reference.width()) as f64;
+                current.x = match direction {
+                    css::ShapeCommandDirection::To => value,
+                    css::ShapeCommandDirection::By => current.x + value,
+                };
+                previous_control = None;
+                path.line_to(current);
+            }
+            css::ShapeCommand::VerticalLine { direction, value } => {
+                let value = resolve_shape_length(value, reference.height()) as f64;
+                current.y = match direction {
+                    css::ShapeCommandDirection::To => value,
+                    css::ShapeCommandDirection::By => current.y + value,
+                };
+                previous_control = None;
+                path.line_to(current);
+            }
+            css::ShapeCommand::Curve {
+                direction,
+                point,
+                control_start,
+                control_end,
+            } => {
+                let control_start = absolute(*direction, resolve_point(control_start));
+                let control_end = absolute(*direction, resolve_point(control_end));
+                current = absolute(*direction, resolve_point(point));
+                previous_control = Some(control_end);
+                path.curve_to(control_start, control_end, current);
+            }
+            css::ShapeCommand::Smooth {
+                direction,
+                point,
+                control_end,
+            } => {
+                let control_start = previous_control
+                    .map(|control| current + (current - control))
+                    .unwrap_or(current);
+                let control_end = absolute(*direction, resolve_point(control_end));
+                current = absolute(*direction, resolve_point(point));
+                previous_control = Some(control_end);
+                path.curve_to(control_start, control_end, current);
+            }
+            css::ShapeCommand::Arc {
+                direction,
+                point,
+                radius_x,
+                radius_y,
+                rotation_radians,
+                large,
+                clockwise,
+            } => {
+                let target = absolute(*direction, resolve_point(point));
+                let radius_x = resolve_shape_length(radius_x, reference.width()).max(0.0);
+                let radius_y = resolve_shape_length(radius_y, reference.height()).max(0.0);
+                if radius_x <= 0.0 || radius_y <= 0.0 || target == current {
+                    path.line_to(target);
+                } else {
+                    // Reuse the SVG arc conversion that kurbo already uses
+                    // for `path()`, avoiding a second subtly different arc
+                    // implementation. The path lives in CSS physical space
+                    // until the shared flatten-and-page transform below.
+                    let svg = format!(
+                        "M {} {} A {} {} {} {} {} {} {}",
+                        current.x,
+                        current.y,
+                        radius_x,
+                        radius_y,
+                        rotation_radians.to_degrees(),
+                        u8::from(*large),
+                        u8::from(*clockwise),
+                        target.x,
+                        target.y,
+                    );
+                    if let Ok(arc) = kurbo::BezPath::from_svg(&svg) {
+                        path.extend(arc.iter().skip(1));
+                    } else {
+                        path.line_to(target);
+                    }
+                }
+                current = target;
+                previous_control = None;
+            }
+            css::ShapeCommand::Close => {
+                path.close_path();
+                current = subpath_start;
+                previous_control = None;
+            }
+        }
+    }
+    flatten_shape_bez_path(path, reference, 1.0)
+}
+
+fn flatten_shape_bez_path(
+    path: kurbo::BezPath,
+    reference: PageTopRect,
+    coordinate_scale: f64,
+) -> Vec<Vec<PageTopPoint>> {
+    let mut subpaths = Vec::new();
+    let mut current = Vec::new();
+    kurbo::flatten(
+        path.iter(),
+        SHAPE_PATH_FLATTEN_TOLERANCE,
+        |element| match element {
+            kurbo::PathEl::MoveTo(point) => {
+                if !current.is_empty() {
+                    subpaths.push(std::mem::take(&mut current));
+                }
+                current.push(PageTopPoint::new(
+                    reference.x() + (point.x * coordinate_scale) as f32,
+                    reference.top_y() - (point.y * coordinate_scale) as f32,
+                ));
+            }
+            kurbo::PathEl::LineTo(point) => current.push(PageTopPoint::new(
+                reference.x() + (point.x * coordinate_scale) as f32,
+                reference.top_y() - (point.y * coordinate_scale) as f32,
+            )),
+            kurbo::PathEl::ClosePath => {}
+            kurbo::PathEl::QuadTo(_, _) | kurbo::PathEl::CurveTo(_, _, _) => {
+                unreachable!("kurbo::flatten emits lines")
+            }
+        },
+    );
+    if !current.is_empty() {
+        subpaths.push(current);
+    }
+    subpaths.retain(|subpath| subpath.len() >= 3);
+    subpaths
 }
 
 fn resolve_image_float_area(
@@ -1013,17 +1202,25 @@ fn reference_box_contour(
 fn rounded_rect(rect: PageTopRect, radii: css::BorderRadius) -> UsedRoundedRect {
     let width = rect.width();
     let height = rect.height();
-    let resolve_x = |radius: &css::CssRadius| resolve_shape_length(&radius.value, width);
-    let resolve_y = |radius: &css::CssRadius| resolve_shape_length(&radius.value, height);
-    let top_left = (resolve_x(&radii.top_left.x), resolve_y(&radii.top_left.y));
-    let top_right = (resolve_x(&radii.top_right.x), resolve_y(&radii.top_right.y));
+    let resolve_x =
+        |radius: &css::CornerRadiusComponent| resolve_shape_length(&radius.value, width);
+    let resolve_y =
+        |radius: &css::CornerRadiusComponent| resolve_shape_length(&radius.value, height);
+    let top_left = (
+        resolve_x(&radii.top_left.horizontal),
+        resolve_y(&radii.top_left.vertical),
+    );
+    let top_right = (
+        resolve_x(&radii.top_right.horizontal),
+        resolve_y(&radii.top_right.vertical),
+    );
     let bottom_right = (
-        resolve_x(&radii.bottom_right.x),
-        resolve_y(&radii.bottom_right.y),
+        resolve_x(&radii.bottom_right.horizontal),
+        resolve_y(&radii.bottom_right.vertical),
     );
     let bottom_left = (
-        resolve_x(&radii.bottom_left.x),
-        resolve_y(&radii.bottom_left.y),
+        resolve_x(&radii.bottom_left.horizontal),
+        resolve_y(&radii.bottom_left.vertical),
     );
     normalized_rounded_rect(
         rect,

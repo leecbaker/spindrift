@@ -1,6 +1,109 @@
 use std::rc::Rc;
 
 use super::*;
+use crate::image_store::ImageId;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct DecodedPngImage {
+    pub(in crate::layout) image_id: Option<ImageId>,
+    /// Source samples used for image paint and PDF resource emission.
+    pub(in crate::layout) pixel_size: RasterPixelSize,
+    /// Optional source crop in the image's original pixel grid. The cached
+    /// resource stays whole; PDF emission applies this crop at draw time.
+    pub(in crate::layout) source_rect: Option<RenderedImageSourceRect>,
+    /// Preferred natural dimensions used by CSS sizing algorithms.
+    pub(in crate::layout) natural_size: crate::units::CssPixelSize,
+    /// The depth shared by the RGB and optional alpha sample planes.
+    pub(in crate::layout) sample_depth: crate::image_store::RasterSampleDepth,
+    /// Byte-encoded raster samples, never CSS coordinates. Generated CSS
+    /// images construct this only after their explicit output-space encoding.
+    pub(in crate::layout) rgb: EncodedRasterRgbSamples,
+    pub(in crate::layout) alpha: Option<Rc<[u8]>>,
+    pub(in crate::layout) color_space: crate::color::RasterColorSpace,
+}
+
+/// Encoded RGB samples paired with `DecodedPngImage::color_space`.
+///
+/// The wrapper prevents image payloads from being confused with CSS component
+/// triples, which may be wide-gamut, unbounded, or D50 PCS coordinates.
+
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct EncodedRasterRgbSamples(Rc<[u8]>);
+
+impl EncodedRasterRgbSamples {
+    pub(in crate::layout) fn new(samples: Vec<u8>) -> Self {
+        Self(Rc::from(samples.into_boxed_slice()))
+    }
+
+    pub(in crate::layout) fn from_shared(samples: Rc<[u8]>) -> Self {
+        Self(samples)
+    }
+
+    pub(in crate::layout) fn shared(&self) -> Rc<[u8]> {
+        Rc::clone(&self.0)
+    }
+}
+
+impl AsRef<[u8]> for EncodedRasterRgbSamples {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for EncodedRasterRgbSamples {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl PartialEq<Vec<u8>> for EncodedRasterRgbSamples {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
+impl DecodedPngImage {
+    pub(in crate::layout) fn new(
+        pixel_width: u32,
+        pixel_height: u32,
+        rgb: Vec<u8>,
+        alpha: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            image_id: None,
+            pixel_size: RasterPixelSize::new(pixel_width, pixel_height),
+            source_rect: None,
+            natural_size: crate::units::CssPixelSize::new(pixel_width, pixel_height),
+            sample_depth: crate::image_store::RasterSampleDepth::Eight,
+            rgb: EncodedRasterRgbSamples::new(rgb),
+            alpha: alpha.map(|alpha| Rc::from(alpha.into_boxed_slice())),
+            color_space: crate::color::RasterColorSpace::SRGB,
+        }
+    }
+
+    pub(in crate::layout) fn in_color_space(
+        mut self,
+        color_space: crate::css::CssColorSpace,
+    ) -> Self {
+        self.color_space = crate::color::RasterColorSpace::BuiltIn(color_space);
+        self
+    }
+
+    pub(in crate::layout) fn natural_layout_size(&self) -> crate::units::LayoutSize {
+        crate::units::css_pixel_natural_layout_size(self.natural_size)
+    }
+
+    pub(in crate::layout) fn with_source_rect(
+        mut self,
+        source_rect: RenderedImageSourceRect,
+    ) -> Self {
+        self.natural_size = crate::units::CssPixelSize::new(source_rect.width, source_rect.height);
+        self.source_rect = Some(source_rect);
+        self
+    }
+}
 use crate::LayoutSize;
 use crate::document::paint::patterns::RenderedImageSourceRect;
 use crate::image_store::RasterOrientationPolicy;

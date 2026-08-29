@@ -1,9 +1,15 @@
+//! Table layout implementation façade.
+
 use super::*;
 
-mod split_1;
-pub(in crate::layout) use self::split_1::*;
-mod split_2;
-pub(in crate::layout::table) use self::split_2::*;
-mod split_3;
-mod split_4;
-pub(in crate::layout::table) use self::split_4::*;
+mod cells;
+mod fragmentation;
+mod grid;
+mod paint;
+mod wrapper;
+
+pub(in crate::layout) use self::cells::*;
+pub(in crate::layout::table) use self::fragmentation::*;
+pub(in crate::layout::table) use self::paint::*;
+pub(in crate::layout::table) use self::wrapper::*;
+pub(in crate::layout::table) use super::CollapsedTableGeometry;

@@ -104,7 +104,7 @@ pub(in crate::layout) fn outline_primitives_for_border_rect(
         bottom: style.outline_width,
         left: style.outline_width,
     };
-    outline_style.border_width_values = css::CssEdges::all(
+    outline_style.border_width_values = css::PhysicalEdges::all(
         css::ComputedLengthPercentage::from_points(style.outline_width),
     );
     outline_style.border_color = style.outline_color;
@@ -743,6 +743,9 @@ impl<'a> LayoutBuilder<'a> {
             PaintPrimitive::Stroke(stroke) => self.push_stroke_in_band(band, stroke),
             PaintPrimitive::Image(image) => self.push_image_in_band(band, image),
             PaintPrimitive::ImagePattern(pattern) => self.push_image_pattern_in_band(band, pattern),
+            PaintPrimitive::ProjectiveRaster(_) => {
+                unreachable!("projective raster lowering happens in the PDF backend")
+            }
             PaintPrimitive::GradientPattern(pattern) => {
                 self.current_page
                     .push_gradient_pattern_in_band(band, pattern);
@@ -755,9 +758,12 @@ impl<'a> LayoutBuilder<'a> {
                 self.current_page
                     .push_opaque_text_coverage_in_band(band, line, paths);
             }
-            PaintPrimitive::SvgTextOutline { paths, actual_text } => {
+            PaintPrimitive::SvgTextOutline {
+                content,
+                actual_text,
+            } => {
                 self.current_page
-                    .push_svg_text_outline_in_band(band, paths, actual_text);
+                    .push_svg_text_outline_scope_in_band(band, *content, actual_text);
             }
         }
     }

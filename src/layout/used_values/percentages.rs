@@ -5,7 +5,7 @@ use super::*;
 /// percentage heights through ordinary CSS Sizing rules or through
 /// context-specific relayout. More specialized layout modes can use their own
 /// source enum when the exact reason affects correctness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) enum BlockSizeBasisSource {
     /// The page area's initial containing block, used only to resolve the
     /// document root's own percentage block size.
@@ -24,6 +24,131 @@ pub(in crate::layout) enum BlockSizeBasisSource {
 pub(in crate::layout) type BlockSizePercentageBasis =
     PercentageBasis<ContentBoxLength, BlockSizeBasisSource>;
 
+/// Why a formatting-context root supplies its descendant block-axis
+/// percentage basis.
+///
+/// A content-sized block has an indefinite percentage basis, but that alone
+/// is not enough information for intrinsic sizing. CSS Sizing requires a
+/// cyclic percentage in a non-replaced preferred or maximum block-size to be
+/// treated as the property's initial value for its intrinsic contribution.
+/// Keeping that reason at the formatting-context boundary prevents a replayed
+/// used height from accidentally becoming a new definite basis.
+/// <https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) enum DescendantBlockPercentageContext {
+    Definite {
+        value: ContentBoxLength,
+        source: BlockSizeBasisSource,
+    },
+    Indefinite,
+    ContentSized,
+}
+
+impl DescendantBlockPercentageContext {
+    pub(in crate::layout) fn definite(
+        value: ContentBoxLength,
+        source: BlockSizeBasisSource,
+    ) -> Self {
+        Self::Definite { value, source }
+    }
+
+    pub(in crate::layout) fn from_percentage_basis(basis: BlockSizePercentageBasis) -> Self {
+        match basis {
+            PercentageBasis::Definite { value, source } => Self::Definite { value, source },
+            PercentageBasis::Indefinite => Self::Indefinite,
+        }
+    }
+
+    /// Classify a formatting context from its already-resolved used content
+    /// height.  An absent height is a content-sized, not merely unknown,
+    /// percentage boundary.
+    pub(in crate::layout) fn formatting_context(
+        used_content_height: Option<ContentBoxLength>,
+        source: BlockSizeBasisSource,
+    ) -> Self {
+        used_content_height.map_or(Self::ContentSized, |value| Self::definite(value, source))
+    }
+
+    /// Returns the ordinary definiteness-only view for properties whose
+    /// cyclic fallback is unchanged.
+    pub(in crate::layout) fn percentage_basis(self) -> BlockSizePercentageBasis {
+        match self {
+            Self::Definite { value, source } => PercentageBasis::definite_from(value, source),
+            Self::Indefinite | Self::ContentSized => PercentageBasis::indefinite(),
+        }
+    }
+
+    pub(in crate::layout) fn is_definite(self) -> bool {
+        matches!(self, Self::Definite { .. })
+    }
+
+    pub(in crate::layout) fn is_content_sized(self) -> bool {
+        matches!(self, Self::ContentSized)
+    }
+}
+
+/// The block-axis percentage context active at nested formatting-context
+/// boundaries.
+///
+/// This is intentionally the sole stored stack.  Callers that only need the
+/// ordinary CSS percentage basis must derive it through
+/// [`Self::current_percentage_basis`], so a cyclic `ContentSized` boundary
+/// cannot diverge from a parallel definiteness-only stack.
+/// <https://drafts.csswg.org/css-sizing-3/#percentage-sizing>
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(in crate::layout) struct BlockPercentageContextStack {
+    entries: Vec<DescendantBlockPercentageContext>,
+}
+
+impl BlockPercentageContextStack {
+    pub(in crate::layout) fn current_context(&self) -> DescendantBlockPercentageContext {
+        self.entries
+            .last()
+            .copied()
+            .unwrap_or(DescendantBlockPercentageContext::Indefinite)
+    }
+
+    pub(in crate::layout) fn current_percentage_basis(&self) -> BlockSizePercentageBasis {
+        self.current_context().percentage_basis()
+    }
+
+    /// Returns the containing context's ordinary basis while an inner
+    /// formatting-context scope is active.
+    pub(in crate::layout) fn parent_percentage_basis(&self) -> BlockSizePercentageBasis {
+        self.entries
+            .iter()
+            .rev()
+            .nth(1)
+            .copied()
+            .unwrap_or(DescendantBlockPercentageContext::Indefinite)
+            .percentage_basis()
+    }
+
+    pub(in crate::layout) fn push_context(&mut self, context: DescendantBlockPercentageContext) {
+        self.entries.push(context);
+    }
+
+    /// Push a legacy definiteness-only boundary as a semantic context.
+    ///
+    /// New formatting-context boundaries should use [`Self::push_context`]
+    /// directly so they can retain `ContentSized` when appropriate.
+    pub(in crate::layout) fn push_percentage_basis(&mut self, basis: BlockSizePercentageBasis) {
+        self.push_context(DescendantBlockPercentageContext::from_percentage_basis(
+            basis,
+        ));
+    }
+
+    pub(in crate::layout) fn pop(&mut self) -> DescendantBlockPercentageContext {
+        self.entries
+            .pop()
+            .expect("block percentage context stack is balanced")
+    }
+
+    pub(in crate::layout) fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 pub(in crate::layout) fn percentage_basis_from_points(
     value: Option<f32>,
 ) -> PercentageBasis<ContentBoxLength> {
@@ -41,6 +166,7 @@ pub(in crate::layout) fn block_size_percentage_basis_from_points(
         .map(|value| PercentageBasis::definite_from(content_box_pt(value), source))
         .unwrap_or_else(PercentageBasis::indefinite)
 }
+
 /// Resolves a computed `<length-percentage>` against a used percentage basis.
 ///
 /// CSS Values and Units Level 4 defines computed `<length-percentage>` values
@@ -233,6 +359,40 @@ mod tests {
                 non_content_pt(0.0),
             ),
             None,
+        );
+    }
+
+    #[test]
+    fn block_percentage_context_stack_derives_ordinary_basis_without_losing_reason() {
+        let mut stack = BlockPercentageContextStack::default();
+        assert_eq!(
+            stack.current_context(),
+            DescendantBlockPercentageContext::Indefinite
+        );
+        assert!(!stack.current_percentage_basis().is_definite());
+
+        let definite = DescendantBlockPercentageContext::definite(
+            content_box_pt(144.0),
+            BlockSizeBasisSource::InitialContainingBlock,
+        );
+        stack.push_context(definite);
+        assert_eq!(stack.current_context(), definite);
+        assert_eq!(stack.current_percentage_basis().points(), Some(144.0));
+
+        stack.push_context(DescendantBlockPercentageContext::ContentSized);
+        assert_eq!(
+            stack.current_context(),
+            DescendantBlockPercentageContext::ContentSized
+        );
+        assert!(!stack.current_percentage_basis().is_definite());
+
+        let snapshot = stack.clone();
+        assert_eq!(snapshot, stack);
+        assert_eq!(stack.pop(), DescendantBlockPercentageContext::ContentSized);
+        assert_eq!(stack.current_context(), definite);
+        assert_eq!(
+            snapshot.current_context(),
+            DescendantBlockPercentageContext::ContentSized
         );
     }
 }

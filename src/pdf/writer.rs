@@ -126,8 +126,7 @@ pub(crate) fn write_document<W: Write>(
     let color_requirements = final_color_requirements_from_lowering(
         &lowering_color_policy,
         &lowered_program.pages,
-        &image_plan,
-        &document.image_store,
+        &prepared_images,
     );
     let color_plan = PdfColorPlan::new(profile, planner.peek_id(), color_requirements)?;
     planner.reserve_ids(color_plan.object_count());
@@ -348,6 +347,27 @@ pub(crate) fn write_document<W: Write>(
                 color_spaces: color_plan.resource_handles().into_iter().collect(),
             };
             bindings.record_uses(&mut page_render.stream);
+            let uses_indirect_color_space = !page_render.gradient_patterns.is_empty()
+                || !page_render.gradient_tiling_patterns.is_empty()
+                || !page_render.svg_tiling_patterns.is_empty()
+                || !page_render.svg_path_tiling_patterns.is_empty()
+                || !image_plan.page_image_unique_indexes[page_index].is_empty()
+                || !image_plan.page_svg_pattern_image_unique_indexes[page_index].is_empty()
+                || !image_plan.page_pattern_tile_unique_indexes[page_index].is_empty();
+            if uses_indirect_color_space {
+                // Page-owned patterns and image XObjects can select a calibrated
+                // output profile through an indirect `/ColorSpace` value without
+                // emitting a named `cs` operator in the page content stream.
+                // Keep the final page colour-space plan in the page resources so
+                // those nested paint programs and ordinary direct paint share
+                // the same declared ICCBased identity.
+                // ISO 32000-2:2020, 8.6.3 and 8.6.5.5.
+                page_render
+                    .stream
+                    .resource_uses
+                    .color_spaces
+                    .extend(bindings.color_spaces.clone());
+            }
             for form in &mut page_render.form_xobjects {
                 bindings.record_uses(&mut form.stream);
             }
@@ -664,12 +684,35 @@ fn serialize_program(
 fn final_color_requirements_from_lowering(
     lowering_policy: &PdfLoweringColorPolicy,
     page_renders: &[PageContentRender],
-    image_plan: &ImageResourcePlan,
-    image_store: &crate::image_store::DocumentImageStore,
+    prepared_images: &[PreparedImageResource],
 ) -> PdfColorRequirements {
-    let used_raster_images = final_raster_image_indexes(page_renders, image_plan);
-    let (built_in_image_spaces, embedded_image_profiles) =
-        image_plan.color_sources_for_indexes(&used_raster_images, image_store);
+    // `write_images` serializes every prepared raster resource. Plan precisely
+    // those retained profiles here, rather than trying to infer reachability
+    // from PDF tokens after projective lowering has rewritten the display
+    // tree. This makes an image's color-space dependency explicit at the same
+    // boundary that decides it remains an image XObject.
+    let mut built_in_image_spaces = Vec::new();
+    let mut embedded_image_profiles = Vec::new();
+    for image in prepared_images {
+        let PreparedImageResource::Raster(image) = image else {
+            continue;
+        };
+        match &image.color_space {
+            crate::color::RasterColorSpace::BuiltIn(space)
+                if !built_in_image_spaces.contains(space) =>
+            {
+                built_in_image_spaces.push(*space);
+            }
+            crate::color::RasterColorSpace::EmbeddedRgb(profile)
+                if !embedded_image_profiles
+                    .iter()
+                    .any(|existing: &std::rc::Rc<[u8]>| existing.as_ref() == profile.as_ref()) =>
+            {
+                embedded_image_profiles.push(Rc::clone(profile));
+            }
+            _ => {}
+        }
+    }
     let mut requirements = PdfColorRequirements::from_paint_and_image_sources(
         std::iter::empty(),
         built_in_image_spaces,
@@ -735,51 +778,6 @@ fn final_color_requirements_from_lowering(
         }
     }
     requirements
-}
-
-/// Discover raster XObjects selected by the final page and Form streams.
-///
-/// Image source collection happens before lowering so that content painting
-/// has stable `/ImN` and `/PN` names.  This pass deliberately goes the other
-/// direction: it retains a raster source's ICC profile only if a final `Do`
-/// or image-pattern selection can reach the serialized program.  Direct
-/// solid-image fills are covered instead by their emitted colour-space
-/// operators in `final_color_requirements_from_lowering`.
-fn final_raster_image_indexes(
-    page_renders: &[PageContentRender],
-    image_plan: &ImageResourcePlan,
-) -> Vec<PlannedImageIndex> {
-    let mut indexes = Vec::new();
-    for (page_index, page_render) in page_renders.iter().enumerate() {
-        let streams = std::iter::once(&page_render.stream)
-            .chain(page_render.form_xobjects.iter().map(|form| &form.stream));
-        for stream in streams {
-            for (image_index, planned) in image_plan.page_image_unique_indexes[page_index]
-                .iter()
-                .enumerate()
-            {
-                let name = format!("Im{}", image_index + 1);
-                if stream_uses_named_operator(&stream.bytes, &name, b"Do")
-                    && !indexes.contains(planned)
-                {
-                    indexes.push(*planned);
-                }
-            }
-            for (pattern_index, planned) in image_plan.page_pattern_tile_unique_indexes[page_index]
-                .iter()
-                .enumerate()
-            {
-                let name = format!("P{}", pattern_index + 1);
-                if (stream_uses_named_operator(&stream.bytes, &name, b"scn")
-                    || stream_uses_named_operator(&stream.bytes, &name, b"SCN"))
-                    && !indexes.contains(planned)
-                {
-                    indexes.push(*planned);
-                }
-            }
-        }
-    }
-    indexes
 }
 
 #[derive(Debug, Default)]

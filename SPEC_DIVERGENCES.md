@@ -213,6 +213,7 @@ Primary references:
   rendering; XML namespace parsing remains limited by the current `xml5ever`
   integration.
   <https://www.w3.org/TR/xml-names/#defaulting>
+  <https://github.com/servo/html5ever/issues/775>
 
 ### HTML Embedded Browsing Contexts
 
@@ -331,6 +332,18 @@ Primary references:
   implemented in the static PDF renderer.
   <https://www.w3.org/TR/css-scroll-snap-1/>
 
+### CSS Overflow Level 5 scroll markers
+
+- Quire parses and materializes the static automatic-marker foundation, but it
+  does not yet implement immutable explicit-link topology, flat-tree target
+  ordering, the CSS Overflow 5 geometry-based active-marker algorithm, or its
+  bounded state-dependent re-layout convergence. `:target-current` presently
+  reflects only the document fragment target; `:target-before` and
+  `:target-after` do not yet resolve. Automatic marker boxes also lack their
+  required same-document PDF link annotations, and root/
+  `display: contents` external-group placement remains incomplete.
+  <https://drafts.csswg.org/css-overflow-5/#scroll-markers>
+
 ### CSS Float Layout
 
 - Spec area: CSS 2.2 floats and float-adjacent formatting contexts.
@@ -367,8 +380,8 @@ Primary references:
   WPTs. `shape-image-threshold`, decoded bitmap alpha sources,
   and generated linear gradients now use page-local raster contours; their
   `shape-margin` is clipped to the float margin box. SVG alpha sources,
-  several gradient directions in vertical writing, `path()`, CSS Shapes 2
-  `shape()`, and initial-letter boxes remain unsupported. Rounded shape-box
+  several gradient directions in vertical writing, and initial-letter boxes
+  remain unsupported. Rounded shape-box
   contours and basic-shape contours are queried for line wrapping, but
   remaining BFC-root avoidance paths need broader conformance coverage.
   <https://drafts.csswg.org/css-shapes-1/#shape-outside-property>
@@ -379,11 +392,6 @@ Primary references:
   vertical band query, but the remaining physical/logical placement and retry
   projection must be unified with horizontal-writing behavior.
   <https://drafts.csswg.org/css-shapes-1/#relation-to-box-model-and-float-behavior>
-- Divergence: CSS Shapes Level 2 `shape()` values are not represented for
-  float-area geometry. The existing unrelated CSS Borders `border-shape`
-  subset cannot supply CSS Shapes semantics, including fill rules, curves,
-  arcs, percentage resolution, or line-intersection queries.
-  <https://drafts.csswg.org/css-shapes-2/#shape-function>
 
 ### CSS Writing Modes
 
@@ -560,8 +568,9 @@ Primary references:
   content alignment, and covered numeric/named implicit lines on either side
   of the explicit grid can use definite cycled `grid-auto-*` tracks, including
   after-explicit row and column lines outside the grid container with
-  line-edge offsets and covered horizontal static-rectangle end edges that do
-  not include the following implicit gutter.
+  line-edge offsets. Covered horizontal static-rectangle end edges use the
+  final occupied track edge rather than the following line start, and therefore
+  exclude following explicit, repeated, or implicit gutters in LTR and RTL.
   Named explicit lines inside finite numbered repeats are covered on both
   axes, and named fixed-size `auto-fill` and collapsed `auto-fit` repeated
   lines, including multi-track repeated fragments and before-/after-explicit
@@ -929,12 +938,6 @@ Primary references:
   N'Ko, and Mongolian boundary-shaping WPT cluster is covered by the shared
   authored shaping stream.
   <https://drafts.csswg.org/css-text-3/#boundary-shaping>
-- Divergence: an authored Arabic U+0640 TATWEEL that crosses a font-selection
-  transition does not yet preserve all contextual joining forms. Tatweel is
-  retained as visible, advancing source text; Quire does not synthesize it as
-  boundary context.
-  <https://drafts.csswg.org/css-text-3/#boundary-shaping>
-
 ### Tables
 
 - Spec area: CSS Tables, CSS 2.2 table layout, HTML table semantics, CSS
@@ -1292,50 +1295,12 @@ Primary references:
   scaling) and `non-scaling-stroke-006.html` (non-uniform scaling through
   `preserveAspectRatio="none"`) pending upstream `usvg` support.
   <https://www.w3.org/TR/SVG2/painting.html#VectorEffects>
-  `repeat`/`reflect` spread methods, pattern tiles with nested paint servers,
-  SVG text beyond the supported normalized visible `<text>`/`<tspan>` subset:
-  shared-font shaping, affine transforms, relative `dx`/`dy`, `text-anchor`,
-  `textLength`, normalized absolute `x`/`y` chunks, horizontal BASE-table baseline selection/inherited
-  `baseline-shift`, native solid PDF text, gradient/stroked/rotated/text-path
-  glyph-outline fallback with tagged `ActualText`, and `text-shadow` replay
-  from the same glyph outlines (including bounded premultiplied-alpha raster
-  blur without a duplicate text layer) are implemented. Remaining
-  character-list edge cases, complete SVG vertical writing/baselines (the
-  retained `vertical-rl`, `vertical-lr`, `sideways-rl`, and `sideways-lr`
-  modes already use Quire's vertical glyph-orientation/PDF-matrix path and
-  relative `dx`/`dy` lists remain in SVG user axes, but mixed-run anchors,
-  mixed-run `textLength`, and baseline semantics remain incomplete; upright
-  vertical `textLength`, both `lengthAdjust` modes, and `text-anchor` use the
-  shared typed vertical inline axis; upright vertical decorations also follow
-  that axis), complete text-path behavior, mixed-orientation/path-text
-  decoration geometry,
-  patterns, exact SVG/CSS blur kernel matching and grouped effects (the
-  retained scene currently supports only a single `feGaussianBlur`,
-  `feDropShadow`, `feOffset`, `feColorMatrix`, or `feComponentTransfer` of `SourceGraphic`,
-  a bounded `feMorphology` of `SourceGraphic`, or a strictly linear
-  `feGaussianBlur`/`feDropShadow`/`feOffset`/`feColorMatrix`/`feComponentTransfer`/
-  `feMorphology`/`feConvolveMatrix` chain whose named inputs consume the previous result, all
-  with an explicit `userSpaceOnUse` region, plus the exact `feFlood`/`feComposite`
-  `operator="in"`/`SourceAlpha` coloring pattern and canonical
-  blur/offset/flood/composite/merge drop-shadow graph), SVG text processing
-  that changes parser chunk construction (`text-transform`, `white-space`,
-  `tab-size`, and line-breaking/line-height behavior), masks beyond
-  the bounded flat-solid-path alpha/luminance `userSpaceOnUse` subset (including
-  nested/object-bounding-box masks, images, gradients, and patterns),
-  filters (including masks and object-bounding-box filters on retained text),
-  and exact SVG `text-shadow` raster matching (the text is visible and uses
-  the shared shaped outlines, but `svg/painting/reftests/text-shadow-03.html`
-  still differs from its reference in Ahem baseline/outline geometry and blur
-  samples),
-  external string-URL SVG `<image>` resources in secure-static mode,
-  SVG fonts, `<object>`, and `<embed>` remain unsupported;
-  affected SVG subtrees are omitted rather than approximated. Inline SVG
-  `<use>` supports statically preloaded same-origin HTML, XML, and SVG
-  documents with fragment targets and nested external `<use>` chains. Its
-  external-document CSS scope, cross-origin requests, and external `<image>`
-  descendants remain unsupported. The shared-font SVG text design and its
-  implemented native-PDF subset are documented in
-  [`doc/svg_text_architecture.md`](doc/svg_text_architecture.md).
+  SVG text is laid out and flattened by upstream `usvg` using native system fonts.
+  Its visual result is emitted as paths with one PDF `/ActualText` wrapper, not
+  Quire-selected native PDF text. Consequently SVG and HTML text can choose
+  different fallback fonts; SVG `@font-face`, host-CSS SVG `text-shadow`, and
+  exact font/feature parity with surrounding HTML are unsupported. Wasm has no
+  system-font database and omits SVG text.
 - Divergence: non-root inline SVG descendants cascade valid SVG `transform`
   presentation attributes at author origin/specificity zero with CSS
   `transform`, including invalid-CSS fallback, explicit `none`, SVG unitless

@@ -36,7 +36,7 @@ pub(crate) fn apply_border(value: &str, style: &mut ComputedStyle, side: Option<
         let used_width = used_nonnegative_length(width.clone()).points();
         style.border_width = used_width;
         style.border_widths = edge_all(used_width);
-        style.border_width_values = CssEdges::all(width);
+        style.border_width_values = PhysicalEdges::all(width);
         style.border_styles = border_styles_all(border_style);
         style.border_color = color;
         style.border_colors = border_colors_all(color);
@@ -95,26 +95,26 @@ pub(crate) fn parse_computed_border_width(
 pub(crate) fn parse_border_width_edges(
     value: &str,
     font_size: f32,
-) -> Option<CssEdges<ComputedLengthPercentage>> {
+) -> Option<PhysicalEdges<ComputedLengthPercentage>> {
     let values = split_css_component_values(value)
         .into_iter()
         .map(|part| parse_computed_border_width(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
-        [all] => Some(CssEdges::all(all.clone())),
-        [vertical, horizontal] => Some(CssEdges {
+        [all] => Some(PhysicalEdges::all(all.clone())),
+        [vertical, horizontal] => Some(PhysicalEdges {
             top: vertical.clone(),
             right: horizontal.clone(),
             bottom: vertical.clone(),
             left: horizontal.clone(),
         }),
-        [top, horizontal, bottom] => Some(CssEdges {
+        [top, horizontal, bottom] => Some(PhysicalEdges {
             top: top.clone(),
             right: horizontal.clone(),
             bottom: bottom.clone(),
             left: horizontal.clone(),
         }),
-        [top, right, bottom, left] => Some(CssEdges {
+        [top, right, bottom, left] => Some(PhysicalEdges {
             top: top.clone(),
             right: right.clone(),
             bottom: bottom.clone(),

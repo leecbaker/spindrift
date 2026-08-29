@@ -131,6 +131,33 @@ pub(in crate::layout) fn used_content_box_height_or_auto_with_basis<Source>(
     )
 }
 
+/// Resolves a non-replaced preferred block size at a descendant
+/// formatting-context boundary.
+///
+/// During intrinsic measurement of a content-sized containing block, a cyclic
+/// percentage preferred size is its initial value (`auto`), rather than the
+/// fixed length component of the expression. This differs from the ordinary
+/// indefinite-basis fallback used by margins, padding, and minimum sizes.
+/// <https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution>
+pub(in crate::layout) fn used_non_replaced_content_box_height_or_auto(
+    style: &ComputedStyle,
+    context: DescendantBlockPercentageContext,
+    vertical_non_content: NonContentLength,
+) -> Option<ContentBoxLength> {
+    let value = style.box_values.height.value().clone();
+    if context.is_content_sized()
+        && matches!(&value, css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.needs_percentage_basis())
+    {
+        return None;
+    }
+    used_content_box_size_with_basis(
+        value,
+        style.box_sizing,
+        context.percentage_basis(),
+        vertical_non_content,
+    )
+}
+
 /// The box whose dimensions participate in preferred aspect-ratio sizing.
 ///
 /// A bare `<ratio>` uses the box selected by `box-sizing`, while the ratio in
@@ -665,6 +692,53 @@ where
 {
     used_length_percentage_or_auto(style.box_values.max_height.clone(), percentage_basis)
         .map(|value| content_box_pt(value.points().max(0.0)))
+}
+
+/// Resolves a non-replaced maximum block-size at a descendant
+/// formatting-context boundary.
+///
+/// A cyclic percentage maximum is `none` for an intrinsic contribution. Do
+/// not route this through `used_max_height`: its generic indefinite-basis
+/// behavior intentionally retains a fixed `calc()` component for properties
+/// whose cyclic rule is different.
+/// <https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution>
+pub(in crate::layout) fn used_non_replaced_max_height(
+    style: &ComputedStyle,
+    context: DescendantBlockPercentageContext,
+) -> Option<ContentBoxLength> {
+    let value = style.box_values.max_height.clone();
+    if context.is_content_sized()
+        && matches!(&value, css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.needs_percentage_basis())
+    {
+        return None;
+    }
+    used_max_height(style, context.percentage_basis())
+}
+
+/// Applies ordinary non-replaced block-size constraints at a descendant
+/// formatting-context boundary.
+///
+/// This is the non-intrinsic counterpart of
+/// [`constrain_non_replaced_height_with_intrinsic`].
+/// <https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution>
+pub(in crate::layout) fn constrain_non_replaced_content_height(
+    style: &ComputedStyle,
+    value: ContentBoxLength,
+    context: DescendantBlockPercentageContext,
+) -> ContentBoxLength {
+    let mut cyclic_style;
+    let style = if context.is_content_sized()
+        && matches!(
+            &style.box_values.max_height,
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.needs_percentage_basis()
+        ) {
+        cyclic_style = style.clone();
+        cyclic_style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
+        &cyclic_style
+    } else {
+        style
+    };
+    constrain_content_height(style, value, context.percentage_basis())
 }
 
 /// Applies non-intrinsic used min/max width constraints to a content width.
@@ -1328,6 +1402,44 @@ pub(in crate::layout) fn constrain_height_with_intrinsic<Source>(
     )
 }
 
+/// Applies intrinsic block-size constraints for a non-replaced box whose
+/// containing-block context is retained separately from its numeric basis.
+///
+/// This is the constraint counterpart of
+/// [`used_non_replaced_content_box_height_or_auto`]. A content-sized context
+/// substitutes `none` for a cyclic percentage `max-height`, while retaining
+/// the existing zero/length-component rule for `min-height`.
+/// <https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution>
+pub(in crate::layout) fn constrain_non_replaced_height_with_intrinsic(
+    style: &ComputedStyle,
+    value: ContentBoxLength,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
+    context: DescendantBlockPercentageContext,
+    vertical_non_content: NonContentLength,
+) -> ContentBoxLength {
+    let mut cyclic_style;
+    let style = if context.is_content_sized()
+        && matches!(
+            &style.box_values.max_height,
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.needs_percentage_basis()
+        ) {
+        cyclic_style = style.clone();
+        cyclic_style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
+        &cyclic_style
+    } else {
+        style
+    };
+    constrain_height_with_intrinsic(
+        style,
+        value,
+        min_content,
+        max_content,
+        context.percentage_basis(),
+        vertical_non_content,
+    )
+}
+
 pub(in crate::layout) fn intrinsic_height_constraint(
     value: css::ComputedLengthPercentageOrAuto,
     box_sizing: BoxSizing,
@@ -1545,6 +1657,65 @@ mod tests {
             .expect("a fixed calc component remains a used min-height");
 
         assert_eq!(used.points(), 18.75);
+    }
+
+    #[test]
+    fn content_sized_context_uses_initial_preferred_and_maximum_values() {
+        let mut style = ComputedStyle::initial();
+        let cyclic_calc = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_affine(layout_pt(10.0), 0.5, true),
+        );
+        style
+            .box_values
+            .height
+            .replace_with_used(cyclic_calc.clone());
+        style.box_values.max_height = percent(1.0);
+        style.box_values.min_height = cyclic_calc;
+
+        let content_sized = DescendantBlockPercentageContext::ContentSized;
+        assert!(
+            used_non_replaced_content_box_height_or_auto(
+                &style,
+                content_sized,
+                non_content_pt(0.0),
+            )
+            .is_none()
+        );
+        assert!(used_non_replaced_max_height(&style, content_sized).is_none());
+        assert_eq!(
+            used_min_height(&style, content_sized.percentage_basis())
+                .expect("cyclic minimum retains its length component")
+                .points(),
+            10.0,
+        );
+    }
+
+    #[test]
+    fn definite_context_resolves_preferred_and_maximum_percentages() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.height.replace_with_used(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_affine(layout_pt(10.0), 0.5, true),
+            ),
+        );
+        style.box_values.max_height = percent(1.0);
+        let context = DescendantBlockPercentageContext::definite(
+            content_box_pt(200.0),
+            BlockSizeBasisSource::ContainingBlock,
+        );
+
+        assert_eq!(
+            used_non_replaced_content_box_height_or_auto(&style, context, non_content_pt(0.0))
+                .expect("a definite basis resolves the preferred size")
+                .points(),
+            110.0,
+        );
+        assert_eq!(
+            used_non_replaced_max_height(&style, context)
+                .expect("a definite basis resolves the maximum")
+                .points(),
+            200.0,
+        );
     }
     #[test]
     fn typed_constraint_entry_points_preserve_content_box_lengths() {

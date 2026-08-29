@@ -610,6 +610,8 @@ pub(in crate::css) fn affected_longhand_names(
         "scroll-snap-type" => &["scroll-snap-type"],
         "scroll-snap-align" => &["scroll-snap-align"],
         "scroll-snap-stop" => &["scroll-snap-stop"],
+        "scroll-target-group" => &["scroll-target-group"],
+        "scroll-marker-group" => &["scroll-marker-group"],
         "scroll-padding" => &[
             "scroll-padding-top",
             "scroll-padding-right",

@@ -879,31 +879,31 @@ fn parse_page_margin_edge(value: &str, font_size: f32) -> Option<PageMarginEdge>
 fn parse_page_padding_shorthand(
     value: &str,
     font_size: f32,
-) -> Option<super::types::CssEdges<ComputedLengthPercentage>> {
+) -> Option<super::types::PhysicalEdges<ComputedLengthPercentage>> {
     let values = value
         .split_whitespace()
         .filter_map(|part| parse_computed_length_percentage(part, font_size))
         .collect::<Vec<_>>();
     match values.as_slice() {
-        [all] => Some(super::types::CssEdges {
+        [all] => Some(super::types::PhysicalEdges {
             top: all.clone(),
             right: all.clone(),
             bottom: all.clone(),
             left: all.clone(),
         }),
-        [vertical, horizontal] => Some(super::types::CssEdges {
+        [vertical, horizontal] => Some(super::types::PhysicalEdges {
             top: vertical.clone(),
             right: horizontal.clone(),
             bottom: vertical.clone(),
             left: horizontal.clone(),
         }),
-        [top, horizontal, bottom] => Some(super::types::CssEdges {
+        [top, horizontal, bottom] => Some(super::types::PhysicalEdges {
             top: top.clone(),
             right: horizontal.clone(),
             bottom: bottom.clone(),
             left: horizontal.clone(),
         }),
-        [top, right, bottom, left] => Some(super::types::CssEdges {
+        [top, right, bottom, left] => Some(super::types::PhysicalEdges {
             top: top.clone(),
             right: right.clone(),
             bottom: bottom.clone(),
@@ -973,7 +973,7 @@ fn set_page_margin_edge(margins: &mut PageMarginEdges, side: PhysicalSide, edge:
 }
 
 fn set_page_padding_edge(
-    padding: &mut super::types::CssEdges<ComputedLengthPercentage>,
+    padding: &mut super::types::PhysicalEdges<ComputedLengthPercentage>,
     side: PhysicalSide,
     edge: ComputedLengthPercentage,
 ) {

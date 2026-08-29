@@ -1,6 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
 use super::*;
+use crate::layout::taffy_bridge;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GridItemEstimate {
@@ -12,6 +13,159 @@ pub(super) struct GridItemEstimate {
     /// from their Grid intrinsic contribution. A `minmax(auto, 0)` track can
     /// suppress the latter without changing the former.
     pub(super) replaced_used_size: Option<ReplacedGridItemUsedSize>,
+}
+
+/// Whether one Grid item's logical min-content contributions can change over
+/// Grid's bounded cross-axis feedback sequence.
+///
+/// This belongs beside the intrinsic measurement that proves it, rather than
+/// on [`GridItemEstimate`]: the estimate is a value, while this records the
+/// inputs on which that value may depend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GridItemFeedbackSensitivity {
+    pub(super) inline_contribution_may_depend_on_area: bool,
+    pub(super) block_contribution_may_depend_on_area: bool,
+}
+
+impl GridItemFeedbackSensitivity {
+    const fn may_depend() -> Self {
+        Self {
+            inline_contribution_may_depend_on_area: true,
+            block_contribution_may_depend_on_area: true,
+        }
+    }
+
+    const fn invariant() -> Self {
+        Self {
+            inline_contribution_may_depend_on_area: false,
+            block_contribution_may_depend_on_area: false,
+        }
+    }
+}
+
+/// The value and proof produced by an internal Grid intrinsic measurement.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GridItemIntrinsicMeasurement {
+    pub(super) estimate: GridItemEstimate,
+    pub(super) sensitivity: GridItemFeedbackSensitivity,
+}
+
+impl GridItemIntrinsicMeasurement {
+    fn may_depend(estimate: GridItemEstimate) -> Self {
+        Self {
+            estimate,
+            sensitivity: GridItemFeedbackSensitivity::may_depend(),
+        }
+    }
+
+    fn invariant(estimate: GridItemEstimate) -> Self {
+        Self {
+            estimate,
+            sensitivity: GridItemFeedbackSensitivity::invariant(),
+        }
+    }
+
+    fn from_inline_measurement(
+        estimate: GridItemEstimate,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        measurement: &inline_layout::InlineIntrinsicMeasurement,
+        request: GridItemMeasurementRequest,
+    ) -> Self {
+        let request_is_independent = !request.has_inherited_axis();
+        let style_is_independent = grid_item_style_is_basis_invariant(style);
+        let tree_is_independent = grid_item_tree_is_basis_invariant_inline_text(children);
+        let inline_extent_is_independent = !measurement
+            .sensitivity()
+            .block_extent_depends_on_available_inline_size;
+        let direct_inline_text = request_is_independent
+            && style_is_independent
+            && tree_is_independent
+            && inline_extent_is_independent;
+        if direct_inline_text {
+            Self::invariant(estimate)
+        } else {
+            Self::may_depend(estimate)
+        }
+    }
+}
+
+/// Return whether this used style is independent of either Grid-area
+/// percentage basis in a direct inline-text intrinsic probe.
+///
+/// This is intentionally narrower than general block layout. Any sizing
+/// feature which is not plainly a fixed direct-text input leaves the Grid
+/// feedback probes enabled.
+fn grid_item_style_is_basis_invariant(style: &ComputedStyle) -> bool {
+    grid_item_style_has_basis_invariant_box_metrics(style)
+        && !style.content.is_generated()
+        && style.before_style.is_none()
+        && style.after_style.is_none()
+}
+
+/// HTML `br` creates its mandatory break through a generated inline pseudo.
+/// The opportunity graph carries that break explicitly, so it is safe to use
+/// the same proof while excluding only the pseudo presence itself.
+fn grid_item_forced_break_style_is_basis_invariant(style: &ComputedStyle) -> bool {
+    grid_item_style_has_basis_invariant_box_metrics(style)
+}
+
+fn grid_item_style_has_basis_invariant_box_metrics(style: &ComputedStyle) -> bool {
+    matches!(
+        style.display.inner,
+        DisplayInner::Flow | DisplayInner::FlowRoot
+    ) && !style.display.list_item
+        && matches!(style.position, Position::Static)
+        && style.float == Float::None
+        && !style.contain.layout
+        && !style.contain.paint
+        && !style.contain.size
+        && style
+            .aspect_ratio
+            .preferred_ratio_for_non_replaced(false)
+            .is_none()
+        && !grid_item_box_size_depends_on_basis(&style.box_values.width)
+        && !grid_item_box_size_depends_on_basis(style.box_values.height.value())
+        && !grid_item_box_size_depends_on_basis(&style.box_values.min_width)
+        && !grid_item_box_size_depends_on_basis(&style.box_values.max_width)
+        && !grid_item_box_size_depends_on_basis(&style.box_values.min_height)
+        && !grid_item_box_size_depends_on_basis(&style.box_values.max_height)
+}
+
+fn grid_item_box_size_depends_on_basis(value: &css::ComputedLengthPercentageOrAuto) -> bool {
+    match value {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => value.contains_percentage(),
+        css::ComputedLengthPercentageOrAuto::FitContent(Some(value)) => value.contains_percentage(),
+        css::ComputedLengthPercentageOrAuto::CalcSize(_) => true,
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::MinContent
+        | css::ComputedLengthPercentageOrAuto::MaxContent
+        | css::ComputedLengthPercentageOrAuto::FitContent(None)
+        | css::ComputedLengthPercentageOrAuto::Stretch => false,
+    }
+}
+
+/// Prove that every source box remains an ordinary inline text participant.
+/// Atomic, replaced, block, and layout-root descendants all have their own
+/// containing-block-sensitive sizing paths and therefore retain Grid feedback.
+fn grid_item_tree_is_basis_invariant_inline_text(children: &[box_tree::FormattingBox<'_>]) -> bool {
+    children.iter().all(|child| match child {
+        box_tree::FormattingBox::Text(text) => grid_item_style_is_basis_invariant(&text.style),
+        box_tree::FormattingBox::Inline(inline) => {
+            (if inline.core.element.tag == "br" {
+                grid_item_forced_break_style_is_basis_invariant(&inline.core.style)
+            } else {
+                grid_item_style_is_basis_invariant(&inline.core.style)
+            }) && grid_item_tree_is_basis_invariant_inline_text(&inline.core.children)
+        }
+        // Blockification wraps an inline-level Grid item in an anonymous
+        // block container. It has no independent sizing behavior, so retain
+        // the proof when its children remain direct inline text.
+        box_tree::FormattingBox::AnonymousBlock(block) => {
+            grid_item_tree_is_basis_invariant_inline_text(&block.children)
+        }
+        _ => false,
+    })
 }
 
 /// What a caller needs from a grid item's intrinsic measurement.
@@ -528,7 +682,27 @@ impl<'a> LayoutBuilder<'a> {
         available_width_basis: GridPercentageBasis,
         available_height_basis: GridPercentageBasis,
     ) -> GridItemEstimate {
-        let mut estimate = self.estimate_grid_item_size_with_request(
+        self.measure_grid_item_size(
+            child,
+            stylesheets,
+            available_width,
+            available_width_basis,
+            available_height_basis,
+        )
+        .estimate
+    }
+
+    /// Measure one complete Grid item estimate together with the conservative
+    /// proof used to plan Grid's optional feedback probes.
+    pub(super) fn measure_grid_item_size(
+        &mut self,
+        child: &GridChild<'_>,
+        stylesheets: &Stylesheets<'_>,
+        available_width: f32,
+        available_width_basis: GridPercentageBasis,
+        available_height_basis: GridPercentageBasis,
+    ) -> GridItemIntrinsicMeasurement {
+        let mut measurement = self.estimate_grid_item_size_with_request(
             child,
             stylesheets,
             available_width,
@@ -543,9 +717,9 @@ impl<'a> LayoutBuilder<'a> {
             // Layout containment suppresses baseline export; grid alignment
             // synthesizes the fallback from the item's border box.
             // <https://www.w3.org/TR/css-contain-1/#containment-layout>
-            estimate.metrics.clear_block_baselines();
+            measurement.estimate.metrics.clear_block_baselines();
         }
-        estimate
+        measurement
     }
 
     pub(super) fn estimate_grid_item_size_for_parent_track_sizing(
@@ -564,6 +738,7 @@ impl<'a> LayoutBuilder<'a> {
             available_height_basis,
             GridItemMeasurementRequest::parent_track_sizing(&child.style),
         )
+        .estimate
     }
 
     fn estimate_grid_item_size_with_request(
@@ -574,7 +749,7 @@ impl<'a> LayoutBuilder<'a> {
         available_width_basis: GridPercentageBasis,
         available_height_basis: GridPercentageBasis,
         request: GridItemMeasurementRequest,
-    ) -> GridItemEstimate {
+    ) -> GridItemIntrinsicMeasurement {
         let layout_style = grid_item_layout_style(&child.style);
         let style = &layout_style;
         let available_height = available_height_basis.points();
@@ -620,11 +795,17 @@ impl<'a> LayoutBuilder<'a> {
                 ),
                 measurement.line_count(),
             );
-            return estimate;
+            return GridItemIntrinsicMeasurement::from_inline_measurement(
+                estimate,
+                style,
+                children,
+                &measurement,
+                request,
+            );
         }
 
         let Some((element, signature, child_boxes)) = child.element_parts() else {
-            return GridItemEstimate::fixed(0.0, 0.0);
+            return GridItemIntrinsicMeasurement::invariant(GridItemEstimate::fixed(0.0, 0.0));
         };
 
         self.with_ancestor_signature(signature.clone(), |layout| {
@@ -668,7 +849,7 @@ impl<'a> LayoutBuilder<'a> {
                     width: PhysicalContentWidth::new(content_box_pt(content_size.width)),
                     height: PhysicalContentHeight::new(content_box_pt(content_size.height)),
                 });
-                return estimate;
+                return GridItemIntrinsicMeasurement::may_depend(estimate);
             }
 
             if style.display.inner == DisplayInner::Grid
@@ -827,7 +1008,7 @@ impl<'a> LayoutBuilder<'a> {
                 if fast_subgrid_measurement {
                     request.apply_to_estimate(&mut estimate);
                 }
-                return estimate;
+                return GridItemIntrinsicMeasurement::may_depend(estimate);
             }
 
             // During Grid's row-to-column feedback pass the item's grid area
@@ -836,12 +1017,12 @@ impl<'a> LayoutBuilder<'a> {
             // inline contribution: a descendant `height: 100%` can transfer
             // through its aspect ratio into that contribution.
             // <https://drafts.csswg.org/css-grid-2/#algo-track-sizing>
-            layout
-                .definite_block_size_stack
-                .push(block_size_percentage_basis_from_points(
+            layout.block_percentage_context_stack.push_percentage_basis(
+                block_size_percentage_basis_from_points(
                     block_basis.points(),
                     BlockSizeBasisSource::GridItem,
-                ));
+                ),
+            );
             let inline_measurement = layout.intrinsic_inline_measurement_for_element(
                 element,
                 style,
@@ -851,6 +1032,7 @@ impl<'a> LayoutBuilder<'a> {
             );
             let mut min_content = inline_measurement.contribution.min_content.points();
             let mut max_content = inline_measurement.contribution.max_content.points();
+            let mut used_block_intrinsic_fallback = false;
             if min_content == 0.0 && max_content == 0.0 {
                 let (block_min, block_max) = layout.block_intrinsic_content_widths(
                     element,
@@ -861,6 +1043,7 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 min_content = block_min;
                 max_content = block_max;
+                used_block_intrinsic_fallback = true;
             }
             let content_height = layout
                 .estimate_element_height(element, style, stylesheets, available_width, child_boxes)
@@ -909,7 +1092,7 @@ impl<'a> LayoutBuilder<'a> {
                 content_height
             };
 
-            layout.definite_block_size_stack.pop();
+            layout.block_percentage_context_stack.pop();
 
             let mut estimate = grid_item_estimate_from_intrinsic(
                 style,
@@ -931,7 +1114,17 @@ impl<'a> LayoutBuilder<'a> {
                 ),
                 inline_measurement.line_count(),
             );
-            estimate
+            if used_block_intrinsic_fallback {
+                GridItemIntrinsicMeasurement::may_depend(estimate)
+            } else {
+                GridItemIntrinsicMeasurement::from_inline_measurement(
+                    estimate,
+                    style,
+                    child_boxes.unwrap_or_default(),
+                    &inline_measurement,
+                    request,
+                )
+            }
         })
     }
 }
@@ -2714,6 +2907,23 @@ pub(super) fn measure_grid_item(
             ),
         },
     )
+}
+
+/// Adapt Quire's Grid intrinsic estimate to Taffy 0.14's leaf callback.
+/// Taffy consumes only horizontal first/last baselines, so an estimate whose
+/// axes were projected for vertical writing remains under Quire's baseline
+/// reconciliation instead.
+pub(super) fn taffy_grid_measurement(
+    input: taffy::tree::LayoutInput,
+    estimate: Option<&mut GridItemEstimate>,
+) -> taffy::tree::LayoutOutput {
+    let baselines = estimate
+        .as_deref()
+        .filter(|estimate| !estimate.swaps_physical_axes)
+        .map(|estimate| (estimate.first_baseline, estimate.last_baseline))
+        .unwrap_or((None, None));
+    let size = measure_grid_item(input.known_dimensions, input.available_space, estimate);
+    taffy_bridge::measured_leaf_output(size, baselines.0, baselines.1)
 }
 
 fn grid_item_measured_size(

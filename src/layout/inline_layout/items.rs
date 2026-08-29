@@ -447,7 +447,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut line_index = 0usize;
         let mut next_paragraph_starts_after_forced_break = false;
         let mut page_scopes = Vec::new();
-        let mut plaintext_direction_state = None;
+        let mut preceding_plaintext_line_direction = None;
         for (item_index, item) in items.iter().cloned().enumerate() {
             // This direct layout path also splits the shared source stream at
             // preserved breaks. Carry source that follows the boundary into
@@ -475,7 +475,7 @@ impl<'a> LayoutBuilder<'a> {
                         line_index,
                         force_empty_line,
                         next_paragraph_starts_after_forced_break,
-                        &mut plaintext_direction_state,
+                        &mut preceding_plaintext_line_direction,
                     );
                     line_index = paragraph_outcome.next_line_index;
                     outcome.include(paragraph_outcome);
@@ -493,9 +493,6 @@ impl<'a> LayoutBuilder<'a> {
                         // <https://drafts.csswg.org/css2/#float-position>
                         self.adjoining_float_origin_y = None;
                     }
-                    if context.block_style.unicode_bidi == UnicodeBidi::Plaintext {
-                        plaintext_direction_state = None;
-                    }
                     next_paragraph_starts_after_forced_break = true;
                 }
                 InlineBoundaryRole::PageScopeStart => {
@@ -510,7 +507,7 @@ impl<'a> LayoutBuilder<'a> {
                         line_index,
                         false,
                         next_paragraph_starts_after_forced_break,
-                        &mut plaintext_direction_state,
+                        &mut preceding_plaintext_line_direction,
                     );
                     line_index = paragraph_outcome.next_line_index;
                     outcome.include(paragraph_outcome);
@@ -528,7 +525,7 @@ impl<'a> LayoutBuilder<'a> {
                         line_index,
                         false,
                         next_paragraph_starts_after_forced_break,
-                        &mut plaintext_direction_state,
+                        &mut preceding_plaintext_line_direction,
                     );
                     line_index = paragraph_outcome.next_line_index;
                     outcome.include(paragraph_outcome);
@@ -551,7 +548,7 @@ impl<'a> LayoutBuilder<'a> {
             line_index,
             false,
             next_paragraph_starts_after_forced_break,
-            &mut plaintext_direction_state,
+            &mut preceding_plaintext_line_direction,
         );
         outcome.include(paragraph_outcome);
         while let Some(scope) = page_scopes.pop() {
@@ -1034,24 +1031,21 @@ impl<'a> LayoutBuilder<'a> {
                 // formatting context. A percentage height on this context's
                 // own inline contents resolves against the containing
                 // context immediately below it.
-                self.definite_block_size_stack
-                    .iter()
-                    .rev()
-                    .nth(1)
-                    .copied()
-                    .and_then(|basis| {
-                        let upper = used_length_percentage_or_auto(
-                            style.box_values.height.value().clone(),
-                            basis,
-                        )
-                        .map(SemanticLengthExt::points);
-                        let max_height =
-                            used_max_height(style, basis).map(SemanticLengthExt::points);
-                        let upper = upper.into_iter().chain(max_height).reduce(f32::min)?;
-                        let min_height =
-                            used_min_height(style, basis).map(SemanticLengthExt::points);
-                        Some(min_height.map_or(upper, |min| upper.max(min)))
-                    })
+                Some(
+                    self.block_percentage_context_stack
+                        .parent_percentage_basis(),
+                )
+                .and_then(|basis| {
+                    let upper = used_length_percentage_or_auto(
+                        style.box_values.height.value().clone(),
+                        basis,
+                    )
+                    .map(SemanticLengthExt::points);
+                    let max_height = used_max_height(style, basis).map(SemanticLengthExt::points);
+                    let upper = upper.into_iter().chain(max_height).reduce(f32::min)?;
+                    let min_height = used_min_height(style, basis).map(SemanticLengthExt::points);
+                    Some(min_height.map_or(upper, |min| upper.max(min)))
+                })
             })?;
         self.select_automatic_inline_clamp_with_constraint(
             sequence,
@@ -1261,7 +1255,7 @@ impl<'a> LayoutBuilder<'a> {
         recover_css_bidi_scope_continuations_across_forced_breaks(&mut records);
         let (records, fragment_text_box_trim) =
             self.with_text_box_line_trim_applied(records, context.block_style);
-        InlineLineSequence {
+        let mut sequence = InlineLineSequence {
             records,
             available_width: context.available_width,
             padding_left: context.padding_left,
@@ -1271,7 +1265,10 @@ impl<'a> LayoutBuilder<'a> {
             has_flow_side_effects: cursor.has_flow_side_effects,
             replay_float_scope: ReplayFloatScope::InheritContainingBlock,
             has_local_continuation_cutoff: false,
-        }
+        };
+        let mut preceding_line_direction = None;
+        sequence.resolve_bidi_base_directions(context.block_style, &mut preceding_line_direction);
+        sequence
     }
 
     pub(in crate::layout) fn current_text_box_line_trim(&self) -> TextBoxLineTrim {
@@ -1538,44 +1535,24 @@ impl<'a> LayoutBuilder<'a> {
         sequence: &InlineLineSequence,
         block_style: &ComputedStyle,
     ) {
-        let mut plaintext_direction_state = None;
-        self.paint_inline_line_sequence_with_state(
-            sequence,
-            block_style,
-            &mut plaintext_direction_state,
-        );
-    }
-
-    pub(in crate::layout) fn paint_inline_line_sequence_with_state(
-        &mut self,
-        sequence: &InlineLineSequence,
-        block_style: &ComputedStyle,
-        plaintext_direction_state: &mut Option<Direction>,
-    ) {
         // A captured line sequence is a replay artifact, not an instruction
         // to inherit whichever float stack happens to be active later.  Keep
         // the scope boundary around the whole slice so fragmentation retries,
         // ruby levels, and atomic formatting contexts share the same rule.
         self.with_replay_float_scope(sequence.replay_float_scope, |layout| {
-            layout.paint_inline_line_sequence_with_state_in_scope(
-                sequence,
-                block_style,
-                plaintext_direction_state,
-            );
+            layout.paint_inline_line_sequence_in_scope(sequence, block_style);
         });
     }
 
-    fn paint_inline_line_sequence_with_state_in_scope(
+    fn paint_inline_line_sequence_in_scope(
         &mut self,
         sequence: &InlineLineSequence,
         block_style: &ComputedStyle,
-        plaintext_direction_state: &mut Option<Direction>,
     ) {
         self.record_inline_line_sequence_outcome(sequence);
         let saved_content_left = self.content_left;
         let saved_content_right = self.content_right;
         let mut painted = 0usize;
-        let mut plaintext_paragraph_index = None;
         while painted < sequence.records.len() {
             let mut oversized_line_left_final_page_space = false;
             // A speculative multicolumn balance pass must reject a candidate
@@ -1654,12 +1631,6 @@ impl<'a> LayoutBuilder<'a> {
             );
             let fragment_records = sequence.fragment_records_for_paint(painted, fragment_count);
             for line in &fragment_records {
-                if block_style.unicode_bidi == UnicodeBidi::Plaintext
-                    && plaintext_paragraph_index != Some(line.paragraph_index)
-                {
-                    *plaintext_direction_state = None;
-                    plaintext_paragraph_index = Some(line.paragraph_index);
-                }
                 stack.advance(line.block_before);
                 stack.apply(self);
                 self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
@@ -1682,12 +1653,7 @@ impl<'a> LayoutBuilder<'a> {
                     // <https://www.w3.org/TR/css-break-3/#monolithic>
                     let snapshot = self.snapshot();
                     let checkpoint = self.current_page.paint_checkpoint();
-                    self.paint_collected_inline_line(
-                        line,
-                        context,
-                        plaintext_direction_state,
-                        None,
-                    );
+                    self.paint_collected_inline_line(line, context, None);
                     let fragment = self.current_page.take_paint_fragment_since(checkpoint);
                     for (page_index, fragment) in
                         super::super::block::continuous_fragmentainer_paint_slices(
@@ -1722,12 +1688,7 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     stack = self.apply_collected_line_clearance(stack, line.clear_after, context);
                 } else {
-                    self.paint_collected_inline_line(
-                        line,
-                        context,
-                        plaintext_direction_state,
-                        None,
-                    );
+                    self.paint_collected_inline_line(line, context, None);
                     // A non-phantom inline line owns normal-flow space in the
                     // current fragmentainer even when its paint is deferred
                     // (for example while fixed descendants are replayed).
@@ -1797,7 +1758,6 @@ impl<'a> LayoutBuilder<'a> {
         self.record_inline_line_sequence_outcome(&sequence);
         let saved_content_left = self.content_left;
         let saved_content_right = self.content_right;
-        let mut plaintext_direction_state = None;
         let context = sequence.context(block_style);
         let mut rule_paint_point = self
             .current_page
@@ -1826,12 +1786,7 @@ impl<'a> LayoutBuilder<'a> {
                     stack.advance(line.block_before);
                     stack.apply(self);
                     self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
-                    self.paint_collected_inline_line(
-                        line,
-                        context,
-                        &mut plaintext_direction_state,
-                        None,
-                    );
+                    self.paint_collected_inline_line(line, context, None);
                     stack.advance(line.height());
                 }
             }
@@ -1875,7 +1830,6 @@ impl<'a> LayoutBuilder<'a> {
         self.record_inline_line_sequence_outcome(sequence);
         let saved_content_left = self.content_left;
         let saved_content_right = self.content_right;
-        let mut plaintext_direction_state = None;
         let mut painted = 0usize;
         let mut marker_painted = false;
         while painted < sequence.records.len() {
@@ -1949,12 +1903,7 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     marker_painted = true;
                 }
-                self.paint_collected_inline_line(
-                    line,
-                    context,
-                    &mut plaintext_direction_state,
-                    None,
-                );
+                self.paint_collected_inline_line(line, context, None);
                 stack.advance(line.height());
                 stack = self.apply_collected_line_clearance(stack, line.clear_after, context);
             }
@@ -2021,7 +1970,6 @@ impl<'a> LayoutBuilder<'a> {
         let saved_cursor_y = self.cursor_y;
         let saved_left = self.content_left;
         let saved_right = self.content_right;
-        let mut plaintext_direction_state = None;
         let context = sequence.context(block_style);
         let (fragment_block_top, fragment_records) =
             sequence.fragment_records_for_slice_paint(slice.block_top, slice.top, slice.bottom);
@@ -2037,7 +1985,6 @@ impl<'a> LayoutBuilder<'a> {
                 self.paint_collected_inline_line_with_float_policy(
                     line,
                     context,
-                    &mut plaintext_direction_state,
                     text_source,
                     float_policy,
                 );
@@ -2070,7 +2017,6 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = content_left;
         self.content_right = content_left + available_width;
         let context = sequence.context(block_style);
-        let mut plaintext_direction_state = None;
         let mut stack = InlineLineStackCursor::new(
             block_style,
             self.content_left,
@@ -2082,9 +2028,7 @@ impl<'a> LayoutBuilder<'a> {
             stack.advance(line.block_before);
             stack.apply(self);
             self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
-            if let Some(prepared) =
-                self.prepare_inline_line_record(line, context, &mut plaintext_direction_state)
-            {
+            if let Some(prepared) = self.prepare_inline_line_record(line, context) {
                 self.paint_prepared_inline_line(&prepared);
             }
             stack.advance(line.height());
@@ -2122,6 +2066,7 @@ impl<'a> LayoutBuilder<'a> {
                     is_first_formatted_line,
                     is_last_line_in_paragraph: true,
                     is_forced_empty: true,
+                    used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: cursor
                         .starts_after_preserved_segment_break,
                     clear_after: Clear::None,
@@ -2215,6 +2160,7 @@ impl<'a> LayoutBuilder<'a> {
                     && next_line_index == 0,
                 is_last_line_in_paragraph: true,
                 is_forced_empty: true,
+                used_bidi_base_direction: None,
                 starts_after_preserved_segment_break: cursor.starts_after_preserved_segment_break,
                 clear_after: Clear::None,
                 block_before: 0.0,
@@ -2269,6 +2215,7 @@ impl<'a> LayoutBuilder<'a> {
                     // Float exclusions can consume a physical line before a
                     // graph range fits the following available float band.
                     is_forced_empty: true,
+                    used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: false,
                     clear_after: Clear::None,
                     block_before: 0.0,
@@ -2329,6 +2276,7 @@ impl<'a> LayoutBuilder<'a> {
                     && !is_phantom,
                 is_last_line_in_paragraph: offset + 1 == line_count,
                 is_forced_empty: false,
+                used_bidi_base_direction: None,
                 starts_after_preserved_segment_break: offset == 0
                     && cursor.starts_after_preserved_segment_break,
                 clear_after: Clear::None,
@@ -2362,13 +2310,11 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         line: &InlineLineRecord,
         context: InlineParagraphContext<'_>,
-        plaintext_direction_state: &mut Option<Direction>,
         text_source: Option<RenderedLineSource>,
     ) {
         self.paint_collected_inline_line_with_float_policy(
             line,
             context,
-            plaintext_direction_state,
             text_source,
             NestedInlinePaintFloatPolicy::ReapplyActiveFloatBands,
         );
@@ -2378,7 +2324,6 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         line: &InlineLineRecord,
         context: InlineParagraphContext<'_>,
-        plaintext_direction_state: &mut Option<Direction>,
         text_source: Option<RenderedLineSource>,
         float_policy: NestedInlinePaintFloatPolicy,
     ) {
@@ -2463,9 +2408,7 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         self.record_in_flow_line_baseline(&paint_line, context.block_style);
-        if let Some(prepared) =
-            self.prepare_inline_line_record(&paint_line, paint_context, plaintext_direction_state)
-        {
+        if let Some(prepared) = self.prepare_inline_line_record(&paint_line, paint_context) {
             self.paint_prepared_inline_line_with_text_source(&prepared, text_source);
         }
     }
@@ -2584,33 +2527,28 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         line: &InlineLineRecord,
         context: InlineParagraphContext<'_>,
-        plaintext_direction_state: &mut Option<Direction>,
     ) -> Option<PreparedInlineLine> {
         let line_box = line.fragment.as_ref()?;
         let block_style = context.block_style;
-        if block_style.unicode_bidi == UnicodeBidi::Plaintext
-            && line.paragraph_index != 0
-            && line.paragraph_line_index == 0
-        {
-            // Callers may prepare collected records individually (for
-            // generated boxes and tests), so keep the plaintext paragraph
-            // boundary at the record API as well as the sequence paint loop.
-            *plaintext_direction_state = None;
-        }
         let padding_left = context.padding_left;
         let line_text = line_box.text();
-        let text_align = text_align_for_inline_line_text_with_state(
+        // Most sequences are finalized immediately after line selection.
+        // Hypothetical sequences used to capture an out-of-flow box's static
+        // position, however, are deliberately restored from a layout
+        // snapshot before they reach this paint-equivalent preparation path.
+        // Their containing block direction is the used direction unless
+        // `unicode-bidi: plaintext` supplied a line-local override, so retain
+        // that invariant at the consumer boundary rather than rejecting an
+        // otherwise valid static-position calculation.
+        // <https://www.w3.org/TR/css-writing-modes-4/#valdef-unicode-bidi-plaintext>
+        let line_direction = line
+            .used_bidi_base_direction
+            .unwrap_or_else(|| block_style.used_direction());
+        let text_align = text_align_for_inline_line_with_base_direction(
             block_style,
             line.is_last_line_in_paragraph,
-            line_text,
-            plaintext_direction_state,
+            line_direction,
         );
-        let inherited_line_direction = if block_style.unicode_bidi == UnicodeBidi::Plaintext {
-            (*plaintext_direction_state).unwrap_or(block_style.used_direction())
-        } else {
-            block_style.used_direction()
-        };
-        let line_direction = inherited_line_direction;
         let mut metrics = line_box.metrics;
         // A left float shifts the physical left edge of an RTL line but does
         // not indent its logical inline start at the right edge. Inline line
@@ -2783,7 +2721,7 @@ impl<'a> LayoutBuilder<'a> {
         line_index: usize,
         force_empty_line: bool,
         starts_after_forced_break: bool,
-        plaintext_direction_state: &mut Option<Direction>,
+        preceding_plaintext_line_direction: &mut Option<Direction>,
     ) -> InlineLayoutOutcome {
         trim_inline_item_edges(paragraph);
         if paragraph.is_empty() {
@@ -2814,20 +2752,12 @@ impl<'a> LayoutBuilder<'a> {
                 has_local_continuation_cutoff: false,
             };
         }
-        // A forced break starts a new UAX #9 plaintext paragraph, unlike a
-        // soft wrap which retains the direction established by the paragraph's
-        // first selected line.
-        // <https://www.w3.org/TR/css-writing-modes-4/#valdef-unicode-bidi-plaintext>
-        // <https://www.unicode.org/reports/tr9/#P2>
-        if starts_after_forced_break && context.block_style.unicode_bidi == UnicodeBidi::Plaintext {
-            *plaintext_direction_state = None;
-        }
         let outcome = self.layout_inline_paragraph(
             paragraph,
             context,
             line_index,
             starts_after_forced_break,
-            plaintext_direction_state,
+            preceding_plaintext_line_direction,
         );
         paragraph.clear();
         // A leading float is out of flow and therefore produces no selected
@@ -3066,6 +2996,7 @@ mod tests {
             is_first_formatted_line: false,
             is_last_line_in_paragraph: false,
             is_forced_empty,
+            used_bidi_base_direction: None,
             starts_after_preserved_segment_break: false,
             clear_after: Clear::None,
             block_before: 0.0,
@@ -3077,6 +3008,27 @@ mod tests {
             line_height: 10.0,
             decoration_origin_fragments: Default::default(),
         }
+    }
+
+    #[test]
+    fn plaintext_direction_finalization_skips_phantom_records() {
+        let mut style = ComputedStyle::initial();
+        style.unicode_bidi = UnicodeBidi::Plaintext;
+        style.direction = Direction::Rtl;
+        let mut sequence = InlineLineSequence {
+            records: vec![line_record(true, false), line_record(false, true)],
+            ..InlineLineSequence::default()
+        };
+        let mut preceding = Some(Direction::Ltr);
+
+        sequence.resolve_bidi_base_directions(&style, &mut preceding);
+
+        assert_eq!(sequence.records[0].used_bidi_base_direction, None);
+        assert_eq!(
+            sequence.records[1].used_bidi_base_direction,
+            Some(Direction::Ltr)
+        );
+        assert_eq!(preceding, Some(Direction::Ltr));
     }
 
     #[test]
@@ -3607,6 +3559,7 @@ fn clearance_only_inline_line_record(
         is_first_formatted_line: false,
         is_last_line_in_paragraph: true,
         is_forced_empty: false,
+        used_bidi_base_direction: None,
         starts_after_preserved_segment_break: false,
         clear_after: clear,
         block_before: 0.0,
@@ -3680,6 +3633,40 @@ impl InlineLineStackCursor {
 }
 
 impl InlineLineSequence {
+    /// Resolve the used bidi base direction for selected formatted lines.
+    ///
+    /// `unicode-bidi: plaintext` is a line-box rule, not a paint-time
+    /// property: each line uses its own first strong character, otherwise the
+    /// preceding formatted line, and finally the containing block direction.
+    /// Phantom records are not line boxes and deliberately do not participate
+    /// in this state transition:
+    /// <https://www.w3.org/TR/css-text-3/#bidi-linebox>.
+    pub(in crate::layout) fn resolve_bidi_base_directions(
+        &mut self,
+        block_style: &ComputedStyle,
+        preceding_line_direction: &mut Option<Direction>,
+    ) {
+        let block_direction = block_style.used_direction();
+        for record in &mut self.records {
+            if record.is_phantom {
+                record.used_bidi_base_direction = None;
+                continue;
+            }
+            let direction = if block_style.unicode_bidi == UnicodeBidi::Plaintext {
+                record
+                    .fragment
+                    .as_ref()
+                    .and_then(|fragment| plaintext_direction_for_text(fragment.text()))
+                    .or(*preceding_line_direction)
+                    .unwrap_or(block_direction)
+            } else {
+                block_direction
+            };
+            record.used_bidi_base_direction = Some(direction);
+            *preceding_line_direction = Some(direction);
+        }
+    }
+
     /// Mark a captured line sequence with the float visibility of its owning
     /// formatting context.
     ///
@@ -4526,6 +4513,15 @@ pub(in crate::layout) struct InlineLineRecord {
     pub(in crate::layout) is_first_formatted_line: bool,
     pub(in crate::layout) is_last_line_in_paragraph: bool,
     pub(in crate::layout) is_forced_empty: bool,
+    /// Used inline base direction of this formatted line.
+    ///
+    /// CSS Text resolves `unicode-bidi: plaintext` per line box: a line with
+    /// no strong character inherits the preceding formatted line's base
+    /// direction, or the containing block's direction for the first line.
+    /// This is finalized with the selected line sequence so all later paint
+    /// and fragmentation consumers observe the same result:
+    /// <https://www.w3.org/TR/css-text-3/#bidi-linebox>.
+    pub(in crate::layout) used_bidi_base_direction: Option<Direction>,
     /// Source-sensitive CSS Text Phase II line-start state.
     pub(in crate::layout) starts_after_preserved_segment_break: bool,
     pub(in crate::layout) clear_after: Clear,

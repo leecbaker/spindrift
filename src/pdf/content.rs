@@ -878,6 +878,7 @@ fn filter_lowering_capable_item(
             PaintPrimitive::GradientPattern(_) => true,
             PaintPrimitive::Image(_)
             | PaintPrimitive::ImagePattern(_)
+            | PaintPrimitive::ProjectiveRaster(_)
             | PaintPrimitive::SvgPattern(_)
             | PaintPrimitive::OpaqueTextCoverage { .. }
             | PaintPrimitive::SvgTextOutline { .. } => false,
@@ -2529,9 +2530,108 @@ fn write_display_item(
         crate::document::paint::display_list::PaintDisplayItem::EffectScope(scope) => {
             write_effect_scope(content, page, scope, embedded_fonts, state);
         }
+        crate::document::paint::display_list::PaintDisplayItem::Primitive(
+            crate::document::paint::page::PaintPrimitive::ProjectiveRaster(raster),
+        ) => write_projective_raster(content, page, raster, state),
         crate::document::paint::display_list::PaintDisplayItem::Primitive(_)
         | crate::document::paint::display_list::PaintDisplayItem::Link(_) => {}
     }
+}
+
+/// Emit the finite viewer-visible portion of a raster plane. PDF cannot carry
+/// the CSS projective CTM, so this fallback scopes the existing calibrated
+/// raster/pattern paint to the clipped projected polygon. Keeping the source
+/// resource name means ordinary PDF resource and ICC planning remains shared
+/// with non-projective raster paint.
+fn write_projective_raster(
+    content: &mut Content,
+    page: &crate::Page,
+    raster: &crate::document::paint::page::ProjectiveRasterPrimitive,
+    state: &mut PaintTreeRenderState<'_, '_>,
+) {
+    use crate::document::paint::page::ProjectiveRasterSource;
+
+    if raster.visible_polygon.len() < 3 {
+        return;
+    }
+    match &raster.source {
+        ProjectiveRasterSource::Image(image) => {
+            let Some(index) = page.images.iter().position(|candidate| candidate == image) else {
+                return;
+            };
+            let Some(resource) = state
+                .page_image_sources
+                .get(index)
+                .and_then(|source| state.image_resources.get(source.0))
+            else {
+                return;
+            };
+            if matches!(resource, PreparedImageResource::Transparent) {
+                return;
+            }
+            content.save_state();
+            write_projected_polygon_clip(content, &raster.visible_polygon);
+            write_image(content, image, index, resource, state.color_policy);
+            content.restore_state();
+        }
+        ProjectiveRasterSource::ImagePattern(pattern) => {
+            let Some(index) = page
+                .image_patterns
+                .iter()
+                .position(|candidate| candidate == pattern)
+            else {
+                return;
+            };
+            let Some(resource) = state
+                .page_image_pattern_sources
+                .get(index)
+                .and_then(|source| state.image_resources.get(source.0))
+            else {
+                return;
+            };
+            if matches!(resource, PreparedImageResource::Transparent) {
+                return;
+            }
+            write_projected_image_pattern(content, &raster.visible_polygon, index);
+        }
+    }
+}
+
+fn write_projected_polygon_clip(
+    content: &mut Content,
+    polygon: &[crate::document::paint::geometry::PaintPoint],
+) {
+    let Some((first, rest)) = polygon.split_first() else {
+        return;
+    };
+    let first = crate::document::paint::geometry::paint_point_to_pdf(*first);
+    content.move_to(first.x, first.y);
+    for point in rest {
+        let point = crate::document::paint::geometry::paint_point_to_pdf(*point);
+        content.line_to(point.x, point.y);
+    }
+    content.close_path().clip_nonzero().end_path();
+}
+
+fn write_projected_image_pattern(
+    content: &mut Content,
+    polygon: &[crate::document::paint::geometry::PaintPoint],
+    index: usize,
+) {
+    let Some((first, rest)) = polygon.split_first() else {
+        return;
+    };
+    let first = crate::document::paint::geometry::paint_point_to_pdf(*first);
+    content.save_state();
+    content
+        .set_fill_color_space(ColorSpaceOperand::Pattern)
+        .set_fill_pattern([], pdf_name(&format!("P{}", index + 1)))
+        .move_to(first.x, first.y);
+    for point in rest {
+        let point = crate::document::paint::geometry::paint_point_to_pdf(*point);
+        content.line_to(point.x, point.y);
+    }
+    content.close_path().fill_nonzero().restore_state();
 }
 
 fn write_page_operation(
@@ -2674,19 +2774,7 @@ fn write_page_operation(
                     .properties()
                     .actual_text(TextStr(outline.actual_text.as_ref()));
             }
-            for path_index in &outline.path_indices {
-                if let Some(path) = page.paths.get(*path_index) {
-                    write_path(
-                        content,
-                        path,
-                        state.vector_paints,
-                        state.resources,
-                        state.page_size,
-                        state.color_mode,
-                        state.active_filter_color_transform,
-                    );
-                }
-            }
+            write_effect_scope(content, page, &outline.content, embedded_fonts, state);
             content.end_marked_content();
         }
     }
@@ -3855,24 +3943,15 @@ fn write_svg_pattern_scene(
                     image_uses,
                 )
             }
-            // Pattern resources are emitted before page font-resource plans
-            // are available. SVG text in a pattern therefore takes the
-            // outline fallback path; it must not be serialized through a
-            // separate font subset here.
-            crate::svg::SvgPaintItem::Text(_) => {}
-            crate::svg::SvgPaintItem::OutlinedText(outlined) => {
-                for path in &outlined.paths {
-                    write_path(
-                        content,
-                        path,
-                        vector_paints,
-                        resources,
-                        tile_size,
-                        color_mode,
-                        crate::css::BoundedSrgbColorTransform::IDENTITY,
-                    );
-                }
-            }
+            crate::svg::SvgPaintItem::OutlinedText(outlined) => write_svg_pattern_scene(
+                content,
+                &outlined.content,
+                vector_paints,
+                resources,
+                tile_size,
+                color_mode,
+                image_uses,
+            ),
         }
     }
 }
@@ -3967,10 +4046,12 @@ pub(super) fn write_rendered_line(
     } else {
         TextRenderingMode::Fill
     };
-    for run in text_runs {
+    let mut reuse_text_position = false;
+    for (run_index, run) in text_runs.iter().enumerate() {
         saw_text_run = true;
         if run.glyphs.is_empty() {
             log::debug!("empty shaped text line {:?}", line.text);
+            reuse_text_position = false;
             continue;
         }
         let Some(embedded_font_index) = embedded_fonts
@@ -3982,6 +4063,7 @@ pub(super) fn write_rendered_line(
                 "skipping shaped text run with unmapped document font id {}",
                 run.document_font_id
             );
+            reuse_text_position = false;
             continue;
         };
         let Some(font) = embedded_fonts.fonts.get(embedded_font_index) else {
@@ -3989,6 +4071,7 @@ pub(super) fn write_rendered_line(
                 "skipping shaped text run with missing embedded font resource {}",
                 embedded_font_index
             );
+            reuse_text_position = false;
             continue;
         };
         if run
@@ -4000,6 +4083,7 @@ pub(super) fn write_rendered_line(
             log::warn!(
                 "skipping shaped text run whose glyphs are missing from PDF font CID mapping"
             );
+            reuse_text_position = false;
             continue;
         }
         if !text_started {
@@ -4035,7 +4119,10 @@ pub(super) fn write_rendered_line(
         let pdf_font_size = quantized_pdf_font_size(run.font_size);
         let run_origin = (line_origin.x + run.x_offset, line_origin.y + run.y_offset);
         let run_text_matrix = pdf_text_matrix(run.text_matrix, synthesis.oblique, run_origin);
-        if run.text_matrix.is_identity() && synthesis.oblique.is_none() {
+        if reuse_text_position {
+            debug_assert!(run.text_matrix.is_identity());
+            debug_assert!(synthesis.oblique.is_none());
+        } else if run.text_matrix.is_identity() && synthesis.oblique.is_none() {
             if let Some((previous_x, previous_y)) = identity_text_line_origin {
                 content.next_line(run_origin.0 - previous_x, run_origin.1 - previous_y);
             } else {
@@ -4071,7 +4158,31 @@ pub(super) fn write_rendered_line(
             // identity run, whose `Td` displacement is relative to it.
             content.set_text_matrix(run_text_matrix);
         } else {
-            write_glyphs(content, run.glyphs, glyph_metrics, invisible, visible_mode);
+            let continues_to_next = text_runs.get(run_index + 1).is_some_and(|next| {
+                let next_synthesis = embedded_fonts
+                    .document_font_synthesis
+                    .get(next.document_font_id)
+                    .copied()
+                    .unwrap_or_default();
+                pdf_text_runs_can_share_cursor(
+                    run,
+                    next,
+                    synthesis.oblique.is_none(),
+                    next_synthesis.oblique.is_none(),
+                )
+            });
+            write_glyphs(
+                content,
+                run.glyphs,
+                glyph_metrics,
+                invisible,
+                visible_mode,
+                continues_to_next,
+            );
+            reuse_text_position = continues_to_next;
+        }
+        if glyphs_have_origin_offsets(run.glyphs) {
+            reuse_text_position = false;
         }
         if run.actual_text.is_some() {
             content.end_marked_content();
@@ -4224,18 +4335,61 @@ impl<'a> PdfGlyphRunMetrics<'a> {
     }
 }
 
+/// Whether two already-coalesced identity text runs can retain one PDF text
+/// matrix. The layout records remain separate: this only avoids replacing the
+/// previous run's serialized text-space advance with a rounded absolute
+/// coordinate before painting the next run.
+fn pdf_text_runs_can_share_cursor(
+    previous: &super::text::PdfTextRun<'_>,
+    next: &super::text::PdfTextRun<'_>,
+    previous_has_no_oblique_synthesis: bool,
+    next_has_no_oblique_synthesis: bool,
+) -> bool {
+    if !previous.text_matrix.is_identity()
+        || !next.text_matrix.is_identity()
+        || !previous_has_no_oblique_synthesis
+        || !next_has_no_oblique_synthesis
+        || glyphs_have_origin_offsets(previous.glyphs)
+        || glyphs_have_origin_offsets(next.glyphs)
+        || previous
+            .glyphs
+            .iter()
+            .chain(next.glyphs)
+            .any(RenderedGlyph::is_painted_by_vector_path)
+    {
+        return false;
+    }
+
+    let previous_end = previous.x_offset
+        + previous
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.x_advance)
+            .sum::<f32>();
+    let scale =
+        (previous_end.abs() + next.x_offset.abs() + previous.y_offset.abs() + next.y_offset.abs())
+            .max(1.0);
+    let tolerance = f32::EPSILON * scale * 8.0;
+    (previous_end - next.x_offset).abs() <= tolerance
+        && (previous.y_offset - next.y_offset).abs() <= tolerance
+}
+
 fn write_glyphs(
     content: &mut Content,
     glyphs: &[RenderedGlyph],
     metrics: PdfGlyphRunMetrics<'_>,
     invisible: bool,
     visible_mode: TextRenderingMode,
+    continue_text_cursor: bool,
 ) {
+    debug_assert!(
+        !continue_text_cursor || !glyphs.iter().any(RenderedGlyph::is_painted_by_vector_path)
+    );
     if glyphs.iter().any(RenderedGlyph::is_painted_by_vector_path) {
         write_glyphs_with_paint_modes(content, glyphs, metrics, invisible, visible_mode);
         return;
     }
-    if !needs_positioned_glyphs(glyphs, metrics) {
+    if !needs_positioned_glyphs(glyphs, metrics, continue_text_cursor) {
         let glyph_bytes = glyph_bytes(glyphs, metrics.source_gid_to_cid);
         content.show(Str(&glyph_bytes));
         return;
@@ -4248,11 +4402,10 @@ fn write_glyphs(
             let glyph_bytes = glyph_id_bytes(metrics.cid(glyph_id));
             items.show(Str(&glyph_bytes));
         }
-        if index + 1 < glyphs.len() {
-            // A run may be followed by a separately painted inline fragment.
-            // Even a sub-centipoint difference accumulates in that fragment's
-            // absolute origin, so omitting it here makes the two PDF text
-            // streams rasterize at different positions.
+        if index + 1 < glyphs.len() || continue_text_cursor && index + 1 == glyphs.len() {
+            // A paint-continuation run starts at this text cursor. Preserve
+            // the final adjustment as well as the internal ones, otherwise a
+            // freshly rounded absolute position subtly changes glyph coverage.
             let adjustment = metrics.adjustment_for(glyph);
             if !adjustment.is_zero() {
                 items.adjust(adjustment.value());
@@ -4409,9 +4562,14 @@ pub(super) fn pdf_text_matrix_transform_local_point(
     )
 }
 
-fn needs_positioned_glyphs(glyphs: &[RenderedGlyph], metrics: PdfGlyphRunMetrics<'_>) -> bool {
+fn needs_positioned_glyphs(
+    glyphs: &[RenderedGlyph],
+    metrics: PdfGlyphRunMetrics<'_>,
+    continue_text_cursor: bool,
+) -> bool {
     glyphs.iter().enumerate().any(|(index, glyph)| {
-        (index + 1 < glyphs.len() && !metrics.adjustment_for(glyph).is_zero())
+        ((index + 1 < glyphs.len() || continue_text_cursor && index + 1 == glyphs.len())
+            && !metrics.adjustment_for(glyph).is_zero())
             || glyph.x_offset.abs() > 0.01
             || glyph.y_offset.abs() > 0.01
     })
@@ -5230,10 +5388,107 @@ mod content_tests {
             metrics,
             false,
             TextRenderingMode::Fill,
+            false,
         );
         content.end_text();
         let content = String::from_utf8_lossy(&content.finish().into_vec()).into_owned();
 
         assert!(content.contains("TJ"), "content={content}");
+    }
+
+    #[test]
+    fn cursor_continuation_emits_the_final_pdf_text_space_adjustment() {
+        let source_gid_to_cid = BTreeMap::from([(1, 1)]);
+        let source_gid_to_width =
+            BTreeMap::from([(1, PdfTextSpaceWidth::from_font_units(455, 2048))]);
+        let metrics = PdfGlyphRunMetrics {
+            source_gid_to_cid: &source_gid_to_cid,
+            source_gid_to_width: &source_gid_to_width,
+            default_width: PdfTextSpaceWidth(0),
+            font_size: PdfTextFontSize::new(12.0),
+        };
+        let glyphs = vec![RenderedGlyph {
+            kind: crate::document::paint::text::RenderedGlyphKind::Paint(1),
+            x_advance: 455.0 * 12.0 / 2048.0,
+            nominal_x_advance: 455.0 * 12.0 / 2048.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            unicode: "A".to_string(),
+        }];
+
+        let mut ordinary = Content::new();
+        ordinary.begin_text();
+        write_glyphs(
+            &mut ordinary,
+            &glyphs,
+            metrics,
+            false,
+            TextRenderingMode::Fill,
+            false,
+        );
+        ordinary.end_text();
+        let ordinary = String::from_utf8_lossy(&ordinary.finish().into_vec()).into_owned();
+        assert!(!ordinary.contains("TJ"), "content={ordinary}");
+
+        let mut continuation = Content::new();
+        continuation.begin_text();
+        write_glyphs(
+            &mut continuation,
+            &glyphs,
+            metrics,
+            false,
+            TextRenderingMode::Fill,
+            true,
+        );
+        continuation.end_text();
+        let continuation = String::from_utf8_lossy(&continuation.finish().into_vec()).into_owned();
+        assert!(continuation.contains("TJ"), "content={continuation}");
+    }
+
+    #[test]
+    fn pdf_cursor_continuation_rejects_a_gap_or_transformed_run() {
+        let glyphs = [RenderedGlyph {
+            kind: crate::document::paint::text::RenderedGlyphKind::Paint(1),
+            x_advance: 7.0,
+            nominal_x_advance: 7.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            unicode: "A".to_string(),
+        }];
+        let previous = super::super::text::PdfTextRun {
+            document_font_id: 0,
+            actual_text: None,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
+            font_size: 12.0,
+            glyphs: &glyphs,
+        };
+        let mut next = super::super::text::PdfTextRun {
+            document_font_id: 0,
+            actual_text: None,
+            x_offset: 7.0,
+            y_offset: 0.0,
+            text_matrix: crate::document::paint::text::RenderedTextMatrix::IDENTITY,
+            font_size: 12.0,
+            glyphs: &glyphs,
+        };
+
+        assert!(pdf_text_runs_can_share_cursor(&previous, &next, true, true));
+
+        next.x_offset = 7.01;
+        assert!(!pdf_text_runs_can_share_cursor(
+            &previous, &next, true, true
+        ));
+
+        next.x_offset = 7.0;
+        next.text_matrix =
+            crate::document::paint::text::RenderedTextMatrix::from_pdf_linear_components([
+                1.0, 0.0, 0.1, 1.0,
+            ])
+            .unwrap();
+        assert!(!pdf_text_runs_can_share_cursor(
+            &previous, &next, true, true
+        ));
     }
 }

@@ -798,6 +798,10 @@ pub(crate) enum GeneratedPseudoKind {
     Before,
     After,
     FootnoteCall,
+    /// CSS Overflow 5 generated sibling owned by a scroll container.
+    ScrollMarkerGroup,
+    /// CSS Overflow 5 marker whose source data remains its target element.
+    ScrollMarker,
 }
 
 impl GeneratedPseudoKind {
@@ -806,6 +810,9 @@ impl GeneratedPseudoKind {
             Self::Before => CounterEventSource::Before,
             Self::After => CounterEventSource::After,
             Self::FootnoteCall => CounterEventSource::FootnoteCall,
+            // Markers inherit their originating element's counter snapshot;
+            // the external group itself does not establish a counter scope.
+            Self::ScrollMarkerGroup | Self::ScrollMarker => CounterEventSource::Principal,
         }
     }
 }

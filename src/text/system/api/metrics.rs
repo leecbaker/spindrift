@@ -42,10 +42,32 @@ impl FontSystem {
                 self.used_x_height_for_style(style).points(),
             ));
         };
-        let x_height = self.used_x_height_for_style(style).points();
-        let Some(font) = self.document_fonts.get(font_id) else {
-            return layout_pt(style.font_size);
-        };
+        self.baseline_offset_for_font(style, font_id, used_font_size, metric)
+            .unwrap_or_else(|| layout_pt(style.font_size))
+    }
+
+    /// Return one selected font's CSS baseline position measured from the
+    /// block-start of its em-box.
+    ///
+    /// Inline layout must use the same font selected for a shaped run: a
+    /// `unicode-range` or ordinary fallback face can have different BASE,
+    /// ascent, and descent metrics from the first available face in the
+    /// authored family list.
+    /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
+    /// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm>
+    fn baseline_offset_for_font(
+        &self,
+        style: &ComputedStyle,
+        font_id: usize,
+        used_font_size: f32,
+        metric: BaselineMetric,
+    ) -> Option<LayoutLength> {
+        let metric = baseline_metric_for_typography(metric, style.text_layout_policy());
+        let x_height = self
+            .x_height_for_font(font_id, used_font_size)
+            .unwrap_or_else(|| layout_pt(used_font_size * 0.5))
+            .points();
+        let font = self.document_fonts.get(font_id)?;
         let units_per_em = font.units_per_em.max(1) as f32;
         let coordinate_value = |coordinate: crate::document::OpenTypeBaselineCoordinate| {
             let delta = coordinate
@@ -109,7 +131,7 @@ impl FontSystem {
                     synthesized_baseline_offset(metric, alphabetic, used_font_size, x_height)
                 }),
         };
-        layout_pt(offset)
+        Some(layout_pt(offset))
     }
 
     /// Resolve the selected CSS content-area alphabetic baseline position.
@@ -392,9 +414,10 @@ impl FontSystem {
     /// unspecified, but it requires the choice not to change with
     /// `line-height`; backgrounds, borders, and padding consume this metric.
     ///
-    /// The normal line box uses that same primary metric face. Fallback faces
-    /// remain per-glyph shaping and painting concerns, so the characters in a
-    /// run cannot change the inline box's CSS geometry:
+    /// This result is the parent strut. Inline layout unions it with extents
+    /// for the exact font runs selected during shaping, so fallback faces can
+    /// contribute their own glyph-and-leading geometry without changing the
+    /// authored inline box's content-area policy:
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
     /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>.
     pub(crate) fn resolved_inline_text_metrics(
@@ -408,6 +431,31 @@ impl FontSystem {
         let line = self.line_extents_for_style_font(selected_font_id, style, content);
 
         ResolvedInlineTextMetrics { content, line }
+    }
+
+    /// Resolve vertical metrics for one font already selected by shaping.
+    ///
+    /// This is the font-run counterpart to [`Self::resolved_inline_text_metrics`].
+    /// It deliberately receives the run's used size instead of recalculating
+    /// `font-size-adjust`, because the shaped run is the source of truth for
+    /// the selected `@font-face` and its size adjustment.
+    /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
+    /// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm>
+    pub(crate) fn resolved_inline_text_metrics_for_selected_font(
+        &self,
+        style: &ComputedStyle,
+        font_id: usize,
+        used_font_size: f32,
+    ) -> Option<ResolvedInlineTextMetrics> {
+        let content_baseline_offset = self
+            .baseline_offset_for_font(style, font_id, used_font_size, BaselineMetric::Alphabetic)?
+            .points();
+        let content =
+            self.content_extents_for_font(Some(font_id), used_font_size, content_baseline_offset)?;
+        let line =
+            self.line_extents_for_style_font_at_size(Some(font_id), style, used_font_size, content);
+
+        Some(ResolvedInlineTextMetrics { content, line })
     }
 
     fn content_extents_for_style_font(
@@ -453,10 +501,20 @@ impl FontSystem {
         style: &ComputedStyle,
         content: FontRunVerticalExtents,
     ) -> FontRunVerticalExtents {
+        let used_font_size = font_id
+            .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
+            .unwrap_or(style.font_size);
+        self.line_extents_for_style_font_at_size(font_id, style, used_font_size, content)
+    }
+
+    fn line_extents_for_style_font_at_size(
+        &self,
+        font_id: Option<usize>,
+        style: &ComputedStyle,
+        used_font_size: f32,
+        content: FontRunVerticalExtents,
+    ) -> FontRunVerticalExtents {
         if style.line_height_is_normal() {
-            let used_font_size = font_id
-                .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
-                .unwrap_or(style.font_size);
             self.normal_line_extents_for_font(font_id, used_font_size, content)
         } else {
             self.explicit_line_extents_for_content(style.line_height, content)
@@ -717,7 +775,14 @@ impl FontSystem {
         let used_font_size = font_id
             .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
             .unwrap_or(style.font_size);
-        let font = font_id.and_then(|id| self.document_fonts.get(id))?;
+        self.x_height_for_font(font_id?, used_font_size)
+    }
+
+    /// Return a specific selected font's x-height at its already-resolved
+    /// shaping size. This keeps per-run baseline synthesis aligned with the
+    /// exact font that supplied the glyphs.
+    fn x_height_for_font(&self, font_id: usize, used_font_size: f32) -> Option<LayoutLength> {
+        let font = self.document_fonts.get(font_id)?;
         let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
         let units_per_em = font.units_per_em.max(1) as f32;
         let height = face

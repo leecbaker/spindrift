@@ -1230,11 +1230,9 @@ fn collect_svg_scene_colors(scene: &crate::svg::SvgPaintGroup, colors: &mut Vec<
                 collect_svg_scene_colors(group, colors)
             }
             crate::svg::SvgPaintItem::OutlinedText(outlined) => {
-                for path in &outlined.paths {
-                    collect_path_colors(path, colors);
-                }
+                collect_svg_scene_colors(&outlined.content, colors)
             }
-            crate::svg::SvgPaintItem::RasterImage(_) | crate::svg::SvgPaintItem::Text(_) => {}
+            crate::svg::SvgPaintItem::RasterImage(_) => {}
         }
     }
 }

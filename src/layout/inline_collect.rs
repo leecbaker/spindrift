@@ -4,9 +4,21 @@ use crate::text::{
     trim_css_collapsible_whitespace, typographic_unit_is_upright_in_mixed_orientation,
 };
 
-mod split_1;
-pub(in crate::layout) use self::split_1::*;
-mod split_2;
-pub(in crate::layout) use self::split_2::FrozenInlineReplayInput;
-mod split_3;
-pub(in crate::layout) use self::split_3::*;
+mod atomic;
+mod autospace;
+mod collection;
+mod generated_content;
+mod inline_block;
+mod intrinsic;
+mod positioned;
+mod ruby;
+mod scopes;
+mod static_position;
+mod text;
+
+pub(in crate::layout) use self::autospace::*;
+pub(in crate::layout) use self::collection::FrozenInlineReplayInput;
+pub(in crate::layout) use self::generated_content::quote_pair;
+pub(in crate::layout) use self::scopes::*;
+pub(in crate::layout) use self::static_position::BlockStaticPositionPlaceholderGeometry;
+pub(in crate::layout) use self::text::*;

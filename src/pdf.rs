@@ -530,35 +530,6 @@ struct ImageResourcePlan {
 }
 
 impl ImageResourcePlan {
-    /// Return the calibrated raster colour sources that are actually selected
-    /// by the final PDF program.  A source can be planned for a page but be
-    /// elided during lowering, so the document-wide deduplication table is
-    /// not itself evidence that its ICC profile belongs in the output.
-    fn color_sources_for_indexes(
-        &self,
-        indexes: &[PlannedImageIndex],
-        image_store: &crate::image_store::DocumentImageStore,
-    ) -> (Vec<crate::css::CssColorSpace>, Vec<Rc<[u8]>>) {
-        let mut built_in = Vec::new();
-        let mut embedded = Vec::new();
-        for index in indexes {
-            match self.unique_images[index.0].raster_color_space(image_store) {
-                crate::color::RasterColorSpace::BuiltIn(space) if !built_in.contains(&space) => {
-                    built_in.push(space);
-                }
-                crate::color::RasterColorSpace::EmbeddedRgb(profile)
-                    if !embedded
-                        .iter()
-                        .any(|existing: &Rc<[u8]>| existing.as_ref() == profile.as_ref()) =>
-                {
-                    embedded.push(profile);
-                }
-                _ => {}
-            }
-        }
-        (built_in, embedded)
-    }
-
     fn built_in_color_spaces(
         &self,
         image_store: &crate::image_store::DocumentImageStore,

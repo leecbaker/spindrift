@@ -79,6 +79,9 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
             "visited" => Ok(QuirePseudoClass::Visited),
             "target" => Ok(QuirePseudoClass::Target),
             "target-within" => Ok(QuirePseudoClass::TargetWithin),
+            "target-current" => Ok(QuirePseudoClass::TargetCurrent),
+            "target-before" => Ok(QuirePseudoClass::TargetBefore),
+            "target-after" => Ok(QuirePseudoClass::TargetAfter),
             "hover" => Ok(QuirePseudoClass::StaticFalse("hover")),
             "active" => Ok(QuirePseudoClass::StaticFalse("active")),
             "focus" => Ok(QuirePseudoClass::StaticFalse("focus")),
@@ -183,6 +186,10 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
             Ok(QuirePseudoElement::Before)
         } else if name.eq_ignore_ascii_case("after") {
             Ok(QuirePseudoElement::After)
+        } else if name.eq_ignore_ascii_case("scroll-marker") {
+            Ok(QuirePseudoElement::ScrollMarker)
+        } else if name.eq_ignore_ascii_case("scroll-marker-group") {
+            Ok(QuirePseudoElement::ScrollMarkerGroup)
         } else if name.eq_ignore_ascii_case("footnote-call") {
             Ok(QuirePseudoElement::FootnoteCall)
         } else if name.eq_ignore_ascii_case("footnote-marker") {

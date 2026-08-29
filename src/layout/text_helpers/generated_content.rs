@@ -40,7 +40,7 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             anchor.counters.get(name)?.last().copied()?
         };
-        list::counter_text(
+        counter_styles::counter_text(
             style.unwrap_or(ListStyleType::Decimal),
             value,
             &self.counter_styles,
@@ -100,7 +100,7 @@ pub(in crate::layout) fn evaluate_generated_content_text(
     content: &[GeneratedContentPart],
     counter_stack: &HashMap<String, Vec<i32>>,
     counter_styles: &HashMap<String, CounterStyleRule>,
-    render_context: list::CounterStyleRenderContext,
+    render_context: counter_styles::CounterStyleRenderContext,
 ) -> String {
     let mut output = String::new();
     for part in content {
@@ -122,7 +122,7 @@ pub(in crate::layout) fn evaluate_generated_content_text(
                     .get(name)
                     .and_then(|values| values.last().cloned())
                     .unwrap_or(0);
-                if let Some(counter) = list::counter_text_with_context(
+                if let Some(counter) = counter_styles::counter_text_with_context(
                     counter_style.clone().unwrap_or(ListStyleType::Decimal),
                     value,
                     counter_styles,
@@ -143,7 +143,7 @@ pub(in crate::layout) fn evaluate_generated_content_text(
                     .unwrap_or_else(|| vec![0])
                     .into_iter()
                     .filter_map(|value| {
-                        list::counter_text_with_context(
+                        counter_styles::counter_text_with_context(
                             style.clone(),
                             value,
                             counter_styles,
@@ -188,7 +188,7 @@ pub(in crate::layout) fn evaluate_generated_alt_text(
                     .get(name)
                     .and_then(|values| values.last().cloned())
                     .unwrap_or(0);
-                if let Some(counter) = list::counter_text(
+                if let Some(counter) = counter_styles::counter_text(
                     counter_style.clone().unwrap_or(ListStyleType::Decimal),
                     value,
                     counter_styles,
@@ -207,7 +207,9 @@ pub(in crate::layout) fn evaluate_generated_alt_text(
                     .cloned()
                     .unwrap_or_else(|| vec![0])
                     .into_iter()
-                    .filter_map(|value| list::counter_text(style.clone(), value, counter_styles))
+                    .filter_map(|value| {
+                        counter_styles::counter_text(style.clone(), value, counter_styles)
+                    })
                     .collect::<Vec<_>>();
                 output.push_str(&counters.join(separator));
             }

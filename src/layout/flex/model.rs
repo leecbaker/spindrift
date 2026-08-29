@@ -3241,9 +3241,8 @@ pub(super) type StyledChild<'a> = FormattingContextChild<'a>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::flex::compute::{
-        flex_cross_start_side, reproject_taffy_item_cross_axis_coordinates,
-    };
+    use crate::layout::flex::alignment::flex_cross_start_side;
+    use crate::layout::flex::compute::reproject_taffy_item_cross_axis_coordinates;
     use crate::layout::flex::layout::{
         flex_container_page_contents_overflow_clip, flex_container_page_fragment_bounds,
     };

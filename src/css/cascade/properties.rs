@@ -342,6 +342,8 @@ define_modeled_longhands! {
     ScrollSnapType => "scroll-snap-type",
     ScrollSnapAlign => "scroll-snap-align",
     ScrollSnapStop => "scroll-snap-stop",
+    ScrollTargetGroup => "scroll-target-group",
+    ScrollMarkerGroup => "scroll-marker-group",
     ScrollPaddingTop => "scroll-padding-top",
     ScrollPaddingRight => "scroll-padding-right",
     ScrollPaddingBottom => "scroll-padding-bottom",
@@ -1413,6 +1415,8 @@ fn copy_modeled_longhand_by_css_name(
         "scroll-snap-type" => style.scroll_snap_type = source.scroll_snap_type,
         "scroll-snap-align" => style.scroll_snap_align = source.scroll_snap_align,
         "scroll-snap-stop" => style.scroll_snap_stop = source.scroll_snap_stop,
+        "scroll-target-group" => style.scroll_target_group = source.scroll_target_group,
+        "scroll-marker-group" => style.scroll_marker_group = source.scroll_marker_group,
         "scroll-padding-top" => style.scroll_padding.top = source.scroll_padding.top.clone(),
         "scroll-padding-right" => style.scroll_padding.right = source.scroll_padding.right.clone(),
         "scroll-padding-bottom" => {

@@ -5,14 +5,18 @@ use super::annotations::RenderedLink;
 use super::display_list::{PagePaintTree, PaintBand, PaintDisplayItem, PaintDisplayList};
 use super::effects::{PaintEffectScope, PaintEffects};
 use super::fragments::{PaintFragment, RecordedPaintFragment};
-use super::geometry::{PaintBounds, PaintClip, PaintTransform, PaintTranslation, rect_bounds};
+use super::geometry::{
+    PaintClip, PaintPoint, PaintTransform, PaintTranslation, Projective3dPaintTransform,
+    rect_bounds,
+};
 use super::images::RenderedImage;
 use super::paths::{RenderedPath, path_bounds};
 use super::patterns::{RenderedGradientPattern, RenderedImagePattern, RenderedSvgPattern};
 use super::shapes::{RenderedRect, RenderedRoundedRect, RenderedStroke};
 use super::stacking::PaintStackingContext;
 use super::text::{
-    RenderedLine, RenderedTextPaintSegment, rendered_lines_can_merge_as_inline_continuation,
+    RenderedLine, RenderedTextPaintSegment, rendered_lines_can_merge_as_exact_paint_continuation,
+    rendered_lines_can_merge_as_inline_continuation,
     rendered_lines_can_merge_as_tracking_continuation, rendered_lines_can_merge_with_word_gap,
     split_rendered_line_at_font_run_boundaries,
 };
@@ -357,10 +361,6 @@ impl Page {
                     let operation = self.record_image(*image).1;
                     PaintDisplayItem::Operation(operation)
                 }
-                crate::svg::SvgPaintItem::Text(line) => {
-                    let operation = self.record_line(*line).1;
-                    PaintDisplayItem::Operation(operation)
-                }
                 crate::svg::SvgPaintItem::OutlinedText(outlined) => {
                     PaintDisplayItem::Operation(self.record_svg_text_outline(*outlined).1)
                 }
@@ -449,6 +449,10 @@ impl Page {
             return None;
         };
         let previous = self.lines.get_mut(*index)?;
+        if rendered_lines_can_merge_as_exact_paint_continuation(previous, line) {
+            previous.append_same_line_continuation(line);
+            return Some(*index);
+        }
         if rendered_lines_can_merge_as_inline_continuation(previous, line) {
             previous.append_same_line_continuation(line);
             return Some(*index);
@@ -507,14 +511,15 @@ impl Page {
         line_index
     }
 
-    pub(crate) fn push_svg_text_outline_in_band(
+    /// Insert a fragment-replayed SVG text outline without discarding its
+    /// retained SVG compositing subtree.
+    pub(crate) fn push_svg_text_outline_scope_in_band(
         &mut self,
         band: PaintBand,
-        paths: Vec<RenderedPath>,
+        content: crate::document::paint::effects::PaintEffectScope,
         actual_text: Rc<str>,
     ) -> usize {
-        let (index, operation) =
-            self.record_svg_text_outline(crate::svg::SvgOutlinedText { paths, actual_text });
+        let (index, operation) = self.record_svg_text_outline_scope(content, actual_text);
         self.push_paint_tree_operation_in_band(band, operation);
         index
     }
@@ -596,11 +601,13 @@ impl Page {
         let mut opaque_text_coverages_seen = vec![false; self.opaque_text_coverages.len()];
         let mut svg_text_outlines_seen = vec![false; self.svg_text_outlines.len()];
 
-        for (operation_index, operation) in self.paint_operations().iter().enumerate() {
+        let mut operations = self.paint_operations().into_owned();
+        let mut operation_index = 0;
+        while let Some(&operation) = operations.get(operation_index) {
             match operation {
                 PaintOperation::Rect(index) => mark_operation_index(
                     &mut rects_seen,
-                    *index,
+                    index,
                     self.rects.len(),
                     page_index,
                     operation_index,
@@ -608,7 +615,7 @@ impl Page {
                 )?,
                 PaintOperation::Stroke(index) => mark_operation_index(
                     &mut strokes_seen,
-                    *index,
+                    index,
                     self.strokes.len(),
                     page_index,
                     operation_index,
@@ -616,7 +623,7 @@ impl Page {
                 )?,
                 PaintOperation::RoundedRect(index) => mark_operation_index(
                     &mut rounded_rects_seen,
-                    *index,
+                    index,
                     self.rounded_rects.len(),
                     page_index,
                     operation_index,
@@ -624,7 +631,7 @@ impl Page {
                 )?,
                 PaintOperation::Path(index) => mark_operation_index(
                     &mut paths_seen,
-                    *index,
+                    index,
                     self.paths.len(),
                     page_index,
                     operation_index,
@@ -632,7 +639,7 @@ impl Page {
                 )?,
                 PaintOperation::Image(index) => mark_operation_index(
                     &mut images_seen,
-                    *index,
+                    index,
                     self.images.len(),
                     page_index,
                     operation_index,
@@ -640,7 +647,7 @@ impl Page {
                 )?,
                 PaintOperation::ImagePattern(index) => mark_operation_index(
                     &mut image_patterns_seen,
-                    *index,
+                    index,
                     self.image_patterns.len(),
                     page_index,
                     operation_index,
@@ -648,7 +655,7 @@ impl Page {
                 )?,
                 PaintOperation::GradientPattern(index) => mark_operation_index(
                     &mut gradient_patterns_seen,
-                    *index,
+                    index,
                     self.gradient_patterns.len(),
                     page_index,
                     operation_index,
@@ -656,7 +663,7 @@ impl Page {
                 )?,
                 PaintOperation::SvgPattern(index) => mark_operation_index(
                     &mut svg_patterns_seen,
-                    *index,
+                    index,
                     self.svg_patterns.len(),
                     page_index,
                     operation_index,
@@ -664,7 +671,7 @@ impl Page {
                 )?,
                 PaintOperation::Line(index) => mark_operation_index(
                     &mut lines_seen,
-                    *index,
+                    index,
                     self.lines.len(),
                     page_index,
                     operation_index,
@@ -673,13 +680,13 @@ impl Page {
                 PaintOperation::OpaqueTextCoverage(index) => {
                     mark_operation_index(
                         &mut opaque_text_coverages_seen,
-                        *index,
+                        index,
                         self.opaque_text_coverages.len(),
                         page_index,
                         operation_index,
                         "opaque text coverage",
                     )?;
-                    let coverage = self.opaque_text_coverages.get(*index).ok_or_else(|| {
+                    let coverage = self.opaque_text_coverages.get(index).ok_or_else(|| {
                         Error::InvalidInput(format!(
                             "page {} paint operation {} references missing opaque text coverage {}",
                             page_index + 1,
@@ -709,13 +716,13 @@ impl Page {
                 PaintOperation::SvgTextOutline(index) => {
                     mark_operation_index(
                         &mut svg_text_outlines_seen,
-                        *index,
+                        index,
                         self.svg_text_outlines.len(),
                         page_index,
                         operation_index,
                         "SVG text outline",
                     )?;
-                    let outline = self.svg_text_outlines.get(*index).ok_or_else(|| {
+                    let outline = self.svg_text_outlines.get(index).ok_or_else(|| {
                         Error::InvalidInput(format!(
                             "page {} paint operation {} references missing SVG text outline {}",
                             page_index + 1,
@@ -723,18 +730,10 @@ impl Page {
                             index
                         ))
                     })?;
-                    for path_index in &outline.path_indices {
-                        mark_operation_index(
-                            &mut paths_seen,
-                            *path_index,
-                            self.paths.len(),
-                            page_index,
-                            operation_index,
-                            "path",
-                        )?;
-                    }
+                    outline.content.push_flattened_operations(&mut operations);
                 }
             }
+            operation_index += 1;
         }
 
         ensure_all_operations_referenced(&rects_seen, page_index, "rect")?;
@@ -829,15 +828,24 @@ impl Page {
         &mut self,
         outlined: crate::svg::SvgOutlinedText,
     ) -> (usize, PaintOperation) {
-        let path_indices = outlined
-            .paths
-            .into_iter()
-            .map(|path| self.record_path(path).0)
-            .collect();
+        let content = self.record_svg_group(outlined.content);
+        self.record_svg_text_outline_scope(content, outlined.actual_text)
+    }
+
+    /// Record a captured SVG-text outline subtree without flattening its
+    /// compositing boundaries. Paint fragments can replay this representation
+    /// on a later page, where PDF emission still wraps the complete subtree in
+    /// one `/ActualText` span.
+    fn record_svg_text_outline_scope(
+        &mut self,
+        content: crate::document::paint::effects::PaintEffectScope,
+        actual_text: Rc<str>,
+    ) -> (usize, PaintOperation) {
+        let content = content.into_recorded_nodes(self);
         let index = self.svg_text_outlines.len();
         self.svg_text_outlines.push(SvgTextOutline {
-            path_indices,
-            actual_text: outlined.actual_text,
+            content,
+            actual_text,
         });
         (index, PaintOperation::SvgTextOutline(index))
     }
@@ -895,6 +903,9 @@ impl Page {
             PaintPrimitive::Stroke(stroke) => self.record_stroke(stroke).1,
             PaintPrimitive::Image(image) => self.record_image(image).1,
             PaintPrimitive::ImagePattern(pattern) => self.record_image_pattern(pattern).1,
+            PaintPrimitive::ProjectiveRaster(_) => {
+                unreachable!("projective raster lowering runs after page primitive recording")
+            }
             PaintPrimitive::GradientPattern(pattern) => self.record_gradient_pattern(pattern).1,
             PaintPrimitive::SvgPattern(pattern) => self.record_svg_pattern(pattern).1,
             PaintPrimitive::Line(line) => self.record_line(line).1,
@@ -911,10 +922,10 @@ impl Page {
                 });
                 PaintOperation::OpaqueTextCoverage(index)
             }
-            PaintPrimitive::SvgTextOutline { paths, actual_text } => {
-                self.record_svg_text_outline(crate::svg::SvgOutlinedText { paths, actual_text })
-                    .1
-            }
+            PaintPrimitive::SvgTextOutline {
+                content,
+                actual_text,
+            } => self.record_svg_text_outline_scope(*content, actual_text).1,
         }
     }
 
@@ -1037,15 +1048,11 @@ impl Page {
                 Some(PaintPrimitive::OpaqueTextCoverage { line, paths })
             }
             PaintOperation::SvgTextOutline(index) => {
-                let outline = self.svg_text_outlines.get(*index)?;
-                let paths = outline
-                    .path_indices
-                    .iter()
-                    .map(|index| self.paths.get(*index).cloned())
-                    .collect::<Option<Vec<_>>>()?;
-                Some(PaintPrimitive::SvgTextOutline {
-                    paths,
-                    actual_text: Rc::clone(&outline.actual_text),
+                self.svg_text_outlines.get(*index).cloned().map(|outline| {
+                    PaintPrimitive::SvgTextOutline {
+                        content: Box::new(outline.content.into_primitive_nodes(self)),
+                        actual_text: outline.actual_text,
+                    }
                 })
             }
         }
@@ -1139,9 +1146,9 @@ pub(crate) struct OpaqueTextCoverage {
     pub(crate) path_indices: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SvgTextOutline {
-    pub(crate) path_indices: Vec<usize>,
+    pub(crate) content: crate::document::paint::effects::PaintEffectScope,
     pub(crate) actual_text: Rc<str>,
 }
 
@@ -1171,6 +1178,10 @@ pub(crate) enum PaintPrimitive {
     Stroke(RenderedStroke),
     Image(RenderedImage),
     ImagePattern(RenderedImagePattern),
+    /// Raster paint retained until the PDF backend can lower a projective CSS
+    /// scene. PDF has no projective CTM, so the backend paints only the
+    /// finite, viewer-visible polygon.
+    ProjectiveRaster(ProjectiveRasterPrimitive),
     GradientPattern(RenderedGradientPattern),
     SvgPattern(RenderedSvgPattern),
     Line(RenderedLine),
@@ -1179,9 +1190,28 @@ pub(crate) enum PaintPrimitive {
         paths: Vec<RenderedPath>,
     },
     SvgTextOutline {
-        paths: Vec<RenderedPath>,
+        content: Box<crate::document::paint::effects::PaintEffectScope>,
         actual_text: Rc<str>,
     },
+}
+
+/// One source raster together with the projective plane that produced its
+/// finite visible destination polygon.
+///
+/// CSS Transforms 2 requires clipping at the viewer plane before perspective
+/// division. Keeping the source and polygon together prevents the PDF backend
+/// from emitting the original unbounded operation after that clipping step.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProjectiveRasterPrimitive {
+    pub(crate) source: ProjectiveRasterSource,
+    pub(crate) visible_polygon: Vec<PaintPoint>,
+    pub(crate) source_transform: Projective3dPaintTransform,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProjectiveRasterSource {
+    Image(RenderedImage),
+    ImagePattern(RenderedImagePattern),
 }
 
 impl PaintPrimitive {
@@ -1193,6 +1223,7 @@ impl PaintPrimitive {
             Self::Stroke(stroke) => Self::Stroke(stroke.translated(offset)),
             Self::Image(image) => Self::Image(image.translated(offset)),
             Self::ImagePattern(pattern) => Self::ImagePattern(pattern.translated(offset)),
+            Self::ProjectiveRaster(raster) => Self::ProjectiveRaster(raster.translated(offset)),
             Self::GradientPattern(pattern) => Self::GradientPattern(pattern.translated(offset)),
             Self::SvgPattern(pattern) => Self::SvgPattern(pattern.translated(offset)),
             Self::Line(line) => Self::Line(line.translated(offset)),
@@ -1203,11 +1234,11 @@ impl PaintPrimitive {
                     .map(|path| path.translated(offset))
                     .collect(),
             },
-            Self::SvgTextOutline { paths, actual_text } => Self::SvgTextOutline {
-                paths: paths
-                    .into_iter()
-                    .map(|path| path.translated(offset))
-                    .collect(),
+            Self::SvgTextOutline {
+                content,
+                actual_text,
+            } => Self::SvgTextOutline {
+                content: Box::new((*content).translated(offset)),
                 actual_text,
             },
         }
@@ -1231,6 +1262,10 @@ impl PaintPrimitive {
             Self::ImagePattern(pattern) => rect_bounds(pattern.paint_rect())
                 .and_then(|bounds| bounds.intersect(clip))
                 .map(|_| Self::ImagePattern(pattern)),
+            Self::ProjectiveRaster(raster) => raster
+                .bounds()
+                .and_then(|bounds| bounds.intersect(clip))
+                .map(|_| Self::ProjectiveRaster(raster)),
             Self::GradientPattern(pattern) => rect_bounds(pattern.paint_bounds())
                 .and_then(|bounds| bounds.intersect(clip))
                 .map(|_| Self::GradientPattern(pattern)),
@@ -1252,9 +1287,16 @@ impl PaintPrimitive {
                 .paint_bounds()
                 .intersect(clip)
                 .map(|_| Self::OpaqueTextCoverage { line, paths }),
-            Self::SvgTextOutline { paths, actual_text } => svg_text_outline_bounds(&paths)
-                .and_then(|bounds| bounds.intersect(clip))
-                .map(|_| Self::SvgTextOutline { paths, actual_text }),
+            Self::SvgTextOutline {
+                content,
+                actual_text,
+            } => content
+                .bounds
+                .is_none_or(|bounds| bounds.intersect(clip).is_some())
+                .then_some(Self::SvgTextOutline {
+                    content,
+                    actual_text,
+                }),
         }
     }
 
@@ -1264,30 +1306,55 @@ impl PaintPrimitive {
             Self::RoundedRect(rect) => rect_bounds(rect.paint_rect()),
             Self::Image(image) => rect_bounds(image.paint_rect()),
             Self::ImagePattern(pattern) => rect_bounds(pattern.paint_rect()),
+            Self::ProjectiveRaster(raster) => raster.bounds(),
             Self::GradientPattern(pattern) => rect_bounds(pattern.paint_bounds()),
             Self::SvgPattern(pattern) => rect_bounds(pattern.paint_rect()),
             Self::Stroke(stroke) => Some(stroke.paint_bounds()),
             Self::Line(line) => Some(line.paint_bounds()),
             Self::OpaqueTextCoverage { line, .. } => Some(line.paint_bounds()),
-            Self::SvgTextOutline { paths, .. } => svg_text_outline_bounds(paths),
+            Self::SvgTextOutline { content, .. } => content.bounds,
             Self::Path(path) => path_bounds(path),
         }
     }
 }
 
-fn svg_text_outline_bounds(paths: &[RenderedPath]) -> Option<PaintClip> {
-    let mut bounds: Option<PaintBounds> = None;
-    for path_bounds in paths.iter().filter_map(path_bounds) {
-        match &mut bounds {
-            Some(bounds) => bounds.include_paint_rect(path_bounds.paint_rect()),
-            None => bounds = Some(PaintBounds::from_paint_rect(path_bounds.paint_rect())),
-        }
+impl ProjectiveRasterPrimitive {
+    fn translated(mut self, offset: PaintTranslation) -> Self {
+        self.visible_polygon = self
+            .visible_polygon
+            .into_iter()
+            .map(|point| offset.transform_point(point))
+            .collect();
+        self.source = match self.source {
+            ProjectiveRasterSource::Image(image) => {
+                ProjectiveRasterSource::Image(image.translated(offset))
+            }
+            ProjectiveRasterSource::ImagePattern(pattern) => {
+                ProjectiveRasterSource::ImagePattern(pattern.translated(offset))
+            }
+        };
+        self
     }
-    bounds.map(PaintBounds::into_paint_clip)
+
+    fn bounds(&self) -> Option<PaintClip> {
+        let mut points = self.visible_polygon.iter().copied();
+        let first = points.next()?;
+        let (mut min_x, mut max_x, mut min_y, mut max_y) = (first.x, first.x, first.y, first.y);
+        for point in points {
+            min_x = min_x.min(point.x);
+            max_x = max_x.max(point.x);
+            min_y = min_y.min(point.y);
+            max_y = max_y.max(point.y);
+        }
+        (min_x.is_finite() && max_x.is_finite() && min_y.is_finite() && max_y.is_finite())
+            .then(|| PaintClip::new(min_x, min_y, max_x - min_x, max_y - min_y))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::{PaintOperation, PaintPrimitive};
     use crate::CssColor;
     use crate::document::Page;
@@ -1302,6 +1369,10 @@ mod tests {
     };
     use crate::document::paint::patterns::{PaintPatternTiling, RenderedGradientPattern};
     use crate::document::paint::shapes::RenderedRect;
+    use crate::document::paint::text::{
+        RenderedGlyph, RenderedGlyphKind, RenderedLine, RenderedLineSource, RenderedTextMatrix,
+        RenderedTextRun,
+    };
 
     fn black_rect(x: f32) -> RenderedRect {
         RenderedRect::new(
@@ -1313,6 +1384,77 @@ mod tests {
             None,
             PaintStrokeWidth::ZERO,
         )
+    }
+
+    fn text_line(text: &str, x: f32) -> RenderedLine {
+        RenderedLine::new(
+            text.to_string(),
+            x,
+            20.0,
+            12.0,
+            Some(0),
+            CssColor::BLACK,
+            vec![RenderedTextRun {
+                text: Rc::from(text),
+                actual_text: None,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_matrix: RenderedTextMatrix::IDENTITY,
+                font_size: 12.0,
+                font_id: Some(0),
+                font_palette: crate::css::FontPalette::Normal,
+                glyphs: Some(
+                    text.chars()
+                        .map(|character| RenderedGlyph {
+                            kind: RenderedGlyphKind::Paint(1),
+                            x_advance: 7.0,
+                            nominal_x_advance: 7.0,
+                            x_offset: 0.0,
+                            y_offset: 0.0,
+                            unicode: character.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                glyph_source_ranges: None,
+            }],
+        )
+    }
+
+    #[test]
+    fn exact_text_paint_continuations_share_one_page_line() {
+        let mut page = Page::new(100.0, 100.0);
+        page.push_line(text_line("room", 10.0));
+        let mut ellipsis = text_line("…", 38.0);
+        ellipsis.source = RenderedLineSource::BlockEllipsis;
+        page.push_line(ellipsis);
+
+        assert_eq!(page.lines.len(), 1);
+        assert_eq!(page.lines[0].text, "room…");
+        assert_eq!(page.lines[0].runs.len(), 2);
+    }
+
+    #[test]
+    fn paint_operation_between_text_records_prevents_continuation_coalescing() {
+        let mut page = Page::new(100.0, 100.0);
+        page.push_line(text_line("room", 10.0));
+        page.push_rect_in_band(PaintBand::InFlowBlock, black_rect(38.0));
+        page.push_line(text_line("…", 38.0));
+
+        assert_eq!(page.lines.len(), 2);
+    }
+
+    #[test]
+    fn clipped_text_record_prevents_continuation_coalescing() {
+        let mut page = Page::new(100.0, 100.0);
+        page.push_line(text_line("room", 10.0));
+        page.push_line_clipped_in_band(
+            PaintBand::InFlowBlock,
+            text_line("…", 38.0),
+            PaintClip::new(38.0, 10.0, 7.0, 20.0),
+        );
+
+        assert_eq!(page.lines.len(), 2);
     }
 
     #[test]

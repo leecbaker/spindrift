@@ -64,6 +64,8 @@ pub(crate) fn parse_stylesheet_with_media_environment(
     let mut parsed_after_marker_rules = Vec::new();
     let mut parsed_before_rules = Vec::new();
     let mut parsed_after_rules = Vec::new();
+    let mut parsed_scroll_marker_rules = Vec::new();
+    let mut parsed_scroll_marker_group_rules = Vec::new();
     let mut parsed_footnote_call_rules = Vec::new();
     let mut parsed_footnote_marker_rules = Vec::new();
     let mut parsed_first_line_rules = Vec::new();
@@ -86,6 +88,8 @@ pub(crate) fn parse_stylesheet_with_media_environment(
             &mut parsed_after_marker_rules,
             &mut parsed_before_rules,
             &mut parsed_after_rules,
+            &mut parsed_scroll_marker_rules,
+            &mut parsed_scroll_marker_group_rules,
             &mut parsed_footnote_call_rules,
             &mut parsed_footnote_marker_rules,
             &mut parsed_first_line_rules,
@@ -141,6 +145,22 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         })
         .collect();
     let after_rules = parsed_after_rules
+        .into_iter()
+        .enumerate()
+        .map(|(order, mut rule)| {
+            rule.order = order;
+            rule
+        })
+        .collect();
+    let scroll_marker_rules = parsed_scroll_marker_rules
+        .into_iter()
+        .enumerate()
+        .map(|(order, mut rule)| {
+            rule.order = order;
+            rule
+        })
+        .collect();
+    let scroll_marker_group_rules = parsed_scroll_marker_group_rules
         .into_iter()
         .enumerate()
         .map(|(order, mut rule)| {
@@ -227,6 +247,8 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         after_marker_rules,
         before_rules,
         after_rules,
+        scroll_marker_rules,
+        scroll_marker_group_rules,
         footnote_call_rules,
         footnote_marker_rules,
         first_line_rules,

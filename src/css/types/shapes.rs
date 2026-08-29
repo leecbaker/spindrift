@@ -167,13 +167,17 @@ pub(crate) enum ShapeBox {
     Content,
 }
 
-/// Basic shapes implemented for the first CSS Shapes milestone.
+/// CSS Shapes basic shapes. Coordinates remain typed through cascade so the
+/// reference box selected by float layout supplies their percentage bases.
+/// <https://drafts.csswg.org/css-shapes/#basic-shape-functions>
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BasicShape {
     Inset(ShapeInset),
     Circle(ShapeCircle),
     Ellipse(ShapeEllipse),
     Polygon(ShapePolygon),
+    Path(ShapePath),
+    Shape(ShapeFunction),
 }
 
 impl BasicShape {
@@ -209,6 +213,8 @@ impl BasicShape {
                     point.y.resolve_root_font_metric_lengths(basis);
                 }
             }
+            Self::Path(_) => {}
+            Self::Shape(shape) => shape.resolve_root_font_metric_lengths(basis),
         }
     }
 
@@ -232,6 +238,8 @@ impl BasicShape {
             Self::Polygon(shape) => shape.vertices.iter().any(|point| {
                 point.x.requires_root_font_metrics() || point.y.requires_root_font_metrics()
             }),
+            Self::Path(_) => false,
+            Self::Shape(shape) => shape.requires_root_font_metrics(),
         }
     }
 }
@@ -319,6 +327,166 @@ pub(crate) enum ShapeFillRule {
 pub(crate) struct ShapePolygonPoint {
     pub(crate) x: ComputedLengthPercentage,
     pub(crate) y: ComputedLengthPercentage,
+}
+
+/// The SVG path data accepted by CSS Shapes `path()`. The SVG parser validates
+/// it at cascade time; retaining its authored coordinate stream keeps CSS-px
+/// coordinates distinct from reference-box-relative CSS lengths.
+/// <https://drafts.csswg.org/css-shapes/#funcdef-path>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShapePath {
+    pub(crate) fill_rule: ShapeFillRule,
+    pub(crate) data: String,
+}
+
+/// CSS Shapes Level 2 `shape()` value.
+/// <https://drafts.csswg.org/css-shapes-2/#shape-function>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShapeFunction {
+    pub(crate) fill_rule: ShapeFillRule,
+    pub(crate) origin: ShapePosition,
+    pub(crate) commands: Vec<ShapeCommand>,
+}
+
+impl ShapeFunction {
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.origin.resolve_root_font_metric_lengths(basis);
+        for command in &mut self.commands {
+            command.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        self.origin.requires_root_font_metrics()
+            || self
+                .commands
+                .iter()
+                .any(ShapeCommand::requires_root_font_metrics)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShapeCommandDirection {
+    To,
+    By,
+}
+
+/// A shape command keeps its direction rather than eagerly converting `by`
+/// into an absolute point: a percentage displacement is resolved against the
+/// used reference box independently on each physical axis.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ShapeCommand {
+    Move {
+        direction: ShapeCommandDirection,
+        point: ShapePosition,
+    },
+    Line {
+        direction: ShapeCommandDirection,
+        point: ShapePosition,
+    },
+    HorizontalLine {
+        direction: ShapeCommandDirection,
+        value: ComputedLengthPercentage,
+    },
+    VerticalLine {
+        direction: ShapeCommandDirection,
+        value: ComputedLengthPercentage,
+    },
+    Curve {
+        direction: ShapeCommandDirection,
+        point: ShapePosition,
+        control_start: ShapePosition,
+        control_end: ShapePosition,
+    },
+    Smooth {
+        direction: ShapeCommandDirection,
+        point: ShapePosition,
+        control_end: ShapePosition,
+    },
+    Arc {
+        direction: ShapeCommandDirection,
+        point: ShapePosition,
+        radius_x: ComputedLengthPercentage,
+        radius_y: ComputedLengthPercentage,
+        rotation_radians: f32,
+        large: bool,
+        clockwise: bool,
+    },
+    Close,
+}
+
+impl ShapeCommand {
+    fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        let resolve_point =
+            |point: &mut ShapePosition| point.resolve_root_font_metric_lengths(basis);
+        match self {
+            Self::Move { point, .. } | Self::Line { point, .. } => resolve_point(point),
+            Self::HorizontalLine { value, .. } | Self::VerticalLine { value, .. } => {
+                value.resolve_root_font_metric_lengths(basis)
+            }
+            Self::Curve {
+                point,
+                control_start,
+                control_end,
+                ..
+            } => {
+                resolve_point(point);
+                resolve_point(control_start);
+                resolve_point(control_end);
+            }
+            Self::Smooth {
+                point, control_end, ..
+            } => {
+                resolve_point(point);
+                resolve_point(control_end);
+            }
+            Self::Arc {
+                point,
+                radius_x,
+                radius_y,
+                ..
+            } => {
+                resolve_point(point);
+                radius_x.resolve_root_font_metric_lengths(basis);
+                radius_y.resolve_root_font_metric_lengths(basis);
+            }
+            Self::Close => {}
+        }
+    }
+
+    fn requires_root_font_metrics(&self) -> bool {
+        let point_requires = |point: &ShapePosition| point.requires_root_font_metrics();
+        match self {
+            Self::Move { point, .. } | Self::Line { point, .. } => point_requires(point),
+            Self::HorizontalLine { value, .. } | Self::VerticalLine { value, .. } => {
+                value.requires_root_font_metrics()
+            }
+            Self::Curve {
+                point,
+                control_start,
+                control_end,
+                ..
+            } => {
+                point_requires(point)
+                    || point_requires(control_start)
+                    || point_requires(control_end)
+            }
+            Self::Smooth {
+                point, control_end, ..
+            } => point_requires(point) || point_requires(control_end),
+            Self::Arc {
+                point,
+                radius_x,
+                radius_y,
+                ..
+            } => {
+                point_requires(point)
+                    || radius_x.requires_root_font_metrics()
+                    || radius_y.requires_root_font_metrics()
+            }
+            Self::Close => false,
+        }
+    }
 }
 
 /// A basic-shape center expressed as coordinates in its reference box.

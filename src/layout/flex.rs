@@ -3,6 +3,8 @@ use crate::units::{
     IntoLayoutLength, content_box_to_margin_box_length, layout_to_content_box_length,
 };
 
+mod alignment;
+mod baseline;
 mod children;
 mod compute;
 mod estimate;
@@ -10,9 +12,13 @@ mod layout;
 mod model;
 mod taffy;
 
+use alignment::*;
+use baseline::*;
 pub(in crate::layout) use children::flex_container_fragment_boundary_breaks;
 use children::*;
 pub(in crate::layout::flex) use compute::automatic_minimum_main_content_size;
+use estimate::estimated_outer_cross_size;
+pub(in crate::layout) use layout::flex_gap_decoration_primitives_with_gutters;
 use model::*;
 use taffy::*;
 
@@ -42,10 +48,8 @@ impl FlexIntrinsicWidthContributions {
 impl<'a> LayoutBuilder<'a> {
     fn flex_container_height_percentage_basis(&self) -> BlockSizePercentageBasis {
         let stack_basis = self
-            .definite_block_size_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(PercentageBasis::indefinite);
+            .block_percentage_context_stack
+            .current_percentage_basis();
         flex_container_height_percentage_basis_for_context(
             stack_basis,
             self.current_child_available_space()
@@ -231,10 +235,10 @@ impl<'a> LayoutBuilder<'a> {
         // item's preferred main size.
         // <https://www.w3.org/TR/css-flexbox-1/#definite-sizes>
         // <https://drafts.csswg.org/css-sizing-3/#percentage-sizing>
-        self.definite_block_size_stack
-            .push(basis.descendant_percentage_basis());
+        self.block_percentage_context_stack
+            .push_percentage_basis(basis.descendant_percentage_basis());
         let result = layout(self);
-        self.definite_block_size_stack.pop();
+        self.block_percentage_context_stack.pop();
         result
     }
 

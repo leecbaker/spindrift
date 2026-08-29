@@ -132,7 +132,8 @@ impl TablePartUsedStyle {
             strip_table_part_margin_and_padding(layout);
             layout.border_width = 0.0;
             layout.border_widths = css::Edges::ZERO;
-            layout.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
+            layout.border_width_values =
+                css::PhysicalEdges::all(css::ComputedLengthPercentage::ZERO);
             layout.border_styles = css::BorderStyles::NONE;
         });
         Self {
@@ -154,7 +155,7 @@ impl TablePartUsedStyle {
 fn strip_table_part_margin_and_padding(style: &mut ComputedStyle) {
     style.margin = css::Edges::ZERO;
     style.padding = css::Edges::ZERO;
-    style.box_values.padding = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
+    style.box_values.padding = css::PhysicalEdges::all(css::ComputedLengthPercentage::ZERO);
 }
 
 impl TableStyleSource for TablePartUsedStyle {
@@ -628,11 +629,11 @@ mod tests {
         style.margin = edges(7.0);
         style.padding = edges(5.0);
         style.box_values.padding =
-            css::CssEdges::all(css::ComputedLengthPercentage::from_points(5.0));
+            css::PhysicalEdges::all(css::ComputedLengthPercentage::from_points(5.0));
         style.border_width = 3.0;
         style.border_widths = edges(3.0);
         style.border_width_values =
-            css::CssEdges::all(css::ComputedLengthPercentage::from_points(3.0));
+            css::PhysicalEdges::all(css::ComputedLengthPercentage::from_points(3.0));
         style.border_styles = css::BorderStyles {
             top: css::BorderStyle::Solid,
             right: css::BorderStyle::Solid,

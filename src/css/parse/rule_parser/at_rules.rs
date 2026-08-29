@@ -27,6 +27,8 @@ pub(super) fn collect_container_style_rules(
         | ParsedCssRule::AfterMarker(_)
         | ParsedCssRule::Before(_)
         | ParsedCssRule::After(_)
+        | ParsedCssRule::ScrollMarker(_)
+        | ParsedCssRule::ScrollMarkerGroup(_)
         | ParsedCssRule::FootnoteCall(_)
         | ParsedCssRule::FootnoteMarker(_)
         | ParsedCssRule::FirstLine(_)

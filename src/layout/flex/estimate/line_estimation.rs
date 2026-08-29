@@ -1,5 +1,37 @@
 use super::*;
-use crate::layout::flex::compute::FlexBaselineSet;
+
+/// Return an estimated flex item's outer cross-size contribution.
+///
+/// Line collection uses the estimate's content-box metric plus its physical
+/// padding, borders, and margins; final layout uses the corresponding item
+/// rectangle helper instead.
+pub(in crate::layout::flex) fn estimated_outer_cross_size(
+    style: &ComputedStyle,
+    estimate: FlexItemEstimate,
+    physical_direction: FlexDirection,
+) -> LayoutLength {
+    let borders = used_border_widths(style);
+    layout_pt(
+        if physical_direction.is_row_axis() {
+            estimate.height.points()
+                + style.padding.top
+                + style.padding.bottom
+                + borders.top
+                + borders.bottom
+                + style.margin.top
+                + style.margin.bottom
+        } else {
+            estimate.width.points()
+                + style.padding.left
+                + style.padding.right
+                + borders.left
+                + borders.right
+                + style.margin.left
+                + style.margin.right
+        }
+        .max(0.0),
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::flex) struct EstimatedFlexBaselineItem {

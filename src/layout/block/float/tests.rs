@@ -628,6 +628,41 @@ fn content_band_uses_polygon_outermost_edge_but_placement_keeps_margin_box() {
 }
 
 #[test]
+fn right_float_content_band_uses_the_clipped_shape_area_slab() {
+    let mut polygon = shape(Float::Right, 0, 100.0, 300.0, 100.0, 0.0);
+    polygon.area = FloatArea::new(
+        FloatContour::Polygon {
+            vertices: vec![
+                PageTopPoint::new(140.0, 80.0),
+                PageTopPoint::new(260.0, 80.0),
+                PageTopPoint::new(260.0, 20.0),
+                PageTopPoint::new(140.0, 20.0),
+            ],
+            fill_rule: crate::css::ShapeFillRule::NonZero,
+        },
+        20.0,
+    )
+    .with_margin_clip(polygon.rect);
+    let context = FloatContext {
+        shapes: vec![polygon],
+    };
+    let slab = PageBlockSpan::new(80.0, 20.0);
+    let containing = PageInlineSpan::from_edges(0.0, 300.0);
+
+    // CSS 2.2 placement is still constrained by the float's whole margin
+    // rectangle. The wrapping line, however, ends at the contour's left
+    // edge, after its 20pt shape-margin and margin-box clip.
+    assert_eq!(
+        context.band(0, slab, containing),
+        FloatBand::from_edges(0.0, 100.0)
+    );
+    assert_eq!(
+        context.content_band(0, slab, containing),
+        FloatBand::from_edges(0.0, 120.0)
+    );
+}
+
+#[test]
 fn raster_alpha_shape_margin_offsets_opaque_pixel_cells() {
     let mut image = shape(Float::Left, 0, 0.0, 100.0, 100.0, 0.0);
     let content_rect = crate::layout::PageTopRect::new(0.0, 100.0, 100.0, 100.0);

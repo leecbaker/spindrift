@@ -806,6 +806,7 @@ impl FontSystem {
         fonts
     }
 
+    #[cfg(test)]
     pub(crate) fn document_font_from_query_font(
         &mut self,
         font: FontiqueQueryFont,

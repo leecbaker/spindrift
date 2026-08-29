@@ -18,7 +18,10 @@ track-sizing pass is authoritative for repeated and end implicit tracks: the
 hypothetical counting breadths never enlarge used geometry. That pass hands
 its already aligned offsets directly to Grid Lanes; expanding them back to
 source lines gives collapsed tracks zero extent and never stretches or aligns
-the source topology a second time.
+the source topology a second time. The two gutters bordering an interior
+collapsed run overlap into one gutter between its bounding active tracks;
+outer collapsed runs leave no gutter. An occupied zero-breadth track remains
+active and retains its adjacent gutters.
 
 Repeated line names and source-line provenance remain available for authored
 placement even though final sizing uses the active topology. End implicit
@@ -52,7 +55,9 @@ tracks rather than a one-track default span.
 When that area is a subgrid axis, the child retains the used parent track
 slice and its intervening gutters; descendant placement uses hypothetical
 lines but cannot create child-owned inherited tracks. The subgrid's other
-axis remains an ordinary Grid axis and uses its local gap.
+axis remains an ordinary Grid axis and uses its local gap. Grid item min/max
+constraints are resolved to scalar track-sizing values before Taffy layout,
+including the HTML fieldset UA rule `min-inline-size: min-content`.
 
 ## Positioned descendants and outline paint
 

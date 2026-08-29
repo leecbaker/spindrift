@@ -8,7 +8,9 @@ use super::geometry::{
     Affine3dPaintTransform, PaintClip, PaintPoint, PaintTransform, PaintTranslation,
     ProjectedPlane, Projective3dPaintTransform,
 };
-use super::page::{PaintOperation, PaintPrimitive};
+use super::page::{
+    PaintOperation, PaintPrimitive, ProjectiveRasterPrimitive, ProjectiveRasterSource,
+};
 use super::paths::{RenderedPath, RenderedPathCommand, RenderedPathFillRule};
 use super::stacking::PaintStackingContext;
 use crate::document::Page;
@@ -305,8 +307,43 @@ fn lower_projective_primitive(
                 ))
             })
         }
+        PaintPrimitive::Image(image) => {
+            lower_projective_raster(ProjectiveRasterSource::Image(image), transform)
+                .map(PaintPrimitive::ProjectiveRaster)
+        }
+        PaintPrimitive::ImagePattern(pattern) => {
+            lower_projective_raster(ProjectiveRasterSource::ImagePattern(pattern), transform)
+                .map(PaintPrimitive::ProjectiveRaster)
+        }
         primitive => Some(primitive),
     }
+}
+
+/// Keep raster sources paired with their finite projected coverage until the
+/// PDF backend lowers them. Unlike solid rectangles, an image cannot be
+/// converted to a path without losing its samples.
+fn lower_projective_raster(
+    source: ProjectiveRasterSource,
+    transform: Projective3dPaintTransform,
+) -> Option<ProjectiveRasterPrimitive> {
+    let rect = match &source {
+        ProjectiveRasterSource::Image(image) => image.paint_rect(),
+        ProjectiveRasterSource::ImagePattern(pattern) => pattern.paint_rect(),
+    };
+    let polygon = project_plane_polygon(
+        transform,
+        &[
+            rect.origin,
+            PaintPoint::new(rect.max_x(), rect.min_y()),
+            PaintPoint::new(rect.max_x(), rect.max_y()),
+            PaintPoint::new(rect.min_x(), rect.max_y()),
+        ],
+    )?;
+    Some(ProjectiveRasterPrimitive {
+        source,
+        visible_polygon: polygon,
+        source_transform: transform,
+    })
 }
 
 /// PDF link annotations are rectangular, so a projective link is represented
@@ -1998,8 +2035,12 @@ pub(crate) struct PagePaintTree {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
     use crate::document::paint::contours::OverflowClipEffect;
+    use crate::document::paint::images::RenderedImage;
+    use crate::document::paint::page::{ProjectiveRasterPrimitive, ProjectiveRasterSource};
     use crate::document::paint::shapes::RenderedRect;
     use crate::document::paint::stacking::StackLevel;
 
@@ -2044,6 +2085,38 @@ mod tests {
             items.as_slice(),
             [PaintDisplayItem::Operation(PaintOperation::Image(0))]
         ));
+    }
+
+    #[test]
+    fn projective_raster_clips_at_viewer_and_keeps_finite_visible_polygon() {
+        let image = RenderedImage::from_paint_rect(
+            PaintClip::new(-2.0, -1.0, 2.0, 2.0).paint_rect(),
+            false,
+            1,
+            1,
+            None,
+            crate::document::paint::images::RasterSampling::Auto,
+            Rc::from([255, 0, 0]),
+            None,
+            None,
+        );
+        let transform = Projective3dPaintTransform::from_transform(euclid::Transform3D::new(
+            1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ));
+
+        let ProjectiveRasterPrimitive {
+            source,
+            visible_polygon,
+            ..
+        } = lower_projective_raster(ProjectiveRasterSource::Image(image), transform)
+            .expect("the w > 0 side remains visible");
+        assert!(matches!(source, ProjectiveRasterSource::Image(_)));
+        assert!(visible_polygon.len() >= 3);
+        assert!(
+            visible_polygon
+                .iter()
+                .all(|point| point.x.is_finite() && point.y.is_finite())
+        );
     }
 
     #[test]

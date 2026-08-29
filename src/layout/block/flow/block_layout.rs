@@ -273,6 +273,7 @@ impl<'a> LayoutBuilder<'a> {
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         descendant_percentage_height_basis: Option<BlockSizePercentageBasis>,
+        descendant_percentage_height_context: Option<DescendantBlockPercentageContext>,
         replayed_item_logical_inline_size: Option<LogicalInlineContentSize>,
         principal_box_paint_mode: PrincipalBoxPaintMode,
         replay_height: PostLayoutHeightReplay,
@@ -290,6 +291,7 @@ impl<'a> LayoutBuilder<'a> {
             run_in_children,
             child_boxes,
             descendant_percentage_height_basis,
+            descendant_percentage_height_context,
             replayed_item_logical_inline_size,
             principal_box_paint_mode,
         );
@@ -405,6 +407,7 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             None,
             None,
+            None,
             PrincipalBoxPaintMode::RootPaints,
         );
     }
@@ -418,6 +421,7 @@ impl<'a> LayoutBuilder<'a> {
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         descendant_percentage_height_basis: Option<BlockSizePercentageBasis>,
+        descendant_percentage_height_context: Option<DescendantBlockPercentageContext>,
         replayed_item_logical_inline_size: Option<LogicalInlineContentSize>,
         principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
@@ -649,6 +653,7 @@ impl<'a> LayoutBuilder<'a> {
                     run_in_children,
                     child_boxes,
                     descendant_percentage_height_basis,
+                    descendant_percentage_height_context,
                     replayed_item_logical_inline_size,
                     probe,
                     geometry.vertical_non_content,
@@ -666,8 +671,11 @@ impl<'a> LayoutBuilder<'a> {
         let may_need_post_layout_constraint_replay = geometry.definite_content_height.is_none()
             && (used_min_height(&geometry.style, geometry.containing_block_content_height)
                 .is_some()
-                || used_max_height(&geometry.style, geometry.containing_block_content_height)
-                    .is_some());
+                || used_non_replaced_max_height(
+                    &geometry.style,
+                    geometry.containing_block_percentage_context,
+                )
+                .is_some());
         *post_layout_constraint_replay_snapshot =
             may_need_post_layout_constraint_replay.then(|| Box::new(self.snapshot()));
         self.begin_clamp_line_slot_capture();
@@ -796,32 +804,35 @@ impl<'a> LayoutBuilder<'a> {
         // definite content height.
         // <https://drafts.csswg.org/css-flexbox/#definite-sizes> and
         // <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>
-        let preparatory_descendant_percentage_basis = descendant_percentage_height_basis
+        let preparatory_descendant_percentage_context = descendant_percentage_height_context
+            .or_else(|| {
+                descendant_percentage_height_basis
+                    .map(DescendantBlockPercentageContext::from_percentage_basis)
+            })
             .unwrap_or_else(|| {
-                block_size_percentage_basis_from_points(
+                DescendantBlockPercentageContext::formatting_context(
                     geometry
                         .definite_content_height
-                        .map(|height| height.value().points()),
+                        .map(|height| height.value().content_box_length()),
                     BlockSizeBasisSource::ContainingBlock,
                 )
             });
-        let preparatory_descendant_percentage_basis = if preparatory_descendant_percentage_basis
+        let preparatory_descendant_percentage_context = if preparatory_descendant_percentage_context
             .is_definite()
             || element.document_compatibility_mode != dom::DocumentCompatibilityMode::Quirks
         {
-            preparatory_descendant_percentage_basis
+            preparatory_descendant_percentage_context
         } else {
             // HTML's documented parsing modes, rather than source-text
             // inference, select this browser-compatible quirks behavior.
             // Preserve a definite ancestor block basis through auto-height
             // wrappers only in a quirks document.
-            self.definite_block_size_stack
-                .last()
-                .cloned()
-                .unwrap_or(preparatory_descendant_percentage_basis)
+            self.block_percentage_context_stack.current_context()
         };
-        self.definite_block_size_stack
-            .push(preparatory_descendant_percentage_basis);
+        let preparatory_descendant_percentage_basis =
+            preparatory_descendant_percentage_context.percentage_basis();
+        self.block_percentage_context_stack
+            .push_context(preparatory_descendant_percentage_context);
         let defer_own_decoration_promotion = self.defer_next_block_decoration_promotion;
         self.defer_next_block_decoration_promotion = false;
         let mut suppress_own_principal_box_decoration = !principal_box_paint_mode.root_paints();
@@ -942,6 +953,9 @@ impl<'a> LayoutBuilder<'a> {
         // set, or the descendant contribution is applied a second time.
         let inherited_adjoining_start_margin =
             self.inherited_adjoining_start_margins.last().copied();
+        let inherited_float_replay_clearance_boundary =
+            self.current_float_replay_clearance_boundary();
+        let mut introduced_float_replay_clearance_boundary = None;
         let descendant_applied_start_margin = inherited_adjoining_start_margin
             .map(InheritedAdjoiningStartMargin::complete_margin)
             .unwrap_or(applied_start_margin);
@@ -975,6 +989,11 @@ impl<'a> LayoutBuilder<'a> {
                     })
                     .flatten(),
             ));
+            if clearance.clearance.is_introduced() {
+                introduced_float_replay_clearance_boundary = Some(
+                    FloatReplayClearanceBoundary::new(clearance.used_border_edge),
+                );
+            }
             let start_margin_arrangement = match clearance.clearance {
                 BlockClearance::NotIntroduced => BlockStartMarginArrangement::Adjoining {
                     applied_start_margin: descendant_applied_start_margin,
@@ -1006,6 +1025,11 @@ impl<'a> LayoutBuilder<'a> {
             BlockStartMarginArrangement::Adjoining {
                 applied_start_margin: descendant_applied_start_margin,
             }
+        };
+        let float_replay_clearance_boundary = if establishes_independent_bfc {
+            None
+        } else {
+            introduced_float_replay_clearance_boundary.or(inherited_float_replay_clearance_boundary)
         };
         if establishes_independent_bfc && geometry.style.float == Float::None {
             // A BFC root's `clear` is resolved from its hypothetical margin
@@ -1231,6 +1255,7 @@ impl<'a> LayoutBuilder<'a> {
         );
         let vertical_extras = vertical_non_content.points();
         let containing_block_content_height = geometry.containing_block_content_height;
+        let containing_block_percentage_context = geometry.containing_block_percentage_context;
         let containing_block_height_basis = containing_block_content_height;
         let definite_content_height_for_children = geometry.definite_content_height;
         let definite_content_height =
@@ -1702,19 +1727,29 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 content_logical_inline_size
             };
-            own_inline_span.max(
-                containing_block_content_height
-                    .points()
-                    .map(|height| (height - vertical_extras).max(0.0))
-                    .unwrap_or(0.0)
-                    .max(
-                        self.content_logical_inline_size_stack
-                            .last()
-                            .copied()
-                            .map(|height| (height - vertical_extras).max(0.0))
-                            .unwrap_or(0.0),
-                    ),
-            )
+            if vertical_inline_size_is_definite {
+                // A specified physical height is the vertical box's definite
+                // logical inline span.  The ancestor measure is a fallback
+                // only for an auto-sized parent; taking the maximum here
+                // would incorrectly expand (for example) `height: 100px` to
+                // the initial containing block's height when establishing an
+                // abspos static-position alignment container.
+                own_inline_span
+            } else {
+                own_inline_span.max(
+                    containing_block_content_height
+                        .points()
+                        .map(|height| (height - vertical_extras).max(0.0))
+                        .unwrap_or(0.0)
+                        .max(
+                            self.content_logical_inline_size_stack
+                                .last()
+                                .copied()
+                                .map(|height| (height - vertical_extras).max(0.0))
+                                .unwrap_or(0.0),
+                        ),
+                )
+            }
         } else {
             definite_content_height.unwrap_or_else(|| {
                 containing_block_content_height
@@ -2355,34 +2390,35 @@ impl<'a> LayoutBuilder<'a> {
                     .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
             });
         let children_outcome =
-            self.layout_prepared_block_children(Box::new(BlockFlowChildrenPhaseInput {
-                fragmentainer_kind,
-                element,
-                style,
-                stylesheets,
-                child_boxes,
-                can_collapse_start_margin,
-                can_collapse_end_margin,
-                start_margin_arrangement,
-                starts_at_page_top,
-                laid_out_column_children,
-                traversal_mode,
-                run_in_inline_items_laid_out,
-                has_preceding_inline_flow_content: has_collectable_inline_content
-                    && !matches!(traversal_mode, ChildTraversalMode::OrderedMixed),
-                preceding_inline_local_cutoff,
-                preceding_inline_clamp_block_advance,
-                discard_region_limit: None,
-                direct_automatic_block_size_constraint:
-                    super::children::state::direct_automatic_block_size_constraint(style),
-                definite_content_height: definite_content_height_for_children,
-                descendant_percentage_height_basis,
-            }));
+            self.with_float_replay_clearance_scope(float_replay_clearance_boundary, |layout| {
+                layout.layout_prepared_block_children(Box::new(BlockFlowChildrenPhaseInput {
+                    fragmentainer_kind,
+                    element,
+                    style,
+                    stylesheets,
+                    child_boxes,
+                    can_collapse_start_margin,
+                    can_collapse_end_margin,
+                    start_margin_arrangement,
+                    starts_at_page_top,
+                    laid_out_column_children,
+                    traversal_mode,
+                    run_in_inline_items_laid_out,
+                    has_preceding_inline_flow_content: has_collectable_inline_content
+                        && !matches!(traversal_mode, ChildTraversalMode::OrderedMixed),
+                    preceding_inline_local_cutoff,
+                    preceding_inline_clamp_block_advance,
+                    discard_region_limit: None,
+                    direct_automatic_block_size_constraint:
+                        super::children::state::direct_automatic_block_size_constraint(style),
+                    descendant_percentage_height_context: preparatory_descendant_percentage_context,
+                }))
+            });
         #[cfg(all(feature = "stack-profile", target_os = "macos"))]
         let _stack_profile_scope = stack_profile::enter("finish_prepared_block_layout");
         self.normal_flow_relative_containing_blocks.pop();
         self.static_position_containing_blocks.pop();
-        self.definite_block_size_stack.pop();
+        self.block_percentage_context_stack.pop();
         if has_pending_outside_marker_anchor {
             self.finish_outside_marker_anchor();
         }
@@ -2540,7 +2576,7 @@ impl<'a> LayoutBuilder<'a> {
             self.cursor_y = content_top - content_logical_inline_size;
         } else if definite_content_height.is_some()
             || used_min_height(style, containing_block_height_basis).is_some()
-            || used_max_height(style, containing_block_height_basis).is_some()
+            || used_non_replaced_max_height(style, containing_block_percentage_context).is_some()
             || style.box_values.min_height == css::ComputedLengthPercentageOrAuto::Stretch
             || style.box_values.max_height == css::ComputedLengthPercentageOrAuto::Stretch
             || height_depends_on_intrinsic_content
@@ -2615,9 +2651,9 @@ impl<'a> LayoutBuilder<'a> {
             let mut requested_content_height = definite_content_height
                 .or(aspect_ratio_preferred_height)
                 .unwrap_or_else(|| {
-                    used_content_box_height_or_auto_with_basis(
+                    used_non_replaced_content_box_height_or_auto(
                         style,
-                        containing_block_content_height,
+                        containing_block_percentage_context,
                         vertical_non_content,
                     )
                     .map(SemanticLengthExt::points)
@@ -2661,22 +2697,22 @@ impl<'a> LayoutBuilder<'a> {
                 requested_content_height = requested_content_height.max(measured_content_height);
             }
             let height = if height_depends_on_intrinsic_content {
-                constrain_height_with_intrinsic(
+                constrain_non_replaced_height_with_intrinsic(
                     style,
                     content_box_pt(requested_content_height),
                     content_box_pt(current_content_height),
                     content_box_pt(current_content_height),
-                    containing_block_height_basis,
+                    containing_block_percentage_context,
                     non_content_pt(vertical_extras),
                 )
                 .points()
             } else {
                 containing_block_content_height.points().map_or_else(
                     || {
-                        constrain_content_height(
+                        constrain_non_replaced_content_height(
                             style,
                             content_box_pt(requested_content_height),
-                            containing_block_height_basis,
+                            containing_block_percentage_context,
                         )
                         .points()
                     },
@@ -2735,6 +2771,7 @@ impl<'a> LayoutBuilder<'a> {
                     run_in_children,
                     child_boxes,
                     Some(preparatory_descendant_percentage_basis),
+                    Some(preparatory_descendant_percentage_context),
                     replayed_item_logical_inline_size,
                     principal_box_paint_mode,
                     replay_height,
@@ -2988,7 +3025,20 @@ impl<'a> LayoutBuilder<'a> {
                     continue;
                 }
                 if let Some(bounds) = self.pages[slice.page_index].paint_fragment().bounds() {
-                    slice.bottom = slice.bottom.max(bounds.y());
+                    let committed_bottom = slice.bottom.max(bounds.y());
+                    // Even an otherwise empty leading fragment owns its
+                    // block-start edge. Keep enough of that fragment to
+                    // paint its border and padding instead of trimming it to
+                    // zero when a descendant takes a forced break before it
+                    // produces any paint in this fragmentainer.
+                    // <https://www.w3.org/TR/css-break-3/#break-decoration>
+                    let leading_decoration_bottom =
+                        slice.top - (style.padding.top + border_widths.top);
+                    slice.bottom = if slice.owns_block_start {
+                        committed_bottom.min(leading_decoration_bottom)
+                    } else {
+                        committed_bottom
+                    };
                 }
             }
         }
@@ -4274,6 +4324,7 @@ impl<'a> LayoutBuilder<'a> {
         run_in_children: &[box_tree::FormattingBox<'_>],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         descendant_percentage_height_basis: Option<BlockSizePercentageBasis>,
+        descendant_percentage_height_context: Option<DescendantBlockPercentageContext>,
         replayed_item_logical_inline_size: Option<LogicalInlineContentSize>,
         probe: DeferredDescendantOverflowProbe,
         vertical_non_content: NonContentLength,
@@ -4293,6 +4344,7 @@ impl<'a> LayoutBuilder<'a> {
             run_in_children,
             child_boxes,
             descendant_percentage_height_basis,
+            descendant_percentage_height_context,
             replayed_item_logical_inline_size,
             principal_box_paint_mode,
         );

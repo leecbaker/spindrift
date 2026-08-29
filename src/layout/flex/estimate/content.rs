@@ -478,10 +478,8 @@ impl<'a> LayoutBuilder<'a> {
         };
         self.with_ancestor_signature(signature.clone(), |layout| {
             let containing_height_basis = layout
-                .definite_block_size_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(PercentageBasis::indefinite);
+                .block_percentage_context_stack
+                .current_percentage_basis();
             layout.estimate_element_children_min_content_block_size(
                 element,
                 &child.style,
@@ -763,7 +761,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-box-3/#margin-terms>.
         measured_style.margin = css::Edges::ZERO;
         measured_style.box_values.margin =
-            css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
+            css::PhysicalEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
         // `content_width` is a used flex-item content-box width. Freeze it
         // on the measurement surrogate before using that same width as its
         // containing block; otherwise an authored percentage width would be

@@ -18,36 +18,79 @@ async fn renders_hello_world_pdf() {
 }
 
 #[tokio::test]
-async fn inline_svg_text_is_a_native_document_text_run() {
+async fn nested_scroll_marker_rules_do_not_turn_a_vertical_scroller_into_a_grid() {
+    Html::from_string(
+        r#"<style>
+            .scroller {
+              width: 200px; height: 200px; position: relative;
+              scroll-marker-group: after; overflow: scroll;
+              &::scroll-marker-group {
+                height: 100px; width: 200px; display: grid;
+                grid-auto-flow: column;
+              }
+            }
+            .vertical { writing-mode: vertical-lr }
+            .target {
+              position: absolute; width: 50px; height: 50px;
+              &::scroll-marker {
+                content: ""; display: inline-block; width: 40px; height: 40px;
+              }
+            }
+          </style>
+          <div class="scroller vertical"><div class="target">target</div></div>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .expect("nested scroll-marker rules must render without recursive layout");
+}
+
+#[tokio::test]
+async fn inline_svg_text_is_an_outlined_actual_text_fallback() {
     let document = Html::from_string(
         r#"<style>@page { size: 160pt 80pt; margin: 0 } body { margin: 0 }</style>
            <svg width="120" height="30" xmlns="http://www.w3.org/2000/svg">
-             <text x="4" y="20" font-family="sans-serif" font-size="16">SVG shared text</text>
+             <text x="4" y="20" font-family="Ahem" font-size="16">SVG shared text</text>
            </svg>"#,
     )
     .render(&RenderOptions::default())
     .await
     .unwrap();
 
-    assert!(
-        document.pages[0]
-            .lines()
-            .iter()
-            .any(|line| line.text == "SVG shared text"),
-        "lines={:?}",
-        document.pages[0]
-            .lines()
-            .iter()
-            .map(|line| &line.text)
-            .collect::<Vec<_>>()
-    );
+    assert!(document.pages[0].lines().is_empty());
     let pdf = document
         .write_pdf_bytes(&crate::PdfOptions::default())
         .unwrap();
     let rendered = pdf_searchable_text(&pdf);
-    assert!(rendered.contains("/Subtype /Type0"));
-    assert!(rendered.contains("/ToUnicode"));
-    assert!(rendered.contains("BT\n"));
+    assert!(
+        rendered.contains("/ActualText (SVG shared text)"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("BT\n"), "{rendered}");
+}
+
+#[tokio::test]
+async fn svg_actual_text_concatenates_tspan_chunks_in_document_order() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 160pt 80pt; margin: 0 } body { margin: 0 }</style>
+           <svg width="120" height="30" xmlns="http://www.w3.org/2000/svg">
+             <text x="4" y="20" font-family="Ahem" font-size="16">one<tspan> two</tspan><tspan> three</tspan></text>
+           </svg>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(document.pages[0].lines().is_empty());
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    assert_eq!(
+        rendered.matches("/ActualText (one two three)").count(),
+        1,
+        "{rendered}"
+    );
+    assert!(!rendered.contains("BT\n"), "{rendered}");
 }
 
 #[tokio::test]
@@ -82,7 +125,7 @@ async fn gradient_svg_text_uses_one_actual_text_outline_fallback() {
 }
 
 #[tokio::test]
-async fn replaced_svg_image_text_uses_the_document_font_system() {
+async fn replaced_svg_image_text_uses_an_actual_text_outline_fallback() {
     let svg = base64::engine::general_purpose::STANDARD.encode(
         br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="30"><text x="4" y="20" font-size="16">SVG image text</text></svg>"#,
     );
@@ -93,37 +136,11 @@ async fn replaced_svg_image_text_uses_the_document_font_system() {
     .await
     .unwrap();
 
-    assert!(
-        document.pages[0]
-            .lines()
-            .iter()
-            .any(|line| line.text == "SVG image text")
-    );
-}
-
-#[tokio::test]
-async fn html_and_svg_text_share_the_same_document_font() {
-    let document = Html::from_string(
-        r#"<style>@page { size: 160pt 100pt; margin: 0 } body { margin: 0; font-family: sans-serif }</style>
-           <p>HTML font</p>
-           <svg width="120" height="30" xmlns="http://www.w3.org/2000/svg">
-             <text x="4" y="20" font-family="sans-serif" font-size="16">SVG font</text>
-           </svg>"#,
-    )
-    .render(&RenderOptions::default())
-    .await
-    .unwrap();
-    let html = document.pages[0]
-        .lines()
-        .iter()
-        .find(|line| line.text == "HTML font")
-        .expect("HTML line");
-    let svg = document.pages[0]
-        .lines()
-        .iter()
-        .find(|line| line.text == "SVG font")
-        .expect("SVG line");
-    assert_eq!(html.runs[0].font_id, svg.runs[0].font_id);
+    assert!(document.pages[0].lines().is_empty());
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    assert!(pdf_searchable_text(&pdf).contains("/ActualText (SVG image text)"));
 }
 
 #[tokio::test]

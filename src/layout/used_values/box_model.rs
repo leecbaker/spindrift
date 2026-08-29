@@ -297,7 +297,7 @@ pub(in crate::layout) fn synchronize_resolved_fixed_box_edge_cache(style: &mut C
 /// <https://www.w3.org/TR/css-grid-1/#grid-item-placement>.
 pub(in crate::layout) fn suppress_replayed_item_margins(style: &mut ComputedStyle) {
     style.margin = css::Edges::ZERO;
-    style.box_values.margin = css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
+    style.box_values.margin = css::PhysicalEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
 }
 
 /// Freezes an item's already-resolved physical padding for normal-flow replay.
@@ -313,7 +313,7 @@ pub(in crate::layout) fn freeze_replayed_item_padding(
     padding: css::Edges,
 ) {
     style.padding = padding;
-    style.box_values.padding = css::CssEdges {
+    style.box_values.padding = css::PhysicalEdges {
         top: css::ComputedLengthPercentage::from_points(padding.top),
         right: css::ComputedLengthPercentage::from_points(padding.right),
         bottom: css::ComputedLengthPercentage::from_points(padding.bottom),

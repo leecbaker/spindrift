@@ -348,7 +348,7 @@ pub(in crate::layout) fn page_margin_inline_content_style(style: &ComputedStyle)
     inline_style.padding = css::Edges::ZERO;
     inline_style.border_width = 0.0;
     inline_style.border_widths = css::Edges::ZERO;
-    inline_style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
+    inline_style.border_width_values = css::PhysicalEdges::all(css::ComputedLengthPercentage::ZERO);
     inline_style.border_styles = css::BorderStyles::NONE;
     inline_style.border_radius = css::BorderRadius::ZERO;
     inline_style.corner_shapes = css::CornerShapes::ROUND;

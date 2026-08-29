@@ -521,6 +521,16 @@ pub(in crate::css) fn apply_cascaded_text_declaration(
             "always" => style.scroll_snap_stop = ScrollSnapStop::Always,
             _ => {}
         },
+        "scroll-target-group" => match value.trim().to_ascii_lowercase().as_str() {
+            "none" => style.scroll_target_group = ScrollTargetGroup::None,
+            "auto" => style.scroll_target_group = ScrollTargetGroup::Auto,
+            _ => {}
+        },
+        "scroll-marker-group" => {
+            if let Some(value) = parse_scroll_marker_group(value) {
+                style.scroll_marker_group = value;
+            }
+        }
         "scroll-padding-top" => set_scroll_padding_side(value, style.font_size, |edge| {
             style.scroll_padding.top = edge;
         }),
@@ -614,6 +624,25 @@ fn parse_scrollbar_gutter(value: &str) -> Option<ScrollbarGutter> {
         }
         _ => None,
     }
+}
+
+fn parse_scroll_marker_group(value: &str) -> Option<Option<ScrollMarkerGroup>> {
+    let parts = split_css_component_values(value);
+    if parts.as_slice() == ["none"] {
+        return Some(None);
+    }
+    let mut placement = None;
+    let mut mode = ScrollMarkerGroupMode::Links;
+    for part in parts {
+        match part.to_ascii_lowercase().as_str() {
+            "before" if placement.is_none() => placement = Some(ScrollMarkerGroupPlacement::Before),
+            "after" if placement.is_none() => placement = Some(ScrollMarkerGroupPlacement::After),
+            "links" => mode = ScrollMarkerGroupMode::Links,
+            "tabs" => mode = ScrollMarkerGroupMode::Tabs,
+            _ => return None,
+        }
+    }
+    placement.map(|placement| Some(ScrollMarkerGroup { placement, mode }))
 }
 
 fn parse_scroll_snap_type(value: &str) -> Option<ScrollSnapType> {

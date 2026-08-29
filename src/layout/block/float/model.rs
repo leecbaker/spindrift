@@ -370,7 +370,13 @@ impl FloatArea {
         self
     }
 
-    /// Horizontal outer edges occupied anywhere in a line slab.
+    /// Return the shape area's filled outer interval in one clipped physical
+    /// line slab, after applying `shape-margin` and the required margin-box
+    /// clip.
+    ///
+    /// This is the sole wrapping-geometry contract for CSS Shapes. CSS 2.2
+    /// float placement still queries the float's margin rectangle instead.
+    /// CSS Shapes Level 1: <https://www.w3.org/TR/css-shapes-1/#shape-outside-property>
     pub(in crate::layout) fn horizontal_edges(
         &self,
         margin_rect: PageTopRect,
@@ -387,7 +393,7 @@ impl FloatArea {
             .map(|(left, right)| PageInlineSpan::from_edges(left, right))
     }
 
-    /// Vertical outer edges occupied anywhere in a vertical-writing slab.
+    /// Vertical-writing projection of [`Self::horizontal_edges`].
     pub(in crate::layout) fn vertical_edges(
         &self,
         margin_rect: PageTopRect,
@@ -441,11 +447,28 @@ impl FloatArea {
                 center_y - radius_y - self.shape_margin,
             ]),
             FloatContour::RoundedRect(rect) => {
-                rect.outset(self.shape_margin)
-                    .horizontal_transition_tops(slab_height, output);
+                // A parallel curve extends every corner transition by the
+                // circular margin, but does not change the quarter-ellipse
+                // radii themselves.
+                let mut transitions = Vec::new();
+                rect.horizontal_transition_tops(slab_height, &mut transitions);
+                for transition in transitions {
+                    output.extend([
+                        transition + self.shape_margin,
+                        transition - self.shape_margin,
+                    ]);
+                }
             }
             FloatContour::Polygon { vertices, .. } => {
                 for vertex in vertices {
+                    output.extend([
+                        vertex.top_y() + self.shape_margin,
+                        vertex.top_y() - self.shape_margin,
+                    ]);
+                }
+            }
+            FloatContour::Path { subpaths, .. } => {
+                for vertex in subpaths.iter().flatten() {
                     output.extend([
                         vertex.top_y() + self.shape_margin,
                         vertex.top_y() - self.shape_margin,
@@ -476,6 +499,12 @@ pub(in crate::layout) enum FloatContour {
     },
     Polygon {
         vertices: Vec<PageTopPoint>,
+        fill_rule: css::ShapeFillRule,
+    },
+    /// A flattened compound CSS Shapes path. Each subpath is closed when it
+    /// is queried, as `shape-outside` requires for otherwise-open paths.
+    Path {
+        subpaths: Vec<Vec<PageTopPoint>>,
         fill_rule: css::ShapeFillRule,
     },
     RasterAlpha {
@@ -546,6 +575,7 @@ impl FloatContour {
             Self::Circle { .. }
             | Self::Ellipse { .. }
             | Self::Polygon { .. }
+            | Self::Path { .. }
             | Self::RasterAlpha { .. } => false,
         }
     }
@@ -577,6 +607,11 @@ impl FloatContour {
                     output.extend([vertex.top_y(), vertex.top_y() + slab_height]);
                 }
             }
+            Self::Path { subpaths, .. } => {
+                for point in subpaths.iter().flatten() {
+                    output.extend([point.top_y(), point.top_y() + slab_height]);
+                }
+            }
             Self::RasterAlpha { rect, .. } => output.extend([rect.top_y(), rect.bottom_y()]),
         }
     }
@@ -604,6 +639,10 @@ impl FloatContour {
                 vertices,
                 fill_rule,
             } => polygon_horizontal_edges(clip, vertices, *fill_rule, bottom, top),
+            Self::Path {
+                subpaths,
+                fill_rule,
+            } => compound_polygon_horizontal_edges(clip, subpaths, *fill_rule, bottom, top),
             Self::RasterAlpha {
                 rect,
                 pixel_width,
@@ -667,10 +706,17 @@ impl FloatContour {
                 top,
                 margin,
             ),
-            Self::RoundedRect(rect) => rect.outset(margin).horizontal_edges(clip, bottom, top),
-            Self::Polygon { vertices, .. } => {
-                offset_polygon_horizontal_edges(clip, vertices, bottom, top, margin)
-            }
+            Self::RoundedRect(rect) => rect.horizontal_edges_with_margin(clip, bottom, top, margin),
+            Self::Polygon {
+                vertices,
+                fill_rule,
+            } => offset_polygon_horizontal_edges(clip, vertices, *fill_rule, bottom, top, margin),
+            Self::Path {
+                subpaths,
+                fill_rule,
+            } => offset_compound_polygon_horizontal_edges(
+                clip, subpaths, *fill_rule, bottom, top, margin,
+            ),
             Self::RasterAlpha {
                 rect,
                 pixel_width,
@@ -714,6 +760,10 @@ impl FloatContour {
                 vertices,
                 fill_rule,
             } => polygon_vertical_edges(clip, vertices, *fill_rule, left, right),
+            Self::Path {
+                subpaths,
+                fill_rule,
+            } => compound_polygon_vertical_edges(clip, subpaths, *fill_rule, left, right),
             Self::RasterAlpha {
                 rect,
                 pixel_width,
@@ -777,10 +827,17 @@ impl FloatContour {
                 right,
                 margin,
             ),
-            Self::RoundedRect(rect) => rect.outset(margin).vertical_edges(clip, left, right),
-            Self::Polygon { vertices, .. } => {
-                offset_polygon_vertical_edges(clip, vertices, left, right, margin)
-            }
+            Self::RoundedRect(rect) => rect.vertical_edges_with_margin(clip, left, right, margin),
+            Self::Polygon {
+                vertices,
+                fill_rule,
+            } => offset_polygon_vertical_edges(clip, vertices, *fill_rule, left, right, margin),
+            Self::Path {
+                subpaths,
+                fill_rule,
+            } => offset_compound_polygon_vertical_edges(
+                clip, subpaths, *fill_rule, left, right, margin,
+            ),
             Self::RasterAlpha {
                 rect,
                 pixel_width,
@@ -1121,11 +1178,52 @@ fn offset_ellipse_axis_extent(
     slab_high: f32,
     margin: f32,
 ) -> Option<f32> {
+    offset_ellipse_axis_extent_in_range(EllipseAxisExtentQuery {
+        source_axis,
+        source_radius,
+        perpendicular_radius,
+        source_low: source_axis - source_radius,
+        source_high: source_axis + source_radius,
+        slab_low,
+        slab_high,
+        margin,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct EllipseAxisExtentQuery {
+    source_axis: f32,
+    source_radius: f32,
+    perpendicular_radius: f32,
+    source_low: f32,
+    source_high: f32,
+    slab_low: f32,
+    slab_high: f32,
+    margin: f32,
+}
+
+/// As [`offset_ellipse_axis_extent`], limited to one continuous portion of an
+/// ellipse. Rounded-rectangle corners are quarter ellipses, rather than full
+/// ellipses with independently enlarged radii.
+fn offset_ellipse_axis_extent_in_range(query: EllipseAxisExtentQuery) -> Option<f32> {
+    let EllipseAxisExtentQuery {
+        source_axis,
+        source_radius,
+        perpendicular_radius,
+        source_low,
+        source_high,
+        slab_low,
+        slab_high,
+        margin,
+    } = query;
     if source_radius <= 0.0 || perpendicular_radius <= 0.0 {
         return None;
     }
-    let source_low = source_axis - source_radius;
-    let source_high = source_axis + source_radius;
+    let source_low = source_low.max(source_axis - source_radius);
+    let source_high = source_high.min(source_axis + source_radius);
+    if source_high < source_low {
+        return None;
+    }
     if slab_high < source_low - margin || slab_low > source_high + margin {
         return None;
     }
@@ -1181,19 +1279,20 @@ fn offset_ellipse_axis_extent(
 fn offset_polygon_horizontal_edges(
     clip: PageTopRect,
     vertices: &[PageTopPoint],
+    fill_rule: css::ShapeFillRule,
     bottom: f32,
     top: f32,
     margin: f32,
 ) -> Option<(f32, f32)> {
-    let (left, right) = offset_polygon_axis_edges(
-        vertices
-            .iter()
-            .map(|point| (point.top_y(), point.x()))
-            .collect::<Vec<_>>()
-            .as_slice(),
+    let subpaths = vec![vertices.to_vec()];
+    let (left, right) = offset_filled_polygon_axis_edges(
+        &subpaths,
+        fill_rule,
         bottom,
         top,
         margin,
+        |point| point.top_y(),
+        |point| point.x(),
     )?;
     let left = left.max(clip.x());
     let right = right.min(clip.x() + clip.width());
@@ -1203,160 +1302,107 @@ fn offset_polygon_horizontal_edges(
 fn offset_polygon_vertical_edges(
     clip: PageTopRect,
     vertices: &[PageTopPoint],
+    fill_rule: css::ShapeFillRule,
     left: f32,
     right: f32,
     margin: f32,
 ) -> Option<(f32, f32)> {
-    let (bottom, top) = offset_polygon_axis_edges(
-        vertices
-            .iter()
-            .map(|point| (point.x(), point.top_y()))
-            .collect::<Vec<_>>()
-            .as_slice(),
+    let subpaths = vec![vertices.to_vec()];
+    let (bottom, top) = offset_filled_polygon_axis_edges(
+        &subpaths,
+        fill_rule,
         left,
         right,
         margin,
+        |point| point.x(),
+        |point| point.top_y(),
     )?;
     let bottom = bottom.max(clip.bottom_y());
     let top = top.min(clip.top_y());
     (top >= bottom).then_some((bottom, top))
 }
 
-/// Return the outer perpendicular edges of a closed polygon offset by a
-/// circular shape-margin. The first coordinate is parallel to the queried
-/// slab and the second is perpendicular.
-fn offset_polygon_axis_edges(
-    vertices: &[(f32, f32)],
-    slab_low: f32,
-    slab_high: f32,
+fn offset_compound_polygon_horizontal_edges(
+    clip: PageTopRect,
+    subpaths: &[Vec<PageTopPoint>],
+    fill_rule: css::ShapeFillRule,
+    bottom: f32,
+    top: f32,
     margin: f32,
 ) -> Option<(f32, f32)> {
-    if vertices.is_empty() {
-        return None;
-    }
-    let mut minimum = f32::INFINITY;
-    let mut maximum = f32::NEG_INFINITY;
-    for index in 0..vertices.len() {
-        let start = vertices[index];
-        let end = vertices[(index + 1) % vertices.len()];
-        minimum = minimum.min(offset_segment_perpendicular_extreme(
-            start, end, slab_low, slab_high, margin, false,
-        ));
-        maximum = maximum.max(offset_segment_perpendicular_extreme(
-            start, end, slab_low, slab_high, margin, true,
-        ));
-    }
-    (maximum >= minimum).then_some((minimum, maximum))
+    let (left, right) = offset_filled_polygon_axis_edges(
+        subpaths,
+        fill_rule,
+        bottom,
+        top,
+        margin,
+        |point| point.top_y(),
+        |point| point.x(),
+    )?;
+    let left = left.max(clip.x());
+    let right = right.min(clip.x() + clip.width());
+    (right >= left).then_some((left, right))
 }
 
-fn offset_segment_perpendicular_extreme(
-    start: (f32, f32),
-    end: (f32, f32),
+fn offset_compound_polygon_vertical_edges(
+    clip: PageTopRect,
+    subpaths: &[Vec<PageTopPoint>],
+    fill_rule: css::ShapeFillRule,
+    left: f32,
+    right: f32,
+    margin: f32,
+) -> Option<(f32, f32)> {
+    let (bottom, top) = offset_filled_polygon_axis_edges(
+        subpaths,
+        fill_rule,
+        left,
+        right,
+        margin,
+        |point| point.x(),
+        |point| point.top_y(),
+    )?;
+    let bottom = bottom.max(clip.bottom_y());
+    let top = top.min(clip.top_y());
+    (top >= bottom).then_some((bottom, top))
+}
+
+/// Return the outer interval of the circular offset of the *filled* contour
+/// over a slab. Querying filled scanline intervals avoids treating a concave
+/// notch's inner boundary as an outer float-wrap edge.
+fn offset_filled_polygon_axis_edges(
+    subpaths: &[Vec<PageTopPoint>],
+    fill_rule: css::ShapeFillRule,
     slab_low: f32,
     slab_high: f32,
     margin: f32,
-    maximum: bool,
-) -> f32 {
-    let (axis_delta, perpendicular_delta) = (end.0 - start.0, end.1 - start.1);
-    let direction = if maximum { 1.0 } else { -1.0 };
-    let mut result = if maximum {
-        f32::NEG_INFINITY
-    } else {
-        f32::INFINITY
-    };
-    let consider = |axis: f32, perpendicular: f32, boundary: f32| {
-        let distance = (axis - boundary).abs();
-        if distance <= margin + f32::EPSILON {
-            Some(perpendicular + direction * (margin.powi(2) - distance.powi(2)).max(0.0).sqrt())
+    primary: impl Fn(PageTopPoint) -> f32 + Copy,
+    secondary: impl Fn(PageTopPoint) -> f32 + Copy,
+) -> Option<(f32, f32)> {
+    let mut samples = vec![slab_low, slab_high];
+    samples.extend(subpaths.iter().flatten().map(|point| primary(*point)));
+    let mut minimum = f32::INFINITY;
+    let mut maximum = f32::NEG_INFINITY;
+    for coordinate in samples {
+        let distance = if coordinate < slab_low {
+            slab_low - coordinate
+        } else if coordinate > slab_high {
+            coordinate - slab_high
         } else {
-            None
-        }
-    };
-
-    // Source points already in the slab have the full perpendicular offset.
-    let axis_low = start.0.min(end.0).max(slab_low);
-    let axis_high = start.0.max(end.0).min(slab_high);
-    if axis_low <= axis_high {
-        if axis_delta.abs() <= f32::EPSILON {
-            if let Some(value) = consider(
-                start.0,
-                if maximum {
-                    start.1.max(end.1)
-                } else {
-                    start.1.min(end.1)
-                },
-                start.0,
-            ) {
-                result = if maximum {
-                    result.max(value)
-                } else {
-                    result.min(value)
-                };
-            }
-        } else {
-            for axis in [axis_low, axis_high] {
-                let t = (axis - start.0) / axis_delta;
-                let perpendicular = start.1 + perpendicular_delta * t;
-                let value = perpendicular + direction * margin;
-                if maximum {
-                    result = result.max(value);
-                } else {
-                    result = result.min(value);
-                }
-            }
-        }
-    }
-
-    // On either side of the slab the perpendicular circle contribution and
-    // the linear edge form a concave (or its negation, convex) function. Its
-    // stationary point has a closed form.
-    if axis_delta.abs() <= f32::EPSILON {
-        for boundary in [slab_low, slab_high] {
-            if let Some(value) = consider(
-                start.0,
-                if maximum {
-                    start.1.max(end.1)
-                } else {
-                    start.1.min(end.1)
-                },
-                boundary,
-            ) {
-                result = if maximum {
-                    result.max(value)
-                } else {
-                    result.min(value)
-                };
-            }
-        }
-        return result;
-    }
-    let slope = perpendicular_delta / axis_delta;
-    for (boundary, upper_side) in [(slab_low, false), (slab_high, true)] {
-        let (mut low, mut high) = (start.0.min(end.0), start.0.max(end.0));
-        if upper_side {
-            low = low.max(boundary);
-            high = high.min(boundary + margin);
-        } else {
-            low = low.max(boundary - margin);
-            high = high.min(boundary);
-        }
-        if low > high {
+            0.0
+        };
+        if distance > margin + super::exclusions::FLOAT_EPSILON {
             continue;
         }
-        let adjusted_slope = direction * slope;
-        let stationary = boundary + adjusted_slope * margin / (1.0 + adjusted_slope.powi(2)).sqrt();
-        for axis in [low, high, stationary.clamp(low, high)] {
-            let t = (axis - start.0) / axis_delta;
-            if let Some(value) = consider(axis, start.1 + perpendicular_delta * t, boundary) {
-                result = if maximum {
-                    result.max(value)
-                } else {
-                    result.min(value)
-                };
-            }
-        }
+        let Some((left, right)) = compound_polygon_scan_intersections(
+            subpaths, fill_rule, coordinate, primary, secondary,
+        ) else {
+            continue;
+        };
+        let expansion = (margin.powi(2) - distance.powi(2)).max(0.0).sqrt();
+        minimum = minimum.min(left - expansion);
+        maximum = maximum.max(right + expansion);
     }
-    result
+    (maximum >= minimum).then_some((minimum, maximum))
 }
 
 fn polygon_horizontal_edges(
@@ -1389,6 +1435,32 @@ fn polygon_horizontal_edges(
     (right >= left).then_some((left, right))
 }
 
+fn compound_polygon_horizontal_edges(
+    clip: PageTopRect,
+    subpaths: &[Vec<PageTopPoint>],
+    fill_rule: css::ShapeFillRule,
+    bottom: f32,
+    top: f32,
+) -> Option<(f32, f32)> {
+    let boundary_epsilon = polygon_slab_interior_epsilon(bottom, top);
+    let mut sample_y = vec![bottom + boundary_epsilon, top - boundary_epsilon];
+    sample_y.extend(
+        subpaths
+            .iter()
+            .flatten()
+            .map(|vertex| vertex.top_y())
+            .filter(|y| *y > bottom + boundary_epsilon && *y < top - boundary_epsilon),
+    );
+    compound_polygon_axis_edges(
+        clip,
+        subpaths,
+        fill_rule,
+        sample_y,
+        |point| point.top_y(),
+        |point| point.x(),
+    )
+}
+
 fn polygon_vertical_edges(
     clip: PageTopRect,
     vertices: &[PageTopPoint],
@@ -1417,6 +1489,70 @@ fn polygon_vertical_edges(
     let bottom = bottom.max(clip.bottom_y());
     let top = top.min(clip.top_y());
     (top >= bottom).then_some((bottom, top))
+}
+
+fn compound_polygon_vertical_edges(
+    clip: PageTopRect,
+    subpaths: &[Vec<PageTopPoint>],
+    fill_rule: css::ShapeFillRule,
+    left: f32,
+    right: f32,
+) -> Option<(f32, f32)> {
+    let boundary_epsilon = polygon_slab_interior_epsilon(left, right);
+    let mut sample_x = vec![left + boundary_epsilon, right - boundary_epsilon];
+    sample_x.extend(
+        subpaths
+            .iter()
+            .flatten()
+            .map(|vertex| vertex.x())
+            .filter(|x| *x > left + boundary_epsilon && *x < right - boundary_epsilon),
+    );
+    let (bottom, top) = compound_polygon_scan_edges(
+        subpaths,
+        fill_rule,
+        sample_x,
+        |point| point.x(),
+        |point| point.top_y(),
+    )?;
+    let bottom = bottom.max(clip.bottom_y());
+    let top = top.min(clip.top_y());
+    (top >= bottom).then_some((bottom, top))
+}
+
+fn compound_polygon_axis_edges(
+    clip: PageTopRect,
+    subpaths: &[Vec<PageTopPoint>],
+    fill_rule: css::ShapeFillRule,
+    samples: Vec<f32>,
+    primary: impl Fn(PageTopPoint) -> f32 + Copy,
+    secondary: impl Fn(PageTopPoint) -> f32 + Copy,
+) -> Option<(f32, f32)> {
+    let (left, right) =
+        compound_polygon_scan_edges(subpaths, fill_rule, samples, primary, secondary)?;
+    let left = left.max(clip.x());
+    let right = right.min(clip.x() + clip.width());
+    (right >= left).then_some((left, right))
+}
+
+fn compound_polygon_scan_edges(
+    subpaths: &[Vec<PageTopPoint>],
+    fill_rule: css::ShapeFillRule,
+    samples: Vec<f32>,
+    primary: impl Fn(PageTopPoint) -> f32 + Copy,
+    secondary: impl Fn(PageTopPoint) -> f32 + Copy,
+) -> Option<(f32, f32)> {
+    let mut minimum = f32::INFINITY;
+    let mut maximum = f32::NEG_INFINITY;
+    for sample in samples {
+        let Some((sample_minimum, sample_maximum)) =
+            compound_polygon_scan_intersections(subpaths, fill_rule, sample, primary, secondary)
+        else {
+            continue;
+        };
+        minimum = minimum.min(sample_minimum);
+        maximum = maximum.max(sample_maximum);
+    }
+    (maximum >= minimum).then_some((minimum, maximum))
 }
 
 fn polygon_slab_interior_epsilon(start: f32, end: f32) -> f32 {
@@ -1477,6 +1613,13 @@ fn polygon_scan_intersections(
         let winding_delta = i32::from(end_primary > start_primary) * 2 - 1;
         crossings.push((secondary_coordinate, winding_delta));
     }
+    scan_polygon_crossings(crossings, fill_rule)
+}
+
+fn scan_polygon_crossings(
+    mut crossings: Vec<(f32, i32)>,
+    fill_rule: css::ShapeFillRule,
+) -> Option<(f32, f32)> {
     crossings.sort_by(|left, right| left.0.total_cmp(&right.0));
 
     let mut index = 0;
@@ -1511,20 +1654,287 @@ fn polygon_scan_intersections(
     (maximum >= minimum).then_some((minimum, maximum))
 }
 
+fn compound_polygon_scan_intersections(
+    subpaths: &[Vec<PageTopPoint>],
+    fill_rule: css::ShapeFillRule,
+    coordinate: f32,
+    primary: impl Fn(PageTopPoint) -> f32,
+    secondary: impl Fn(PageTopPoint) -> f32,
+) -> Option<(f32, f32)> {
+    let mut crossings = Vec::new();
+    for vertices in subpaths {
+        for (start, end) in vertices
+            .iter()
+            .copied()
+            .zip(vertices.iter().copied().cycle().skip(1))
+            .take(vertices.len())
+        {
+            let start_primary = primary(start);
+            let end_primary = primary(end);
+            if !((start_primary <= coordinate && coordinate < end_primary)
+                || (end_primary <= coordinate && coordinate < start_primary))
+            {
+                continue;
+            }
+            let ratio = (coordinate - start_primary) / (end_primary - start_primary);
+            let secondary_coordinate =
+                secondary(start) + (secondary(end) - secondary(start)) * ratio;
+            let winding_delta = i32::from(end_primary > start_primary) * 2 - 1;
+            crossings.push((secondary_coordinate, winding_delta));
+        }
+    }
+    scan_polygon_crossings(crossings, fill_rule)
+}
+
 impl UsedRoundedRect {
-    /// Offset a rounded rectangle by the circular `shape-margin` contour.
-    /// Straight sides move outward and every quarter-ellipse radius grows by
-    /// the same distance, which is the exact parallel curve of this contour.
-    fn outset(self, margin: f32) -> Self {
-        Self {
-            left: self.left - margin,
-            right: self.right + margin,
-            top: self.top + margin,
-            bottom: self.bottom - margin,
-            top_left: (self.top_left.0 + margin, self.top_left.1 + margin),
-            top_right: (self.top_right.0 + margin, self.top_right.1 + margin),
-            bottom_right: (self.bottom_right.0 + margin, self.bottom_right.1 + margin),
-            bottom_left: (self.bottom_left.0 + margin, self.bottom_left.1 + margin),
+    /// Query the true circular `shape-margin` offset of this rounded inset.
+    ///
+    /// A CSS rounded rectangle is composed of line segments and *quarter*
+    /// ellipses. Increasing both ellipse radii independently does not form
+    /// the parallel curve of an asymmetric corner. This evaluates its source
+    /// perimeter directly and takes the outer extent over the full line slab.
+    /// CSS Shapes Level 1: <https://www.w3.org/TR/css-shapes-1/#shape-margin-property>
+    fn horizontal_edges_with_margin(
+        self,
+        clip: PageTopRect,
+        bottom: f32,
+        top: f32,
+        margin: f32,
+    ) -> Option<(f32, f32)> {
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        let mut consider_side = |edge: f32, low: f32, high: f32, is_left: bool| {
+            if top >= low - margin && bottom <= high + margin {
+                if is_left {
+                    left = left.min(edge - margin);
+                } else {
+                    right = right.max(edge + margin);
+                }
+            }
+        };
+        consider_side(
+            self.left,
+            self.bottom + self.bottom_left.1,
+            self.top - self.top_left.1,
+            true,
+        );
+        consider_side(
+            self.right,
+            self.bottom + self.bottom_right.1,
+            self.top - self.top_right.1,
+            false,
+        );
+
+        self.horizontal_corner_margin_extent(
+            self.left + self.top_left.0,
+            self.top - self.top_left.1,
+            self.top_left,
+            self.top - self.top_left.1,
+            self.top,
+            bottom,
+            top,
+            margin,
+            true,
+            &mut left,
+            &mut right,
+        );
+        self.horizontal_corner_margin_extent(
+            self.right - self.top_right.0,
+            self.top - self.top_right.1,
+            self.top_right,
+            self.top - self.top_right.1,
+            self.top,
+            bottom,
+            top,
+            margin,
+            false,
+            &mut left,
+            &mut right,
+        );
+        self.horizontal_corner_margin_extent(
+            self.left + self.bottom_left.0,
+            self.bottom + self.bottom_left.1,
+            self.bottom_left,
+            self.bottom,
+            self.bottom + self.bottom_left.1,
+            bottom,
+            top,
+            margin,
+            true,
+            &mut left,
+            &mut right,
+        );
+        self.horizontal_corner_margin_extent(
+            self.right - self.bottom_right.0,
+            self.bottom + self.bottom_right.1,
+            self.bottom_right,
+            self.bottom,
+            self.bottom + self.bottom_right.1,
+            bottom,
+            top,
+            margin,
+            false,
+            &mut left,
+            &mut right,
+        );
+        let left = left.max(clip.x());
+        let right = right.min(clip.x() + clip.width());
+        (right >= left).then_some((left, right))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn horizontal_corner_margin_extent(
+        self,
+        center_x: f32,
+        center_y: f32,
+        radii: (f32, f32),
+        corner_low: f32,
+        corner_high: f32,
+        slab_low: f32,
+        slab_high: f32,
+        margin: f32,
+        is_left: bool,
+        left: &mut f32,
+        right: &mut f32,
+    ) {
+        let Some(extent) = offset_ellipse_axis_extent_in_range(EllipseAxisExtentQuery {
+            source_axis: center_y,
+            source_radius: radii.1,
+            perpendicular_radius: radii.0,
+            source_low: corner_low,
+            source_high: corner_high,
+            slab_low,
+            slab_high,
+            margin,
+        }) else {
+            return;
+        };
+        if is_left {
+            *left = (*left).min(center_x - extent);
+        } else {
+            *right = (*right).max(center_x + extent);
+        }
+    }
+
+    fn vertical_edges_with_margin(
+        self,
+        clip: PageTopRect,
+        left: f32,
+        right: f32,
+        margin: f32,
+    ) -> Option<(f32, f32)> {
+        let mut bottom = f32::INFINITY;
+        let mut top = f32::NEG_INFINITY;
+        let mut consider_side = |edge: f32, low: f32, high: f32, is_bottom: bool| {
+            if right >= low - margin && left <= high + margin {
+                if is_bottom {
+                    bottom = bottom.min(edge - margin);
+                } else {
+                    top = top.max(edge + margin);
+                }
+            }
+        };
+        consider_side(
+            self.bottom,
+            self.left + self.bottom_left.0,
+            self.right - self.bottom_right.0,
+            true,
+        );
+        consider_side(
+            self.top,
+            self.left + self.top_left.0,
+            self.right - self.top_right.0,
+            false,
+        );
+
+        self.vertical_corner_margin_extent(
+            self.left + self.top_left.0,
+            self.top - self.top_left.1,
+            self.top_left,
+            self.left,
+            self.left + self.top_left.0,
+            left,
+            right,
+            margin,
+            false,
+            &mut bottom,
+            &mut top,
+        );
+        self.vertical_corner_margin_extent(
+            self.right - self.top_right.0,
+            self.top - self.top_right.1,
+            self.top_right,
+            self.right - self.top_right.0,
+            self.right,
+            left,
+            right,
+            margin,
+            false,
+            &mut bottom,
+            &mut top,
+        );
+        self.vertical_corner_margin_extent(
+            self.left + self.bottom_left.0,
+            self.bottom + self.bottom_left.1,
+            self.bottom_left,
+            self.left,
+            self.left + self.bottom_left.0,
+            left,
+            right,
+            margin,
+            true,
+            &mut bottom,
+            &mut top,
+        );
+        self.vertical_corner_margin_extent(
+            self.right - self.bottom_right.0,
+            self.bottom + self.bottom_right.1,
+            self.bottom_right,
+            self.right - self.bottom_right.0,
+            self.right,
+            left,
+            right,
+            margin,
+            true,
+            &mut bottom,
+            &mut top,
+        );
+        let bottom = bottom.max(clip.bottom_y());
+        let top = top.min(clip.top_y());
+        (top >= bottom).then_some((bottom, top))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn vertical_corner_margin_extent(
+        self,
+        center_x: f32,
+        center_y: f32,
+        radii: (f32, f32),
+        corner_low: f32,
+        corner_high: f32,
+        slab_low: f32,
+        slab_high: f32,
+        margin: f32,
+        is_bottom: bool,
+        bottom: &mut f32,
+        top: &mut f32,
+    ) {
+        let Some(extent) = offset_ellipse_axis_extent_in_range(EllipseAxisExtentQuery {
+            source_axis: center_x,
+            source_radius: radii.0,
+            perpendicular_radius: radii.1,
+            source_low: corner_low,
+            source_high: corner_high,
+            slab_low,
+            slab_high,
+            margin,
+        }) else {
+            return;
+        };
+        if is_bottom {
+            *bottom = (*bottom).min(center_y - extent);
+        } else {
+            *top = (*top).max(center_y + extent);
         }
     }
 

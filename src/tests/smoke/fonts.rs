@@ -1410,11 +1410,11 @@ async fn explicit_line_height_baseline_ignores_fallback_font_runs() {
     );
 }
 
-/// A fallback glyph selected through `unicode-range` must not change an
-/// auto-height inline-block's normal line box or its inline background.
+/// A fallback glyph selected through `unicode-range` contributes its face's
+/// extents to an auto-height inline-block's normal line box.
 /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
 #[tokio::test]
-async fn normal_line_height_inline_block_ignores_fallback_font_metrics() {
+async fn normal_line_height_inline_block_includes_selected_fallback_metrics() {
     let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
     let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
     let html = format!(
@@ -1468,12 +1468,81 @@ async fn normal_line_height_inline_block_ignores_fallback_font_metrics() {
         .expect("primary-only inline background should paint");
 
     assert!(
-        (red.y() - white.y()).abs() < 0.01,
-        "fallback glyph metrics must not shift the inline background: red={red:?} white={white:?}"
+        red.y() < white.y(),
+        "selected fallback metrics must raise the inline background: red={red:?} white={white:?}"
     );
     assert!(
-        (red.height() - white.height()).abs() < 0.01,
-        "fallback glyph metrics must not change the inline background height: red={red:?} white={white:?}"
+        red.height() > white.height(),
+        "selected fallback metrics must expand the inline background height: red={red:?} white={white:?}"
+    );
+}
+
+/// A forced empty line has no paintable selected-font run, so its normal line
+/// box retains the containing block's strut rather than selected-face extents.
+/// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
+#[tokio::test]
+async fn forced_empty_line_retains_parent_strut_without_selected_font_run() {
+    let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
+    let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
+    let html = format!(
+        r#"
+        <style>
+          @page {{ size: 240pt 160pt; margin: 0 }}
+          body {{ margin: 0 }}
+          @font-face {{
+            font-family: PrimaryAOnly;
+            src: url("{primary}") format("truetype");
+            unicode-range: U+0020, U+0061;
+          }}
+          @font-face {{
+            font-family: FallbackBOnly;
+            src: url("{fallback}") format("truetype");
+            unicode-range: U+0062;
+          }}
+          div {{
+            position: absolute;
+            top: 20pt;
+            left: 0;
+            width: 225pt;
+            font-size: 75pt;
+            line-height: normal;
+            color: transparent;
+          }}
+          #empty {{
+            font-family: PrimaryAOnly, FallbackBOnly;
+            background: red;
+          }}
+          #primary {{ font-family: PrimaryAOnly; background: white; }}
+        </style>
+        <div id="empty"><br></div>
+        <div id="primary">aa</div>
+        "#
+    );
+    let document = Html::from_string(html)
+        .with_base_path(".")
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("empty-line background should paint");
+    let white = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::WHITE))
+        .expect("primary strut reference should paint");
+
+    assert!(
+        (red.height() - 90.0).abs() < 0.01,
+        "empty line must keep the parent normal-line strut: red={red:?}"
+    );
+    assert!(
+        red.height() < white.height() && red.y() > white.y(),
+        "a no-font-run line must not borrow selected-face extents: red={red:?} white={white:?}"
     );
 }
 

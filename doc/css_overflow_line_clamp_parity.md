@@ -27,6 +27,16 @@ when the overflow source occurs in a later graph or sibling. Out-of-flow
 positioned and floated source does not create that continuation or consume a
 line slot.
 
+The generated block ellipsis remains a distinct anonymous root-inline fragment
+for styling, line-height, and bidi purposes. When its final painted position
+is exactly adjacent to preceding compatible text, PDF emission retains the
+serialized text cursor across that paint boundary instead of rounding a new
+absolute text origin; the generated marker therefore rasterizes identically to
+the equivalent authored inline text without weakening its CSS semantics. Other
+page-paint records share that continuation only within their logical source
+run, so visually adjacent independent CSS boxes retain their display-list
+identity and paint behavior.
+
 The following focused static WPTs pass with the current debug Quire binary:
 
 - `webkit-line-clamp-001.html`

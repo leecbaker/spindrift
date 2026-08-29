@@ -54,8 +54,7 @@ impl<'a> LayoutBuilder<'a> {
             preceding_inline_clamp_block_advance,
             discard_region_limit,
             direct_automatic_block_size_constraint,
-            definite_content_height,
-            descendant_percentage_height_basis,
+            descendant_percentage_height_context,
         } = *input;
         let can_collapse_start_margin =
             can_collapse_start_margin && start_margin_arrangement.permits_parent_start_collapse();
@@ -69,15 +68,8 @@ impl<'a> LayoutBuilder<'a> {
             traversal_state.mark_local_continuation_cutoff();
         }
         traversal_state.set_discard_region_limit(discard_region_limit);
-        let descendant_percentage_height_basis =
-            descendant_percentage_height_basis.unwrap_or_else(|| {
-                block_size_percentage_basis_from_points(
-                    definite_content_height.map(|height| height.value().points()),
-                    BlockSizeBasisSource::ContainingBlock,
-                )
-            });
-        self.definite_block_size_stack
-            .push(descendant_percentage_height_basis);
+        self.block_percentage_context_stack
+            .push_context(descendant_percentage_height_context);
 
         let traversal_outcome = if laid_out_column_children
             || matches!(traversal_mode, ChildTraversalMode::InlineSequence)
@@ -153,7 +145,7 @@ impl<'a> LayoutBuilder<'a> {
                 &mut traversal_state,
             )
         };
-        self.definite_block_size_stack.pop();
+        self.block_percentage_context_stack.pop();
 
         BlockFlowChildrenPhaseOutcome {
             pending_end_margin_collapse: traversal_outcome.pending_end_margin_collapse,

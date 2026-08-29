@@ -115,6 +115,9 @@ pub(in crate::layout) fn push_page_margin_primitive(
         PaintPrimitive::Stroke(stroke) => page.push_stroke_in_band(band, stroke),
         PaintPrimitive::Image(image) => page.push_image_in_band(band, image),
         PaintPrimitive::ImagePattern(pattern) => page.push_image_pattern_in_band(band, pattern),
+        PaintPrimitive::ProjectiveRaster(_) => {
+            unreachable!("projective raster lowering happens in the PDF backend")
+        }
         PaintPrimitive::GradientPattern(pattern) => {
             page.push_gradient_pattern_in_band(band, pattern)
         }
@@ -123,9 +126,10 @@ pub(in crate::layout) fn push_page_margin_primitive(
         PaintPrimitive::OpaqueTextCoverage { line, paths } => {
             page.push_opaque_text_coverage_in_band(band, line, paths)
         }
-        PaintPrimitive::SvgTextOutline { paths, actual_text } => {
-            page.push_svg_text_outline_in_band(band, paths, actual_text)
-        }
+        PaintPrimitive::SvgTextOutline {
+            content,
+            actual_text,
+        } => page.push_svg_text_outline_scope_in_band(band, *content, actual_text),
     };
 }
 

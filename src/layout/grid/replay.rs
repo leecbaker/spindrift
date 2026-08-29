@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use crate::layout::builder::DetachedLayoutReplayTransaction;
+use crate::layout::builder::SpeculativeLayoutTransaction;
 use crate::units::Definite;
 
 /// Replay context for one split grid item fragment.
@@ -386,7 +386,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         replay_dimensions: GridItemReplayDimensions,
     ) -> ContinuousSourceReplay {
-        let transaction = DetachedLayoutReplayTransaction::begin(self);
+        let transaction = SpeculativeLayoutTransaction::begin(self);
         let positioned_layer_start = 0;
         let offpage_top = offpage_source_offset();
         self.current_page = Page::new(

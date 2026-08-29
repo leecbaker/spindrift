@@ -1,5 +1,14 @@
 use super::*;
 
+fn is_default_block_container_tag(tag: &str) -> bool {
+    // CSS Display defines block containers by computed display, while HTML only
+    // supplies the default display values through the UA stylesheet. The
+    // cascade-derived result is cached per tag because inline-text collection
+    // performs this classification for every nested element.
+    // https://www.w3.org/TR/css-display-3/#block-container
+    css::default_display_is_block_level_for_tag(tag)
+}
+
 pub(in crate::layout) fn inline_text(element: &Element) -> String {
     if element_suppresses_direct_text_children(element) {
         return String::new();

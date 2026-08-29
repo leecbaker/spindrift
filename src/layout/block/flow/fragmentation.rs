@@ -491,7 +491,28 @@ pub(in crate::layout) struct AdjoiningFloatReplayCandidateMeta {
 }
 
 pub(in crate::layout) struct PendingAdjoiningFloatReplayCandidate {
+    pub(in crate::layout) snapshot: Box<LayoutSnapshot>,
     pub(in crate::layout) meta: AdjoiningFloatReplayCandidateMeta,
+}
+
+/// A resolved CSS2 clearance edge that prevents adjoining-float replay across
+/// it within the float formatting context that produced it.
+///
+/// CSS2 clearance moves a box's border edge below the relevant floats. A
+/// transparent descendant can emit a float after that move, so this records
+/// the used edge rather than the syntactic `clear` value.
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FloatReplayClearanceBoundary(PageTopBlockPosition);
+
+impl FloatReplayClearanceBoundary {
+    pub(in crate::layout) const fn new(border_top: PageTopBlockPosition) -> Self {
+        Self(border_top)
+    }
+
+    pub(in crate::layout) const fn border_top(self) -> PageTopBlockPosition {
+        self.0
+    }
 }
 
 pub(in crate::layout) struct AdjoiningFloatReplayCandidate {
@@ -500,20 +521,20 @@ pub(in crate::layout) struct AdjoiningFloatReplayCandidate {
     /// A descendant clearance boundary that gives this otherwise
     /// self-collapsing candidate a real block-end placement for its following
     /// sibling. It must not be replayed as an adjoining float run.
-    clearance_boundary: Option<PageTopBlockPosition>,
+    clearance_boundary: Option<FloatReplayClearanceBoundary>,
 }
 
 impl PendingAdjoiningFloatReplayCandidate {
-    /// Capture before the self-collapsing child layout whose adjoining floats
-    /// may need to be replayed at a later collapsed-margin origin.
+    /// Finalize the pre-layout checkpoint after the self-collapsing child has
+    /// reported its lexical clearance scope.
     pub(in crate::layout) fn arm(
         self,
         builder: &LayoutBuilder<'_>,
     ) -> AdjoiningFloatReplayCandidate {
         AdjoiningFloatReplayCandidate {
-            snapshot: Box::new(builder.snapshot()),
+            snapshot: self.snapshot,
             meta: self.meta,
-            clearance_boundary: None,
+            clearance_boundary: builder.current_float_replay_clearance_boundary(),
         }
     }
 }
@@ -527,12 +548,8 @@ impl AdjoiningFloatReplayCandidate {
         self.snapshot.cursor_y()
     }
 
-    pub(in crate::layout) fn clearance_boundary(&self) -> Option<PageTopBlockPosition> {
+    pub(in crate::layout) fn clearance_boundary(&self) -> Option<FloatReplayClearanceBoundary> {
         self.clearance_boundary
-    }
-
-    pub(in crate::layout) fn record_clearance_boundary(&mut self, boundary: PageTopBlockPosition) {
-        self.clearance_boundary = Some(boundary);
     }
 
     pub(in crate::layout) fn restore(
@@ -541,6 +558,38 @@ impl AdjoiningFloatReplayCandidate {
     ) -> AdjoiningFloatReplayCandidateMeta {
         builder.restore(*self.snapshot);
         self.meta
+    }
+}
+
+impl LayoutBuilder<'_> {
+    /// Return the active lexical clearance boundary for adjoining-float replay.
+    pub(in crate::layout) fn current_float_replay_clearance_boundary(
+        &self,
+    ) -> Option<FloatReplayClearanceBoundary> {
+        self.float_replay_clearance_scopes.last().copied().flatten()
+    }
+
+    /// Run a child-flow phase with its inherited CSS2 clearance boundary.
+    ///
+    /// A nested independent formatting context receives `None`: its floats
+    /// cannot affect the outer float context or its replay decision.
+    pub(in crate::layout) fn with_float_replay_clearance_scope<T>(
+        &mut self,
+        boundary: Option<FloatReplayClearanceBoundary>,
+        layout: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.float_replay_clearance_scopes.push(boundary);
+        let result = layout(self);
+        let completed_boundary = self
+            .float_replay_clearance_scopes
+            .pop()
+            .expect("float replay clearance scope is balanced");
+        if let Some(completed_boundary) = completed_boundary
+            && let Some(inherited_boundary) = self.float_replay_clearance_scopes.last_mut()
+        {
+            *inherited_boundary = Some(completed_boundary);
+        }
+        result
     }
 }
 

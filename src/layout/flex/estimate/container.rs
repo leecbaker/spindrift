@@ -1,6 +1,6 @@
 use super::*;
-use crate::layout::flex::compute::{
-    FlexBaselineSet, estimated_outer_cross_size, flex_baseline_line_axis, flex_baseline_set,
+use crate::layout::flex::baseline::{
+    FlexBaselineSet, flex_baseline_line_axis, flex_baseline_set,
     flex_item_baseline_axis_is_parallel_to_main_axis, line_over_side, line_under_side,
     synthesis_writing_mode, vertical_typographic_mode_uses_central_baseline,
 };

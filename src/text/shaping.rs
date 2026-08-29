@@ -54,17 +54,17 @@ pub(super) fn shape_text_with_document_font(
         .cloned()
         .enumerate()
         .map(|(index, character)| {
+            // Tabs are a synthetic layout control. Every Unicode scalar,
+            // including CSS "other space separators", keeps the selected
+            // font's own glyph and advance.
             let glyph_id = if character == '\t' {
                 face.glyph_index(' ')?
             } else {
-                css_space_separator_blank_glyph(&face, character)
-                    .or_else(|| face.glyph_index(character))?
+                face.glyph_index(character)?
             };
-            let mut x_advance = css_space_separator_advance(&face, character, font_size, scale)
-                .or_else(|| {
-                    face.glyph_hor_advance(glyph_id)
-                        .map(|advance| advance as f32 * scale)
-                })
+            let mut x_advance = face
+                .glyph_hor_advance(glyph_id)
+                .map(|advance| advance as f32 * scale)
                 .unwrap_or(0.0);
             if used_letter_spacing != 0.0 && index + 1 < characters.len() {
                 x_advance += used_letter_spacing;
@@ -84,10 +84,17 @@ pub(super) fn shape_text_with_document_font(
                     RenderedGlyphKind::Paint(glyph_id.0)
                 },
                 x_advance,
-                nominal_x_advance: face
-                    .glyph_hor_advance(glyph_id)
-                    .map(|advance| advance as f32 * scale)
-                    .unwrap_or(x_advance),
+                // Preserved tabs have no font glyph in PDF output. Their
+                // nominal advance must therefore agree with their used
+                // advance so PDF text positioning does not reintroduce the
+                // metric of the placeholder U+0020 glyph.
+                nominal_x_advance: if character == '\t' {
+                    x_advance
+                } else {
+                    face.glyph_hor_advance(glyph_id)
+                        .map(|advance| advance as f32 * scale)
+                        .unwrap_or(x_advance)
+                },
                 x_offset: 0.0,
                 y_offset: 0.0,
                 unicode: character.to_string(),
@@ -95,66 +102,6 @@ pub(super) fn shape_text_with_document_font(
         })
         .collect::<Option<Vec<_>>>()?;
     Some(glyphs)
-}
-
-/// Return a blank glyph for a Unicode space separator.
-///
-/// CSS Text treats Unicode space separators as visible text with advance, but
-/// they are spacing characters rather than inked fallback glyphs. When a
-/// selected font exposes a visible `.notdef` or missing-glyph outline for
-/// characters such as U+2002 EN SPACE, PDF emission should preserve the
-/// separator advance and ToUnicode mapping while painting a blank space glyph:
-/// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
-/// <https://www.unicode.org/reports/tr44/#General_Category_Values>.
-pub(super) fn css_space_separator_blank_glyph(
-    face: &ttf_parser::Face<'_>,
-    character: char,
-) -> Option<ttf_parser::GlyphId> {
-    character_is_css_other_space_separator(character)
-        .then(|| face.glyph_index(' '))
-        .flatten()
-}
-
-/// Return the typographic advance for fixed Unicode space separators.
-///
-/// Unicode defines several `Space_Separator` characters by their nominal em
-/// width. CSS Text keeps these characters in the text stream, so the renderer
-/// synthesizes their blank advance when the selected font lacks a reliable
-/// glyph-specific metric:
-/// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
-/// <https://www.unicode.org/charts/PDF/U2000.pdf>.
-pub(super) fn css_space_separator_advance(
-    face: &ttf_parser::Face<'_>,
-    character: char,
-    font_size: f32,
-    scale: f32,
-) -> Option<f32> {
-    match character {
-        '\u{00a0}' | '\u{1680}' => face
-            .glyph_index(' ')
-            .and_then(|glyph| face.glyph_hor_advance(glyph))
-            .map(|advance| advance as f32 * scale)
-            .or(Some(font_size * 0.25)),
-        '\u{2000}' | '\u{2002}' => Some(font_size * 0.5),
-        '\u{2001}' | '\u{2003}' | '\u{3000}' => Some(font_size),
-        '\u{2004}' => Some(font_size / 3.0),
-        '\u{2005}' => Some(font_size / 4.0),
-        '\u{2006}' => Some(font_size / 6.0),
-        '\u{2007}' => face
-            .glyph_index('0')
-            .and_then(|glyph| face.glyph_hor_advance(glyph))
-            .map(|advance| advance as f32 * scale)
-            .or(Some(font_size * 0.5)),
-        '\u{2008}' => face
-            .glyph_index('.')
-            .and_then(|glyph| face.glyph_hor_advance(glyph))
-            .map(|advance| advance as f32 * scale)
-            .or(Some(font_size * 0.25)),
-        '\u{2009}' | '\u{202f}' => Some(font_size / 5.0),
-        '\u{200a}' => Some(font_size / 10.0),
-        '\u{205f}' => Some(font_size * 4.0 / 18.0),
-        _ => None,
-    }
 }
 
 /// Returns the spacing that should affect glyph advances for this text.

@@ -36,98 +36,325 @@ pub(super) struct GridLayout {
 /// canonical interior gutters so no consumer can accidentally reconstruct a
 /// paint topology from Taffy's lossy boundary-gutter representation.
 /// <https://www.w3.org/TR/css-grid-1/#auto-repeat>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct GridTrackGeometry {
+    start: f32,
+    end: f32,
+    collapsed_auto_fit: bool,
+}
+
+impl GridTrackGeometry {
+    fn new(start: f32, end: f32, collapsed_auto_fit: bool) -> Self {
+        debug_assert!(start <= end);
+        Self {
+            start,
+            end,
+            collapsed_auto_fit,
+        }
+    }
+
+    pub(in crate::layout) fn start(self) -> f32 {
+        self.start
+    }
+
+    pub(in crate::layout) fn end(self) -> f32 {
+        self.end
+    }
+
+    pub(in crate::layout) fn size(self) -> f32 {
+        (self.end - self.start).max(0.0)
+    }
+
+    pub(in crate::layout) fn is_active(self) -> bool {
+        !self.collapsed_auto_fit
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GridTrackLayoutInput {
+    size: f32,
+    gutter_after: f32,
+    collapsed_auto_fit: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(in crate::layout) struct GridAxisTopology {
-    /// Final physical line positions. These are retained with the canonical
-    /// track topology because startward implicit-track correction can shift a
-    /// line without changing the corresponding used track size.
-    line_offsets: Vec<f32>,
-    track_sizes: Vec<f32>,
-    /// One gutter after each track except the last; boundary gutters are not
-    /// Grid geometry and are deliberately never retained here.
-    interior_gutters: Vec<f32>,
-    collapsed_auto_fit_tracks: Vec<bool>,
+    /// Tracks are stored in increasing physical order. Their distinct start
+    /// and end edges preserve the thickness of a Grid line (its gutter), so a
+    /// grid area cannot accidentally absorb the gutter after its final track.
+    tracks: Vec<GridTrackGeometry>,
 }
 
 impl GridAxisTopology {
-    pub(in crate::layout) fn new(
+    /// Build topology from geometry that is already in its intended form.
+    ///
+    /// This deliberately preserves raw backend and correction-source
+    /// geometry. Target geometry for `repeat(auto-fit, ...)` must use
+    /// [`Self::from_auto_fit_track_layout`] so collapsed gutters are
+    /// canonicalized exactly once.
+    pub(in crate::layout) fn from_track_layout(
         track_sizes: Vec<f32>,
         interior_gutters: Vec<f32>,
         collapsed_auto_fit_tracks: Vec<bool>,
-    ) -> Self {
-        let line_offsets = grid_line_offsets_from_track_layout(&track_sizes, &interior_gutters);
-        Self::with_line_offsets(
-            line_offsets,
-            track_sizes,
-            interior_gutters,
-            collapsed_auto_fit_tracks,
-        )
+    ) -> Option<Self> {
+        if interior_gutters.len() != track_sizes.len().saturating_sub(1)
+            || collapsed_auto_fit_tracks.len() != track_sizes.len()
+            || track_sizes.iter().any(|value| !value.is_finite())
+            || interior_gutters.iter().any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        let inputs = track_sizes
+            .into_iter()
+            .zip(collapsed_auto_fit_tracks)
+            .enumerate()
+            .map(|(index, (size, collapsed_auto_fit))| GridTrackLayoutInput {
+                size,
+                gutter_after: interior_gutters.get(index).copied().unwrap_or(0.0),
+                collapsed_auto_fit,
+            });
+        let mut offset = 0.0;
+        let tracks = inputs
+            .map(|input| {
+                let start = offset;
+                let end = start + input.size.max(0.0);
+                offset = end + input.gutter_after.max(0.0);
+                GridTrackGeometry::new(start, end, input.collapsed_auto_fit)
+            })
+            .collect();
+        Some(Self { tracks })
     }
 
-    pub(in crate::layout) fn with_line_offsets(
-        line_offsets: Vec<f32>,
-        track_sizes: Vec<f32>,
+    /// Build canonical used geometry after `repeat(auto-fit, ...)` has
+    /// collapsed its empty tracks.
+    ///
+    /// The gutters bordering an interior collapsed run overlap into one
+    /// gutter between its bounding active tracks. A run touching a Grid edge
+    /// has no outer gutter. Keeping this normalization at the topology
+    /// boundary ensures sizing, alignment, and Grid Lanes consume the same
+    /// CSS used geometry.
+    /// <https://drafts.csswg.org/css-grid-1/#auto-repeat>
+    pub(in crate::layout) fn from_auto_fit_track_layout(
+        mut track_sizes: Vec<f32>,
         interior_gutters: Vec<f32>,
         collapsed_auto_fit_tracks: Vec<bool>,
-    ) -> Self {
-        debug_assert_eq!(
-            interior_gutters.len(),
-            track_sizes.len().saturating_sub(1),
-            "a Grid axis has one interior gutter between each adjacent track"
-        );
-        debug_assert_eq!(
-            collapsed_auto_fit_tracks.len(),
-            track_sizes.len(),
-            "auto-fit collapse provenance belongs to individual tracks"
-        );
-        debug_assert_eq!(
-            line_offsets.len(),
-            track_sizes.len().saturating_add(1),
-            "a Grid axis has one more line than track"
-        );
-        Self {
-            line_offsets,
-            track_sizes,
-            interior_gutters,
-            collapsed_auto_fit_tracks,
+    ) -> Option<Self> {
+        if interior_gutters.len() != track_sizes.len().saturating_sub(1)
+            || collapsed_auto_fit_tracks.len() != track_sizes.len()
+        {
+            return None;
         }
+
+        for (size, &collapsed) in track_sizes.iter_mut().zip(&collapsed_auto_fit_tracks) {
+            if collapsed {
+                *size = 0.0;
+            }
+        }
+        let interior_gutters =
+            collapsed_auto_fit_gutters(&interior_gutters, &collapsed_auto_fit_tracks);
+        Self::from_track_layout(track_sizes, interior_gutters, collapsed_auto_fit_tracks)
     }
 
     pub(in crate::layout) fn from_line_offsets(
         line_offsets: Vec<f32>,
         track_sizes: Vec<f32>,
         collapsed_auto_fit_tracks: Vec<bool>,
-    ) -> Self {
-        debug_assert_eq!(line_offsets.len(), track_sizes.len().saturating_add(1));
-        let interior_gutters = grid_layout_track_gutters(&line_offsets, &track_sizes);
-        Self::with_line_offsets(
-            line_offsets,
-            track_sizes,
-            interior_gutters,
-            collapsed_auto_fit_tracks,
+    ) -> Option<Self> {
+        if line_offsets.len() != track_sizes.len().saturating_add(1)
+            || collapsed_auto_fit_tracks.len() != track_sizes.len()
+        {
+            return None;
+        }
+        let starts = &line_offsets[..track_sizes.len()];
+        let ends = starts
+            .iter()
+            .zip(&track_sizes)
+            .map(|(start, size)| *start + size.max(0.0))
+            .collect::<Vec<_>>();
+        Self::from_track_bounds(starts, &ends, collapsed_auto_fit_tracks)
+    }
+
+    /// Build an axis from the final physical bounds of each track.
+    ///
+    /// This is a lossless physical-bounds constructor: it does not apply
+    /// target `auto-fit` gutter normalization. Grid Lanes retains each
+    /// track's start and end separately so that a
+    /// lane item's grid area never absorbs the gutter after it.  Converting
+    /// that representation back to the canonical Grid topology must use the
+    /// space *between* adjacent bounds as the interior gutter; treating the
+    /// track-end sequence as Grid line offsets loses gutters before
+    /// zero-sized tracks.
+    /// <https://www.w3.org/TR/css-grid-1/#gutters>
+    pub(in crate::layout) fn from_track_bounds(
+        track_starts: &[f32],
+        track_ends: &[f32],
+        collapsed_auto_fit_tracks: Vec<bool>,
+    ) -> Option<Self> {
+        if track_starts.len() != track_ends.len()
+            || collapsed_auto_fit_tracks.len() != track_starts.len()
+        {
+            return None;
+        }
+        Self::from_track_geometry(
+            track_starts
+                .iter()
+                .zip(track_ends)
+                .zip(collapsed_auto_fit_tracks)
+                .map(|((start, end), collapsed)| (*start, *end, collapsed)),
         )
     }
 
-    pub(in crate::layout) fn track_sizes(&self) -> &[f32] {
-        &self.track_sizes
+    pub(in crate::layout) fn from_track_geometry(
+        tracks: impl IntoIterator<Item = (f32, f32, bool)>,
+    ) -> Option<Self> {
+        let mut previous_end = None;
+        let tracks = tracks
+            .into_iter()
+            .map(|(start, end, collapsed)| {
+                if !start.is_finite()
+                    || !end.is_finite()
+                    || start > end
+                    || previous_end.is_some_and(|previous| previous > start)
+                {
+                    return None;
+                }
+                previous_end = Some(end);
+                Some(GridTrackGeometry::new(start, end, collapsed))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { tracks })
     }
 
-    pub(in crate::layout) fn interior_gutters(&self) -> &[f32] {
-        &self.interior_gutters
+    pub(in crate::layout) fn track_count(&self) -> usize {
+        self.tracks.len()
     }
 
-    pub(in crate::layout) fn collapsed_auto_fit_tracks(&self) -> &[bool] {
-        &self.collapsed_auto_fit_tracks
+    pub(in crate::layout) fn track(&self, index: usize) -> Option<GridTrackGeometry> {
+        self.tracks.get(index).copied()
+    }
+
+    pub(in crate::layout) fn extent(&self) -> f32 {
+        match (self.tracks.first(), self.tracks.last()) {
+            (Some(first), Some(last)) => (last.end - first.start).max(0.0),
+            _ => 0.0,
+        }
+    }
+
+    pub(in crate::layout) fn track_sizes_iter(&self) -> impl ExactSizeIterator<Item = f32> + '_ {
+        self.tracks.iter().map(|track| track.size())
+    }
+
+    pub(in crate::layout) fn collapsed_tracks_iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = bool> + '_ {
+        self.tracks.iter().map(|track| !track.is_active())
+    }
+
+    pub(in crate::layout) fn track_sizes(&self) -> Vec<f32> {
+        self.track_sizes_iter().collect()
+    }
+
+    pub(in crate::layout) fn interior_gutters(&self) -> Vec<f32> {
+        self.tracks
+            .windows(2)
+            .map(|tracks| (tracks[1].start - tracks[0].end).max(0.0))
+            .collect()
+    }
+
+    pub(in crate::layout) fn collapsed_auto_fit_tracks(&self) -> Vec<bool> {
+        self.tracks
+            .iter()
+            .map(|track| track.collapsed_auto_fit)
+            .collect()
     }
 
     pub(in crate::layout) fn line_offsets(&self) -> Vec<f32> {
-        self.line_offsets.clone()
+        let mut offsets = self
+            .tracks
+            .iter()
+            .map(|track| track.start)
+            .collect::<Vec<_>>();
+        if let Some(last) = self.tracks.last() {
+            offsets.push(last.end);
+        }
+        offsets
+    }
+
+    /// Return the unaligned physical bounds of a one-based Grid line range.
+    /// The final edge is the preceding track's end, never the following
+    /// track's start across a gutter.
+    pub(in crate::layout) fn area_bounds(
+        &self,
+        start_line: u16,
+        end_line: u16,
+    ) -> Option<(f32, f32)> {
+        let start_track = usize::from(start_line).checked_sub(1)?;
+        let end_track = usize::from(end_line).checked_sub(2)?;
+        let start = self.tracks.get(start_track)?.start;
+        let end = self.tracks.get(end_track)?.end;
+        (start_track <= end_track).then_some((start, end.max(start)))
+    }
+
+    pub(in crate::layout) fn aligned_area_bounds(
+        &self,
+        content_alignment: css::ContentAlignment,
+        container_size: f32,
+        start_line: u16,
+        end_line: u16,
+    ) -> Option<(f32, f32)> {
+        let start_track = usize::from(start_line).checked_sub(1)?;
+        let end_track = usize::from(end_line).checked_sub(2)?;
+        if start_track > end_track {
+            return None;
+        }
+        let line_offsets = self.line_offsets();
+        let collapsed = self.collapsed_auto_fit_tracks();
+        let start = content_aligned_grid_line_offset_with_collapsed_tracks(
+            content_alignment,
+            container_size,
+            &line_offsets,
+            start_track,
+            Some(&collapsed),
+        )?;
+        let end_start = content_aligned_grid_line_offset_with_collapsed_tracks(
+            content_alignment,
+            container_size,
+            &line_offsets,
+            end_track,
+            Some(&collapsed),
+        )?;
+        let end = end_start + self.tracks.get(end_track)?.size();
+        Some((start, end.max(start)))
     }
 
     pub(in crate::layout) fn has_collapsed_auto_fit_tracks(&self) -> bool {
-        self.collapsed_auto_fit_tracks
+        self.tracks.iter().any(|track| track.collapsed_auto_fit)
+    }
+
+    /// Reverse backend-logical track order into increasing physical order.
+    pub(in crate::layout) fn reversed(&self) -> Self {
+        let Some(first) = self.tracks.first() else {
+            return Self::default();
+        };
+        let outer_start = first.start;
+        let outer_end = self
+            .tracks
+            .last()
+            .map(|track| track.end)
+            .unwrap_or(outer_start);
+        let tracks = self
+            .tracks
             .iter()
-            .any(|collapsed| *collapsed)
+            .rev()
+            .map(|track| {
+                GridTrackGeometry::new(
+                    outer_start + outer_end - track.end,
+                    outer_start + outer_end - track.start,
+                    track.collapsed_auto_fit,
+                )
+            })
+            .collect();
+        Self { tracks }
     }
 }
 
@@ -136,7 +363,7 @@ impl GridLayout {
     ///
     /// Grid Lanes uses these only while resolving its Level 3 intrinsic
     /// auto-repeat hypothesis, before it performs its distinct packing pass.
-    pub(super) fn physical_track_sizes(&self, axis: GridAxis) -> &[f32] {
+    pub(super) fn physical_track_sizes(&self, axis: GridAxis) -> Vec<f32> {
         self.axis_topology(axis).track_sizes()
     }
 
@@ -163,14 +390,10 @@ impl GridLayout {
     pub(super) fn set_physical_grid_axis_topology(
         &mut self,
         axis: GridAxis,
-        line_offsets: Vec<f32>,
-        track_sizes: Vec<f32>,
-        collapsed_tracks: Vec<bool>,
+        topology: GridAxisTopology,
         line_names: Vec<css::GridLineNames>,
     ) {
-        debug_assert_eq!(line_offsets.len(), line_names.len());
-        let topology =
-            GridAxisTopology::from_line_offsets(line_offsets, track_sizes, collapsed_tracks);
+        debug_assert_eq!(topology.line_offsets().len(), line_names.len());
         match axis {
             GridAxis::Column => {
                 self.columns = topology;
@@ -184,19 +407,50 @@ impl GridLayout {
     }
 }
 
-fn grid_layout_track_gutters(line_offsets: &[f32], track_sizes: &[f32]) -> Vec<f32> {
-    line_offsets
-        .windows(2)
-        .zip(track_sizes)
-        .map(|(lines, size)| (lines[1] - lines[0] - size).max(0.0))
-        .take(track_sizes.len().saturating_sub(1))
+/// Canonicalize gutters around collapsed `auto-fit` tracks.
+///
+/// Each interior collapsed run merges its two adjacent gutters by overlap.
+/// The canonical physical ordering keeps that merged gutter immediately after
+/// the active track preceding the run. Runs at either outer edge have no
+/// gutter because one of the two sides is absent. An occupied zero-sized track
+/// remains active and therefore keeps its normal gutters.
+/// <https://drafts.csswg.org/css-grid-1/#auto-repeat>
+fn collapsed_auto_fit_gutters(gutters: &[f32], collapsed_tracks: &[bool]) -> Vec<f32> {
+    debug_assert_eq!(gutters.len(), collapsed_tracks.len().saturating_sub(1));
+    let Some(last_active_track) = collapsed_tracks.iter().rposition(|&collapsed| !collapsed) else {
+        return vec![0.0; gutters.len()];
+    };
+
+    gutters
+        .iter()
+        .enumerate()
+        .map(|(index, &gutter)| {
+            // An active track followed by any later active track contributes
+            // exactly one gutter, whether the next active track is adjacent
+            // or separated by a collapsed run.
+            if !collapsed_tracks[index] && index < last_active_track {
+                gutter.max(0.0)
+            } else {
+                0.0
+            }
+        })
         .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GridLayoutPurpose {
     FinalLayout,
+    /// Final track sizing used only to determine a floated Grid's automatic
+    /// block size. It borrows any installed subgrid context so final replay
+    /// remains its one-shot owner.
+    FloatBlockSizeMeasurement,
     IntrinsicProbe,
+}
+
+impl GridLayoutPurpose {
+    pub(super) const fn uses_final_track_sizing(self) -> bool {
+        matches!(self, Self::FinalLayout | Self::FloatBlockSizeMeasurement)
+    }
 }
 
 /// One cloned grid item fragment's destination interval and continuous
@@ -354,6 +608,28 @@ pub(super) struct GridItemArea {
     pub(super) row_end: u16,
     pub(super) column_start: u16,
     pub(super) column_end: u16,
+}
+
+impl GridItemArea {
+    fn reverse_line_range(start: u16, end: u16, track_count: usize) -> Option<(u16, u16)> {
+        let boundary = u16::try_from(track_count).ok()?.checked_add(2)?;
+        Some((boundary.checked_sub(end)?, boundary.checked_sub(start)?))
+    }
+
+    pub(super) fn with_reversed_axis(self, axis: GridAxis, track_count: usize) -> Option<Self> {
+        let mut area = self;
+        match axis {
+            GridAxis::Column => {
+                (area.column_start, area.column_end) =
+                    Self::reverse_line_range(area.column_start, area.column_end, track_count)?;
+            }
+            GridAxis::Row => {
+                (area.row_start, area.row_end) =
+                    Self::reverse_line_range(area.row_start, area.row_end, track_count)?;
+            }
+        }
+        Some(area)
+    }
 }
 
 /// Replace Taffy's emulated subgrid area with the selected parent track area.
@@ -652,6 +928,142 @@ impl GridItemLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_axis_area_bounds_exclude_the_following_gutter() {
+        let topology = GridAxisTopology::from_track_layout(
+            vec![100.0, 40.0, 60.0],
+            vec![20.0, 10.0],
+            vec![false; 3],
+        )
+        .unwrap();
+
+        assert_eq!(topology.area_bounds(1, 2), Some((0.0, 100.0)));
+        assert_eq!(topology.area_bounds(1, 3), Some((0.0, 160.0)));
+        assert_eq!(topology.area_bounds(2, 4), Some((120.0, 230.0)));
+    }
+
+    #[test]
+    fn grid_axis_topology_rejects_mismatched_and_overlapping_geometry() {
+        assert!(
+            GridAxisTopology::from_track_layout(vec![10.0, 20.0], Vec::new(), vec![false; 2],)
+                .is_none()
+        );
+        assert!(
+            GridAxisTopology::from_line_offsets(vec![0.0, 10.0], vec![10.0, 20.0], vec![false; 2],)
+                .is_none()
+        );
+        assert!(
+            GridAxisTopology::from_track_bounds(&[0.0, 5.0], &[10.0, 20.0], vec![false; 2],)
+                .is_none()
+        );
+        assert!(
+            GridAxisTopology::from_track_layout(vec![f32::NAN], Vec::new(), vec![false]).is_none()
+        );
+    }
+
+    #[test]
+    fn empty_and_zero_sized_topologies_remain_valid_when_reversed() {
+        let empty = GridAxisTopology::from_track_layout(Vec::new(), Vec::new(), Vec::new())
+            .expect("an empty axis is valid topology");
+        assert_eq!(empty.track_count(), 0);
+        assert_eq!(empty.reversed().track_count(), 0);
+
+        let zero = GridAxisTopology::from_track_layout(vec![0.0], Vec::new(), vec![false])
+            .expect("an occupied zero-sized track is valid topology")
+            .reversed();
+        assert_eq!(zero.area_bounds(1, 2), Some((0.0, 0.0)));
+        assert_eq!(zero.collapsed_auto_fit_tracks(), vec![false]);
+    }
+
+    #[test]
+    fn auto_fit_topology_merges_gutters_around_an_interior_collapsed_run() {
+        let topology = GridAxisTopology::from_auto_fit_track_layout(
+            vec![10.0, 10.0, 10.0, 10.0, 10.0],
+            vec![3.0, 4.0, 5.0, 6.0],
+            vec![false, true, true, false, false],
+        )
+        .unwrap();
+
+        assert_eq!(topology.track_sizes(), vec![10.0, 0.0, 0.0, 10.0, 10.0]);
+        assert_eq!(topology.interior_gutters(), vec![3.0, 0.0, 0.0, 6.0]);
+        assert_eq!(
+            topology.line_offsets(),
+            vec![0.0, 13.0, 13.0, 13.0, 29.0, 39.0]
+        );
+    }
+
+    #[test]
+    fn auto_fit_topology_removes_outer_collapsed_run_gutters() {
+        let leading = GridAxisTopology::from_auto_fit_track_layout(
+            vec![10.0, 10.0, 10.0, 10.0],
+            vec![3.0, 4.0, 5.0],
+            vec![true, true, false, false],
+        )
+        .unwrap();
+        let trailing = GridAxisTopology::from_auto_fit_track_layout(
+            vec![10.0, 10.0, 10.0, 10.0],
+            vec![3.0, 4.0, 5.0],
+            vec![false, false, true, true],
+        )
+        .unwrap();
+        let all = GridAxisTopology::from_auto_fit_track_layout(
+            vec![10.0, 10.0, 10.0],
+            vec![3.0, 4.0],
+            vec![true; 3],
+        )
+        .unwrap();
+
+        assert_eq!(leading.interior_gutters(), vec![0.0, 0.0, 5.0]);
+        assert_eq!(trailing.interior_gutters(), vec![3.0, 0.0, 0.0]);
+        assert_eq!(all.interior_gutters(), vec![0.0, 0.0]);
+        assert_eq!(all.line_offsets(), vec![0.0; 4]);
+    }
+
+    #[test]
+    fn auto_fit_topology_does_not_collapse_an_occupied_zero_sized_track() {
+        let topology = GridAxisTopology::from_auto_fit_track_layout(
+            vec![10.0, 0.0, 10.0],
+            vec![3.0, 4.0],
+            vec![false, false, false],
+        )
+        .unwrap();
+
+        assert_eq!(topology.track_sizes(), vec![10.0, 0.0, 10.0]);
+        assert_eq!(topology.interior_gutters(), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn grid_axis_reversal_keeps_bounds_and_area_projection_in_sync() {
+        let topology = GridAxisTopology::from_track_layout(
+            vec![30.0, 10.0, 20.0],
+            vec![5.0, 7.0],
+            vec![false, true, false],
+        )
+        .unwrap()
+        .reversed();
+        assert_eq!(topology.track_sizes(), vec![20.0, 10.0, 30.0]);
+        assert_eq!(topology.interior_gutters(), vec![7.0, 5.0]);
+        assert_eq!(
+            topology.collapsed_auto_fit_tracks(),
+            vec![false, true, false]
+        );
+
+        let area = GridItemArea {
+            row_start: 1,
+            row_end: 2,
+            column_start: 1,
+            column_end: 2,
+        }
+        .with_reversed_axis(GridAxis::Column, 3)
+        .expect("valid area projects into physical lines");
+        assert_eq!((area.column_start, area.column_end), (3, 4));
+        assert_eq!(
+            area.with_reversed_axis(GridAxis::Column, 3)
+                .map(|area| (area.column_start, area.column_end)),
+            Some((1, 2))
+        );
+    }
 
     #[test]
     fn grid_layout_retains_a_physical_content_height() {
