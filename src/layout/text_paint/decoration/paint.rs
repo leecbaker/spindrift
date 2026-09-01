@@ -11,7 +11,7 @@ use crate::layout::text_paint::TextDecorationOriginFragmentGeometry;
 /// earlier fragment. Negative adjustments extend only the outer endpoint. For
 /// `clone`, each fragment has its own basis and both edges are adjusted.
 /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
-fn text_decoration_fragment_insets(
+pub(in crate::layout) fn text_decoration_fragment_insets(
     decoration: &TextDecorationLayer,
     fragment: &TextDecorationOriginFragmentGeometry,
 ) -> (f32, f32) {
@@ -20,8 +20,8 @@ fn text_decoration_fragment_insets(
         &fragment.origin_style
     ));
     let percentage_basis = match fragment.origin_style.box_decoration_break {
-        BoxDecorationBreak::Slice => fragment.total_inline_extent,
-        BoxDecorationBreak::Clone => fragment.fragment_inline_extent,
+        BoxDecorationBreak::Slice => fragment.complete_inline_range.extent(),
+        BoxDecorationBreak::Clone => fragment.fragment_inline_range.extent(),
     };
     let (start, end) = decoration
         .decoration
@@ -32,14 +32,16 @@ fn text_decoration_fragment_insets(
         BoxDecorationBreak::Clone => (start, end),
         BoxDecorationBreak::Slice => {
             let start = if start.is_sign_positive() {
-                (start - fragment.preceding_inline_extent.points()).max(0.0)
+                (start - fragment.fragment_inline_range.start().points()).max(0.0)
             } else if fragment.is_first_fragment {
                 start
             } else {
                 0.0
             };
             let end = if end.is_sign_positive() {
-                (end - fragment.following_inline_extent.points()).max(0.0)
+                (end - (fragment.complete_inline_range.end().points()
+                    - fragment.fragment_inline_range.end().points()))
+                .max(0.0)
             } else if fragment.is_last_fragment {
                 end
             } else {
@@ -236,16 +238,11 @@ impl<'a> LayoutBuilder<'a> {
                     .used(layout_pt(inline_span.length()), origin_style.font_size)
             });
         let (baseline, geometry) = if let Some(line_geometry) = line_geometry {
-            let baseline = match style.writing_mode {
-                WritingMode::HorizontalTb => PaintPoint::new(x, line_geometry.line_reference.y),
-                WritingMode::VerticalRl
-                | WritingMode::VerticalLr
-                | WritingMode::SidewaysRl
-                | WritingMode::SidewaysLr => {
-                    PaintPoint::new(line_geometry.line_reference.x, baseline_y)
-                }
-            };
-            (baseline, line_geometry.geometry)
+            // `inline_span` is page-relative, while glyph runs and their ink
+            // boxes are positioned from the prepared line reference. Retain
+            // both coordinates rather than moving the reference to the
+            // selected decoration endpoint.
+            (line_geometry.line_reference, line_geometry.geometry)
         } else {
             let considered_font_id = self.font_system.resolve_style(style);
             let considered_metrics = self
@@ -263,6 +260,9 @@ impl<'a> LayoutBuilder<'a> {
         let ink_boxes = self.font_system.glyph_ink_boxes_for_runs(runs, baseline.y);
         let selected_glyphs =
             line_geometry.map(|geometry| geometry.glyph_sequence.glyphs.as_slice());
+        let positioned_ink_boxes =
+            line_geometry.map(|geometry| geometry.positioned_ink_boxes.as_slice());
+        let receiver_spans = line_geometry.map(|geometry| geometry.receiver_spans.as_slice());
         for stroke in prepare_text_decoration_strokes(TextDecorationPreparationInput {
             baseline,
             inline_span,
@@ -270,9 +270,10 @@ impl<'a> LayoutBuilder<'a> {
             inset_end,
             style,
             inset_style: origin_style,
-            inset_inline_axis: line_geometry
-                .and_then(|geometry| geometry.origin_inline_axis)
-                .or_else(|| VerticalInlineAxis::for_style(origin_style)),
+            inset_inline_axis: line_geometry.map_or_else(
+                || TextDecorationInlineAxis::for_style(origin_style),
+                |geometry| geometry.origin_inline_axis,
+            ),
             decoration: decoration.decoration.clone(),
             phase,
             color,
@@ -284,6 +285,8 @@ impl<'a> LayoutBuilder<'a> {
                 runs,
                 &ink_boxes,
                 selected_glyphs,
+                positioned_ink_boxes,
+                receiver_spans,
             );
         }
     }
@@ -301,7 +304,9 @@ impl<'a> LayoutBuilder<'a> {
         runs: &[RenderedTextRun],
         ink_boxes: &[GlyphInkBox],
     ) {
-        self.paint_text_decoration_stroke_with_selected_glyphs(stroke, runs, ink_boxes, None);
+        self.paint_text_decoration_stroke_with_selected_glyphs(
+            stroke, runs, ink_boxes, None, None, None,
+        );
     }
 
     fn paint_text_decoration_stroke_with_selected_glyphs(
@@ -310,6 +315,8 @@ impl<'a> LayoutBuilder<'a> {
         runs: &[RenderedTextRun],
         ink_boxes: &[GlyphInkBox],
         selected_glyphs: Option<&[TextDecorationPositionedGlyph]>,
+        positioned_ink_boxes: Option<&[TextDecorationPositionedInkBox]>,
+        receiver_spans: Option<&[TextInlineSpan]>,
     ) {
         let PreparedTextDecorationStroke {
             axis,
@@ -341,6 +348,8 @@ impl<'a> LayoutBuilder<'a> {
             runs,
             ink_boxes,
             selected_glyphs,
+            positioned_ink_boxes,
+            receiver_spans,
         );
         match style {
             TextDecorationStyle::Double if thickness >= 1.5 => {
@@ -545,4 +554,122 @@ fn text_decoration_physical_inline_span(
     VerticalInlineAxis::for_style(style)
         .map(|axis| axis.project_span_from_start(layout_pt(baseline_y), local_span))
         .unwrap_or_else(|| TextInlineSpan::from_start_and_length(x, width))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::layout::text_paint::TextDecorationLogicalInlineRange;
+
+    fn layer_and_geometry(
+        break_mode: BoxDecorationBreak,
+        start: css::ComputedLengthPercentage,
+        end: css::ComputedLengthPercentage,
+        fragment_start: f32,
+        fragment_end: f32,
+        total_end: f32,
+    ) -> (TextDecorationLayer, TextDecorationOriginFragmentGeometry) {
+        let mut style = ComputedStyle::initial();
+        style.box_decoration_break = break_mode;
+        style.text_decoration.underline = true;
+        style.text_decoration.inset = css::TextDecorationInset::Lengths { start, end };
+        style.rebuild_own_text_decoration_origin();
+        let layer = style
+            .text_decoration_origins
+            .effective_layers_vec()
+            .into_iter()
+            .next()
+            .expect("visible line creates own origin");
+        let geometry = TextDecorationOriginFragmentGeometry {
+            origin_style: Rc::clone(&layer.origin_style),
+            complete_inline_range: TextDecorationLogicalInlineRange::from_edges(
+                layout_pt(0.0),
+                layout_pt(total_end),
+            ),
+            fragment_inline_range: TextDecorationLogicalInlineRange::from_edges(
+                layout_pt(fragment_start),
+                layout_pt(fragment_end),
+            ),
+            is_first_fragment: fragment_start == 0.0,
+            is_last_fragment: fragment_end == total_end,
+        };
+        (layer, geometry)
+    }
+
+    fn geometry_for_layer(
+        layer: &TextDecorationLayer,
+        fragment_start: f32,
+        fragment_end: f32,
+        total_end: f32,
+    ) -> TextDecorationOriginFragmentGeometry {
+        TextDecorationOriginFragmentGeometry {
+            origin_style: Rc::clone(&layer.origin_style),
+            complete_inline_range: TextDecorationLogicalInlineRange::from_edges(
+                layout_pt(0.0),
+                layout_pt(total_end),
+            ),
+            fragment_inline_range: TextDecorationLogicalInlineRange::from_edges(
+                layout_pt(fragment_start),
+                layout_pt(fragment_end),
+            ),
+            is_first_fragment: fragment_start == 0.0,
+            is_last_fragment: fragment_end == total_end,
+        }
+    }
+
+    #[test]
+    fn slice_carries_positive_start_inset_across_three_fragments() {
+        let (layer, first) = layer_and_geometry(
+            BoxDecorationBreak::Slice,
+            css::ComputedLengthPercentage::from_points(25.0),
+            css::ComputedLengthPercentage::ZERO,
+            0.0,
+            10.0,
+            30.0,
+        );
+        let middle = geometry_for_layer(&layer, 10.0, 20.0, 30.0);
+        let last = geometry_for_layer(&layer, 20.0, 30.0, 30.0);
+
+        assert_eq!(text_decoration_fragment_insets(&layer, &first), (25.0, 0.0));
+        assert_eq!(
+            text_decoration_fragment_insets(&layer, &middle),
+            (15.0, 0.0)
+        );
+        assert_eq!(text_decoration_fragment_insets(&layer, &last), (5.0, 0.0));
+    }
+
+    #[test]
+    fn clone_resolves_percentages_against_each_fragment() {
+        let (layer, fragment) = layer_and_geometry(
+            BoxDecorationBreak::Clone,
+            css::ComputedLengthPercentage::from_percent(0.25),
+            css::ComputedLengthPercentage::from_percent(-0.10),
+            10.0,
+            30.0,
+            60.0,
+        );
+
+        assert_eq!(
+            text_decoration_fragment_insets(&layer, &fragment),
+            (5.0, -2.0)
+        );
+    }
+
+    #[test]
+    fn slice_negative_end_belongs_only_to_last_fragment() {
+        let (layer, middle) = layer_and_geometry(
+            BoxDecorationBreak::Slice,
+            css::ComputedLengthPercentage::ZERO,
+            css::ComputedLengthPercentage::from_points(-4.0),
+            10.0,
+            20.0,
+            30.0,
+        );
+        let last = geometry_for_layer(&layer, 20.0, 30.0, 30.0);
+
+        assert_eq!(text_decoration_fragment_insets(&layer, &middle), (0.0, 0.0));
+        assert_eq!(text_decoration_fragment_insets(&layer, &last), (0.0, -4.0));
+    }
 }

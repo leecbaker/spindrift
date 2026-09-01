@@ -171,6 +171,14 @@ Primary references:
   incomplete.
   <https://drafts.csswg.org/css-text-4/#text-wrap-style>
 
+### CSS Text Level 5 `text-fit`
+
+- `text-fit` implements `consistent`, `per-line`, and `per-line-all` for a
+  collected unfragmented inline sequence. Fitting across fragmentainers or
+  columns, and fitting where a changed line block-size reflows active float
+  exclusions are unsupported.
+  <https://drafts.csswg.org/css-text-5/#text-fit-property>
+
 ### CSS Overflow Line Clamping
 
 - Spec area: CSS Overflow Level 4 `line-clamp`, its longhands, and legacy
@@ -870,10 +878,11 @@ Primary references:
 - Divergence: `text-decoration-skip-box`, complete
   `text-decoration-skip-self` edge cases, decoration collision refinements, and
   rare fragmented vertical decoration cases are incomplete.
-- Divergence: deferred text-decoration receiver endpoints are not yet
-  reconciled across propagated decorations whose receivers use different
-  writing modes or inline directions; origin-owned `text-decoration-inset`
-  endpoints need a shared logical-inline fragment model for that case.
+- Divergence: propagated text decorations crossing orthogonal receivers do
+  not yet map each receiver's local logical span into, and intersect it with,
+  the decorating origin's logical fragment range. Origin endpoints retain
+  their physical logical-start side, including bidi and sideways directions,
+  but mixed-writing-mode receiver intersection remains incomplete.
 - Divergence: `text-decoration-skip-spaces` does not yet normalize preserved
   `break-spaces` glyph-sequence edges across shaping boundaries that retain
   pair-positioning adjustments, so equivalent split and unsplit source can
@@ -1521,7 +1530,12 @@ Primary references:
   definite grid container commits each page or column fragment, including
   paintless continuation slices. Ordinary transparent absolute paint retains
   its resolved destination page, and viewport-fixed layers replay across
-  retained positive absolute spans independently of source order.
+  retained positive absolute spans independently of source order. A nested
+  absolute descendant of a positioned box replayed from an atomic inline can
+  still retain the positioned parent's scratch coordinate space instead of
+  following that parent to the atom's final page position; the reference
+  overlays in `text-decoration-inset-017` through `-023` expose this remaining
+  escaped-atom translation gap.
 - Divergence: `isolation`, blend modes, filters, masks (including
   `mask-border-source`), and `clip-path`, containment-triggered paint
   isolation, `content-visibility`, and `will-change` lack full visual

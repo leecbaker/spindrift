@@ -396,8 +396,11 @@ impl<'a> LayoutBuilder<'a> {
             &mut output,
         );
         let records = std::mem::take(&mut output.sequence.records);
-        let (records, fragment_text_box_trim) =
-            self.with_text_box_line_trim_applied(records, block_style);
+        let (records, fragment_text_box_trim) = self.with_text_box_line_trim_applied(
+            records,
+            block_style,
+            self.current_text_box_line_trim(),
+        );
         output.sequence.records = records;
         output.sequence.fragment_text_box_trim = fragment_text_box_trim;
         let mut preceding_line_direction = None;
@@ -472,6 +475,7 @@ impl<'a> LayoutBuilder<'a> {
                         is_phantom: false,
                         is_first_formatted_line: line_index == 0,
                         is_last_line_in_paragraph: true,
+                        termination: inline_layout::InlineLineTermination::BlockEnd,
                         is_forced_empty: true,
                         used_bidi_base_direction: None,
                         starts_after_preserved_segment_break: false,
@@ -489,6 +493,7 @@ impl<'a> LayoutBuilder<'a> {
                         ),
                         available_width: context.available_width,
                         line_height: context.block_style.line_height,
+                        text_fit_used_style: None,
                         decoration_origin_fragments: Default::default(),
                     });
                 return true;
@@ -557,6 +562,7 @@ impl<'a> LayoutBuilder<'a> {
                     is_phantom: false,
                     is_first_formatted_line: next_line_count == 0,
                     is_last_line_in_paragraph: true,
+                    termination: inline_layout::InlineLineTermination::BlockEnd,
                     is_forced_empty: true,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: false,
@@ -574,6 +580,7 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                     available_width: context.available_width,
                     line_height: context.block_style.line_height,
+                    text_fit_used_style: None,
                     decoration_origin_fragments: Default::default(),
                 });
             output
@@ -612,6 +619,7 @@ impl<'a> LayoutBuilder<'a> {
                         is_phantom: false,
                         is_first_formatted_line: next_record_line_index == 0,
                         is_last_line_in_paragraph: false,
+                        termination: inline_layout::InlineLineTermination::SoftWrap,
                         // A float-excluded line has no selected source range, but
                         // it still consumes block-size before the next float band.
                         is_forced_empty: true,
@@ -625,6 +633,7 @@ impl<'a> LayoutBuilder<'a> {
                         used_indent: 0.0,
                         available_width: context.available_width,
                         line_height: context.block_style.line_height,
+                        text_fit_used_style: None,
                         decoration_origin_fragments: Default::default(),
                     });
                 next_record_line_index += 1;
@@ -642,6 +651,11 @@ impl<'a> LayoutBuilder<'a> {
                     is_phantom,
                     is_first_formatted_line: line_index == 0,
                     is_last_line_in_paragraph: offset + 1 == line_count,
+                    termination: if offset + 1 == line_count {
+                        inline_layout::InlineLineTermination::BlockEnd
+                    } else {
+                        inline_layout::InlineLineTermination::SoftWrap
+                    },
                     is_forced_empty: false,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: false,
@@ -668,6 +682,7 @@ impl<'a> LayoutBuilder<'a> {
                                 .fold(0.0_f32, f32::max),
                         ),
                     fragment: Some(line.fragment),
+                    text_fit_used_style: None,
                     decoration_origin_fragments: Default::default(),
                 });
             next_record_line_index = line_index + 1;

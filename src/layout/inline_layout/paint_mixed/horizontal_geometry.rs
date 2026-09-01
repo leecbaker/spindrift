@@ -287,6 +287,7 @@ mod tests {
         PreparedInlineTextGroup {
             bounds: PhysicalInlineTextBounds::new(InlinePoint::new(0.0, 0.0), 0.0),
             style: ComputedStyle::initial(),
+            line_block_size: 0.0,
             decoration_provenance: Vec::new(),
             text_box_trim: TextBoxLineTrim::default(),
             paint_opacity: 1.0,

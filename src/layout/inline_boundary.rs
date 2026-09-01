@@ -59,7 +59,7 @@ pub(in crate::layout) fn inline_atom_boundary_role(
         InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
         | InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut)
         | InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
-        | InlineAtomContent::StaticPositionPlaceholder => {
+        | InlineAtomContent::StaticPositionPlaceholder(_) => {
             // Out-of-flow boxes retain a zero-size placeholder for static
             // positioning, but CSS Text processes the surrounding source as
             // one text sequence. The placeholder must not create a text

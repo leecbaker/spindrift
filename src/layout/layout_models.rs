@@ -1156,6 +1156,49 @@ impl InlineTrackingScope {
         self.letter_spacing
     }
 
+    /// Rebuild this lexical scope for a CSS Text `text-fit` used font size.
+    /// Percentage tracking and autospace follow that font size, whereas fixed
+    /// length components remain unchanged in the cloned computed style.
+    /// <https://drafts.csswg.org/css-text-5/#text-fit-property>
+    pub(in crate::layout) fn scaled_for_text_fit(&self, scale: f32) -> Rc<Self> {
+        let parent = self
+            .parent
+            .as_deref()
+            .map(|parent| parent.scaled_for_text_fit(scale));
+        let mut autospace_style = (*self.autospace_style).clone();
+        autospace_style.font_size *= scale;
+        if matches!(
+            autospace_style.line_height_value,
+            css::ComputedLineHeight::Normal | css::ComputedLineHeight::Number(_)
+        ) {
+            autospace_style.line_height = autospace_style
+                .line_height_value
+                .clone()
+                .projected(autospace_style.font_size)
+                .0;
+        }
+        let line_relative_style = self.line_relative_style.as_ref().map(|style| {
+            let mut style = (**style).clone();
+            style.font_size *= scale;
+            if matches!(
+                style.line_height_value,
+                css::ComputedLineHeight::Normal | css::ComputedLineHeight::Number(_)
+            ) {
+                style.line_height = style.line_height_value.clone().projected(style.font_size).0;
+            }
+            Rc::new(style)
+        });
+        Rc::new(Self {
+            parent,
+            depth: self.depth,
+            letter_spacing: autospace_style.used_letter_spacing(),
+            autospace_style: Rc::new(autospace_style),
+            boundary_policy: self.boundary_policy,
+            line_relative_alignment: self.line_relative_alignment,
+            line_relative_style,
+        })
+    }
+
     pub(in crate::layout) fn boundary_policy(&self) -> InlineBoundaryPolicy {
         self.boundary_policy
     }
@@ -1738,6 +1781,19 @@ impl InlineFragment {
             data.boundary_shaped_range = None;
         }
         data.text = text;
+    }
+
+    /// Discard source shaping when a line-local used style changes a shaping
+    /// input while retaining the authored text and source ownership.
+    ///
+    /// CSS Text used-value adjustments such as `text-fit` happen after the
+    /// graph has selected a break. Those selections remain valid, but their
+    /// cached glyph advances and boundary shapes are not.
+    pub(in crate::layout) fn clear_cached_shaping_for_used_style_change(&mut self) {
+        let data = Rc::make_mut(&mut self.data);
+        data.source_shaped_selection = None;
+        data.boundary_shaped_source = None;
+        data.boundary_shaped_range = None;
     }
 
     pub(in crate::layout) fn set_mergeable(&mut self, mergeable: bool) {
@@ -3087,6 +3143,12 @@ pub(in crate::layout) struct PreparedInlineAtom {
 pub(in crate::layout) struct PreparedInlineTextGroup {
     pub(in crate::layout) bounds: PhysicalInlineTextBounds,
     pub(in crate::layout) style: ComputedStyle,
+    /// Logical block-size of the containing line box.
+    ///
+    /// A rotated sideways run aligns its horizontal font metrics within this
+    /// line box rather than within its own `line-height` value.
+    /// <https://www.w3.org/TR/css-inline-3/#line-box>
+    pub(in crate::layout) line_block_size: f32,
     /// Lexical decoration receivers preserved alongside a shared shaped run.
     ///
     /// CSS Text allows shaping across transparent inline boundaries, but line
@@ -3197,6 +3259,9 @@ pub(in crate::layout) struct InlineLineGeometry {
     pub(in crate::layout) inline_start: f32,
     pub(in crate::layout) inline_size: f32,
     pub(in crate::layout) block_start: f32,
+    /// Logical block-size of this line box, retained for its text paint
+    /// groups after the physical block-start projection.
+    pub(in crate::layout) line_block_size: f32,
     /// Block-axis trim applied to this selected line. The trim is stored on
     /// the line record rather than the paint group's style when an inline box
     /// is the source of the trim, so links and decorations can use the same
@@ -3745,5 +3810,32 @@ mod inline_tracking_scope_tests {
         let descendant = InlineTrackingScope::child(root, &scope_style());
 
         assert_eq!(descendant.letter_spacing().points(), 0.0);
+    }
+
+    #[test]
+    fn text_fit_scope_scales_percentage_tracking_but_not_fixed_tracking() {
+        let mut percentage = scope_style();
+        percentage.font_size = 20.0;
+        percentage.letter_spacing = crate::css::ComputedLengthPercentage::from_percent(0.5);
+        let percentage_scope = InlineTrackingScope::root(&percentage);
+        assert_eq!(
+            percentage_scope
+                .scaled_for_text_fit(2.0)
+                .letter_spacing()
+                .points(),
+            20.0
+        );
+
+        let mut fixed = scope_style();
+        fixed.font_size = 20.0;
+        fixed.letter_spacing = crate::css::ComputedLengthPercentage::from_points(10.0);
+        let fixed_scope = InlineTrackingScope::root(&fixed);
+        assert_eq!(
+            fixed_scope
+                .scaled_for_text_fit(2.0)
+                .letter_spacing()
+                .points(),
+            10.0
+        );
     }
 }

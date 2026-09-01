@@ -1,4 +1,26 @@
-use super::*;
+use super::{
+    AlignContent, AlignItems, AlignSelf, AspectRatioCalculationBox, BoxSizing, ComputedStyle,
+    ContentAlignmentKeyword, ContentBoxLength, Direction,
+    FlexAutomaticMinimumAutomaticPreferredCrossSize, FlexAutomaticMinimumContentSizeSource,
+    FlexAutomaticMinimumCrossIntrinsicContributions, FlexAutomaticMinimumInputs,
+    FlexAvailablePercentageBasis, FlexAvailableSizeSource, FlexAvailableSpace, FlexCrossSize,
+    FlexCrossSizeProperty, FlexCrossSizingPhase, FlexDirection, FlexHypotheticalAutomaticCrossSize,
+    FlexItemAvailableSpace, FlexItemBaselineEstimate, FlexItemEstimate, FlexMainSize,
+    IntrinsicItemMetrics, JustifyContent, LayoutLength, LogicalAxis, LogicalInlineContentSize,
+    LogicalInlinePercentageBasis, NonContentLength, PercentageBasis, PhysicalAxis,
+    PhysicalContentHeight, PhysicalContentWidth, RatioOnlyReplacedFlexBaseSize,
+    ReplacedPreferredSize, ReplacedPreferredSizeAxes, ReplacedSizeConstraints, ResolvedAspectRatio,
+    SelfAlignmentKeyword, SemanticLengthExt, TaffyPoint, TaffyRect, TaffySize, WritingModeAxes,
+    constrain_height_with_intrinsic, constrain_width_with_intrinsic, content_box_pt,
+    content_box_size_pt, content_box_to_border_box_length, css, flex_main_content_box_length,
+    horizontal_border_width, layout_pt, measure_intrinsic_item_leaf, non_content_pt,
+    percentage_basis_from_points, resolve_replaced_size_with_aspect_ratio,
+    stretch_fit_content_box_size, taffy_layout, used_border_widths,
+    used_box_metrics_for_logical_inline_basis, used_content_box_height_or_auto_with_basis,
+    used_content_box_width_or_auto_with_basis, used_length_percentage_or_auto,
+    used_length_percentage_or_auto_with_basis, used_max_width, used_min_width,
+    vertical_border_width,
+};
 use crate::layout::taffy_bridge;
 
 mod alignment;
@@ -318,12 +340,12 @@ fn taffy_flex_optional_dimension(
     percentage_policy: FlexTaffyPercentagePolicy,
 ) -> taffy_layout::Dimension {
     match value {
-        css::ComputedLengthPercentageOrAuto::Auto
-        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
             taffy_flex_length_percentage_dimension(value, percentage_policy)
         }
-        css::ComputedLengthPercentageOrAuto::MinContent
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::Stretch
+        | css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
         | css::ComputedLengthPercentageOrAuto::FitContent(_)
         | css::ComputedLengthPercentageOrAuto::CalcSize(_) => taffy_layout::Dimension::auto(),
@@ -468,7 +490,7 @@ pub(super) fn measure_flex_item(
     _available_space: taffy_layout::Size<taffy_layout::AvailableSpace>,
     estimate: Option<&mut FlexItemEstimate>,
 ) -> taffy_layout::Size<f32> {
-    let estimate = estimate.cloned().unwrap_or_else(|| {
+    let estimate = estimate.copied().unwrap_or_else(|| {
         FlexItemEstimate::new(
             IntrinsicItemMetrics::zero(),
             FlexItemBaselineEstimate::default(),
@@ -794,8 +816,8 @@ pub(super) struct FlexMinSizeDimensionContext<'a> {
     pub(super) direction: FlexDirection,
     pub(super) automatic_minimum_inputs: Option<FlexAutomaticMinimumInputs>,
     pub(super) available_cross_size: Option<FlexCrossSize>,
-    /// The cross-axis stretch-fit context for an authored `width`/`height:
-    /// `stretch`. This is distinct from `stretched_cross_size`, which records
+    /// The cross-axis stretch-fit context for an authored `width` or `height`
+    /// whose value is `stretch`. This is distinct from `stretched_cross_size`, which records
     /// Flexbox self-alignment stretch after line sizing.
     pub(super) cross_stretch: FlexStretchFitContext,
     pub(super) stretched_cross_size: Option<FlexCrossSize>,
@@ -1871,6 +1893,11 @@ fn flex_aspect_ratio_basis_from_content_box(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::flex::{
+        FlexAspectRatioSizing, FlexAutomaticPreferredPhysicalSize,
+        flex_available_percentage_basis_from_points,
+    };
+    use crate::layout::{AspectRatioAxisConstraints, ResolvedAspectRatioConstraints, WritingMode};
 
     #[test]
     fn automatic_content_basis_preserves_measured_width_with_preserved_whitespace() {

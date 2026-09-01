@@ -10,7 +10,9 @@ use super::geometry::{
     rect_bounds,
 };
 use super::images::RenderedImage;
-use super::paths::{RenderedPath, path_bounds};
+use super::paths::{
+    RenderedPath, RenderedPathClip, RenderedPathFillRule, paint_rect_path_commands, path_bounds,
+};
 use super::patterns::{RenderedGradientPattern, RenderedImagePattern, RenderedSvgPattern};
 use super::shapes::{RenderedRect, RenderedRoundedRect, RenderedStroke};
 use super::stacking::PaintStackingContext;
@@ -1261,17 +1263,35 @@ impl PaintPrimitive {
                 .map(|_| Self::Image(image)),
             Self::ImagePattern(pattern) => rect_bounds(pattern.paint_rect())
                 .and_then(|bounds| bounds.intersect(clip))
-                .map(|_| Self::ImagePattern(pattern)),
+                .map(|intersection| {
+                    Self::ImagePattern(pattern.with_intersected_clip(RenderedPathClip::new(
+                        paint_rect_path_commands(intersection.paint_rect()),
+                        RenderedPathFillRule::NonZero,
+                        Vec::new(),
+                    )))
+                }),
             Self::ProjectiveRaster(raster) => raster
                 .bounds()
                 .and_then(|bounds| bounds.intersect(clip))
                 .map(|_| Self::ProjectiveRaster(raster)),
             Self::GradientPattern(pattern) => rect_bounds(pattern.paint_bounds())
                 .and_then(|bounds| bounds.intersect(clip))
-                .map(|_| Self::GradientPattern(pattern)),
+                .map(|intersection| {
+                    Self::GradientPattern(pattern.with_intersected_clip(RenderedPathClip::new(
+                        paint_rect_path_commands(intersection.paint_rect()),
+                        RenderedPathFillRule::NonZero,
+                        Vec::new(),
+                    )))
+                }),
             Self::SvgPattern(pattern) => rect_bounds(pattern.paint_rect())
                 .and_then(|bounds| bounds.intersect(clip))
-                .map(|_| Self::SvgPattern(pattern)),
+                .map(|intersection| {
+                    Self::SvgPattern(pattern.with_intersected_clip(RenderedPathClip::new(
+                        paint_rect_path_commands(intersection.paint_rect()),
+                        RenderedPathFillRule::NonZero,
+                        Vec::new(),
+                    )))
+                }),
             Self::Path(path) => path_bounds(&path)
                 .and_then(|bounds| bounds.intersect(clip))
                 .map(|_| Self::Path(path)),

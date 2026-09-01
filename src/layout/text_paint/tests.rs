@@ -72,7 +72,7 @@ fn prepared_decoration_strokes_for_style(
         inset_end: 0.0,
         style,
         inset_style: style,
-        inset_inline_axis: VerticalInlineAxis::for_style(style),
+        inset_inline_axis: TextDecorationInlineAxis::for_style(style),
         decoration,
         phase,
         color: CssColor::BLACK,
@@ -101,7 +101,7 @@ fn decoration_uses_its_origin_font_size_for_auto_thickness() {
         inset_end: 0.0,
         style: &decorated_style,
         inset_style: &origin_style,
-        inset_inline_axis: VerticalInlineAxis::for_style(&origin_style),
+        inset_inline_axis: TextDecorationInlineAxis::for_style(&origin_style),
         decoration,
         phase: TextDecorationPaintPhase::BeforeText,
         color: CssColor::BLACK,
@@ -263,34 +263,35 @@ fn sideways_inline_advance_uses_its_directional_inline_start_side() {
 }
 
 #[test]
-fn vertical_decoration_insets_follow_the_origin_logical_start_edge() {
-    let mut top_start = ComputedStyle::initial();
-    top_start.writing_mode = WritingMode::SidewaysRl;
-    top_start.direction = Direction::Ltr;
-    let top_span = text_decoration_inline_span(
-        TextDecorationStrokeAxis::Vertical,
-        TextInlineSpan::new(60.0, 100.0),
-        10.0,
-        -5.0,
-        &top_start,
-        VerticalInlineAxis::for_style(&top_start),
-    )
-    .unwrap();
-    assert_eq!(top_span, TextInlineSpan::new(55.0, 90.0));
-
-    let mut bottom_start = ComputedStyle::initial();
-    bottom_start.writing_mode = WritingMode::SidewaysLr;
-    bottom_start.direction = Direction::Ltr;
-    let bottom_span = text_decoration_inline_span(
-        TextDecorationStrokeAxis::Vertical,
-        TextInlineSpan::new(60.0, 100.0),
-        10.0,
-        -5.0,
-        &bottom_start,
-        VerticalInlineAxis::for_style(&bottom_start),
-    )
-    .unwrap();
-    assert_eq!(bottom_span, TextInlineSpan::new(70.0, 105.0));
+fn decoration_insets_follow_the_origin_logical_start_edge() {
+    let cases = [
+        (WritingMode::HorizontalTb, Direction::Ltr, 70.0, 105.0),
+        (WritingMode::HorizontalTb, Direction::Rtl, 55.0, 90.0),
+        (WritingMode::SidewaysRl, Direction::Ltr, 55.0, 90.0),
+        (WritingMode::SidewaysRl, Direction::Rtl, 70.0, 105.0),
+        (WritingMode::SidewaysLr, Direction::Ltr, 70.0, 105.0),
+        (WritingMode::SidewaysLr, Direction::Rtl, 55.0, 90.0),
+    ];
+    for (writing_mode, direction, expected_start, expected_end) in cases {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = writing_mode;
+        style.direction = direction;
+        let inline_axis = TextDecorationInlineAxis::for_style(&style);
+        let span = text_decoration_inline_span(
+            inline_axis.stroke_axis(),
+            TextInlineSpan::new(60.0, 100.0),
+            10.0,
+            -5.0,
+            &style,
+            inline_axis,
+        )
+        .unwrap();
+        assert_eq!(
+            span,
+            TextInlineSpan::new(expected_start, expected_end),
+            "{writing_mode:?} {direction:?}",
+        );
+    }
 }
 
 #[test]
@@ -403,6 +404,38 @@ fn skip_ink_auto_keeps_a_short_stroke_when_ink_covers_its_entire_span() {
     assert_eq!(segments.len(), 1);
     assert!((segments[0].start - 0.0).abs() < 0.01, "{segments:?}");
     assert!((segments[0].length - 10.0).abs() < 0.01, "{segments:?}");
+}
+
+#[test]
+fn origin_wide_decoration_preserves_receiver_gaps() {
+    let receiver_spans = [
+        TextInlineSpan::new(0.0, 20.0),
+        TextInlineSpan::new(35.0, 60.0),
+    ];
+    let segments = text_decoration_segments_with_selected_glyphs(
+        TextDecorationSegmentInputs {
+            axis: TextDecorationStrokeAxis::Horizontal,
+            line_x: 0.0,
+            line_y: 0.0,
+            inline_start: 0.0,
+            inline_length: 60.0,
+            block_position: 0.0,
+            thickness: 1.0,
+            skip_ink: TextDecorationSkipInk::None,
+            skip_spaces: TextDecorationSkipSpaces::NONE,
+        },
+        &[],
+        &[],
+        None,
+        None,
+        Some(&receiver_spans),
+    );
+
+    assert_eq!(segments.len(), 2, "{segments:?}");
+    assert!((segments[0].start - 0.0).abs() < 0.01, "{segments:?}");
+    assert!((segments[0].length - 20.0).abs() < 0.01, "{segments:?}");
+    assert!((segments[1].start - 35.0).abs() < 0.01, "{segments:?}");
+    assert!((segments[1].length - 25.0).abs() < 0.01, "{segments:?}");
 }
 
 #[test]

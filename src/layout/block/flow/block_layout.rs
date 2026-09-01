@@ -3603,7 +3603,7 @@ impl<'a> LayoutBuilder<'a> {
                             block_start_page_context.area_height()
                         } else {
                             self.fragmentainer_override
-                                .map(|override_| override_.context.area_height())
+                                .map(|override_| override_.continuation_context().area_height())
                                 .unwrap_or_else(|| self.current_page_context.area_height())
                         };
                         (slice_height + style.padding.bottom + border_widths.bottom).min(capacity)
@@ -3717,7 +3717,7 @@ impl<'a> LayoutBuilder<'a> {
                             block_start_page_context.area_height()
                         } else {
                             self.fragmentainer_override
-                                .map(|override_| override_.context.area_height())
+                                .map(|override_| override_.continuation_context().area_height())
                                 .unwrap_or_else(|| self.current_page_context.area_height())
                         };
                         // Child layout enters a continuation below its
@@ -3864,7 +3864,7 @@ impl<'a> LayoutBuilder<'a> {
                     block_start_page_context.area_height()
                 } else {
                     self.fragmentainer_override
-                        .map(|override_| override_.context.area_height())
+                        .map(|override_| override_.continuation_context().area_height())
                         .unwrap_or_else(|| self.current_page_context.area_height())
                 };
                 (slice_height + style.padding.bottom + border_widths.bottom).min(capacity)
@@ -3970,7 +3970,7 @@ impl<'a> LayoutBuilder<'a> {
                             block_start_page_context.area_height()
                         } else {
                             self.fragmentainer_override
-                                .map(|override_| override_.context.area_height())
+                                .map(|override_| override_.continuation_context().area_height())
                                 .unwrap_or_else(|| self.current_page_context.area_height())
                         };
                         (slice_height + style.padding.bottom + border_widths.bottom).min(capacity)
@@ -4743,7 +4743,7 @@ pub(in crate::layout) fn continuous_fragmentainer_paint_slices(
     let first_context = snapshot.current_page_context();
     let continuation_context = snapshot
         .fragmentainer_override()
-        .map(|override_| override_.context)
+        .map(|override_| override_.continuation_context())
         .unwrap_or(first_context);
     let source_bottom = bounds.y();
     let mut source_top = snapshot.cursor_y().max(source_bottom);
@@ -4826,7 +4826,7 @@ fn vertical_root_continuous_fragmentainer_paint_slices(
     let first_context = snapshot.current_page_context();
     let continuation_context = snapshot
         .fragmentainer_override()
-        .map(|override_| override_.context)
+        .map(|override_| override_.continuation_context())
         .unwrap_or(first_context);
     let capacity = first_context.logical_block_size(principal_flow.writing_mode);
     let ranges = root_page_block_slices(layout_pt(source_extent.block), layout_pt(capacity));
@@ -4908,7 +4908,7 @@ fn promoted_spanner_paint_slices(
     fragmentainer_override: Option<FragmentainerOverride>,
 ) -> Vec<PromotedSpannerPaintSlice> {
     let continuation_context = fragmentainer_override
-        .map(|override_| override_.context)
+        .map(|override_| override_.continuation_context())
         .unwrap_or(last_context);
     (first_page_index..=last_page_index)
         .filter_map(|page_index| {

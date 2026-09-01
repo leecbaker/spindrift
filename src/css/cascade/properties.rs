@@ -197,6 +197,7 @@ define_modeled_longhands! {
     WritingMode => "writing-mode",
     TextOrientation => "text-orientation",
     TextCombineUpright => "text-combine-upright",
+    TextFit => "text-fit",
     LineFitEdge => "line-fit-edge",
     TextBoxTrim => "text-box-trim",
     TextBoxEdge => "text-box-edge",
@@ -730,6 +731,7 @@ impl ModeledLonghand {
                 | "text-align-last"
                 | "text-justify"
                 | "text-autospace"
+                | "text-fit"
                 | "text-spacing-trim"
                 | "word-space-transform"
                 | "initial-letter-align"
@@ -1240,6 +1242,7 @@ fn copy_modeled_longhand_by_css_name(
         "text-align-last" => style.text_align_last = source.text_align_last,
         "text-justify" => style.text_justify = source.text_justify,
         "text-autospace" => style.text_autospace = source.text_autospace,
+        "text-fit" => style.text_fit = source.text_fit,
         "text-spacing-trim" => style.text_spacing_trim = source.text_spacing_trim,
         "word-space-transform" => style.word_space_transform = source.word_space_transform,
         "initial-letter" => style.initial_letter = source.initial_letter,

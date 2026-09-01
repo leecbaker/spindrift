@@ -121,13 +121,22 @@ impl TableWrapperPaintBox {
         self.grid_size.physical_width(self.axes)
     }
 
-    /// Return the physical wrapper measure used by table captions.
+    /// Return the wrapper's logical inline border-box size used by captions.
     ///
-    /// This is deliberately distinct from [`Self::physical_grid_width`]: the
-    /// latter is a grid content-box width, while captions participate beside
-    /// the grid at the wrapper border-box boundary.
-    pub(in crate::layout::table) fn caption_outer_width(self) -> TableCaptionOuterWidth {
-        TableCaptionOuterWidth::from_border_box(border_box_pt(self.border_box().width()))
+    /// Captions resolve `inline-size` against the table wrapper's inline
+    /// dimension. In vertical writing that is physical height, not the
+    /// physical X width occupied by the table's block tracks.
+    /// <https://drafts.csswg.org/css-tables-3/#table-caption-box>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+    pub(in crate::layout::table) fn caption_outer_inline_size(self) -> TableCaptionOuterInlineSize {
+        let vertical = self.axes.flow.writing_mode().has_vertical_lines();
+        let border_box = self.border_box();
+        let inline_size = if vertical {
+            border_box.height()
+        } else {
+            border_box.width()
+        };
+        TableCaptionOuterInlineSize::from_border_box(border_box_pt(inline_size))
     }
 
     pub(in crate::layout::table) fn border_box(self) -> PageTopRect {
@@ -170,14 +179,26 @@ impl TableWrapperMarginBoxFootprint {
     /// root border box and the wrapper-owned caption extents.
     pub(in crate::layout::table) fn from_table_root_border_box(
         table_root_border_box: PageTopRect,
+        wrapper_writing_mode: WritingMode,
         wrapper_top: PageTopBlockPosition,
         top_caption_height: LayoutLength,
         bottom_caption_height: LayoutLength,
         margins: &css::Edges,
     ) -> Self {
-        let border_box_height = top_caption_height.points()
-            + table_root_border_box.height()
-            + bottom_caption_height.points();
+        // Captions contribute to the wrapper's block extent. In a vertical
+        // table that is physical X, while the wrapper's physical-Y extent is
+        // its unchanged logical inline span. Treating caption block sizes as
+        // Y heights corrupts the source cross-axis rectangle retained by the
+        // enclosing multicolumn replay.
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        // <https://drafts.csswg.org/css-tables-3/#table-structure>
+        let border_box_height = if wrapper_writing_mode.has_vertical_lines() {
+            table_root_border_box.height()
+        } else {
+            top_caption_height.points()
+                + table_root_border_box.height()
+                + bottom_caption_height.points()
+        };
         Self(PageTopRect::new(
             table_root_border_box.x() - margins.left,
             wrapper_top.points() + margins.top,
@@ -190,11 +211,25 @@ impl TableWrapperMarginBoxFootprint {
         self.0
     }
 
-    /// Return the following parent block cursor for a horizontal containing
-    /// formatting context. This is intentionally a wrapper-margin-box result;
-    /// table-grid logical progress is not parent-flow progress.
-    pub(in crate::layout::table) fn horizontal_parent_block_end(self) -> PageTopBlockPosition {
-        PageTopBlockPosition::new(self.0.top_y() - self.0.height())
+    /// Return the caller's physical-Y cursor after an unfragmented wrapper.
+    ///
+    /// A horizontal parent stacks the wrapper margin box on Y. A vertical
+    /// parent advances its block cursor on X, however, so its physical-Y
+    /// cursor is its logical inline position and must be retained. Treating
+    /// the wrapper's physical height as a vertical parent's block progress
+    /// shifts later multicol replay into the wrong inline band.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout::table) fn parent_cursor_after_unfragmented(
+        self,
+        parent_axes: FlowAxes,
+        current: PageTopBlockPosition,
+    ) -> PageTopBlockPosition {
+        if parent_axes.writing_mode().has_vertical_lines() {
+            current
+        } else {
+            PageTopBlockPosition::new(self.0.top_y() - self.0.height())
+        }
     }
 }
 

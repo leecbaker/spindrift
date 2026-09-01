@@ -574,7 +574,7 @@ pub(in crate::layout) fn transparent_inline_edge_precedes_visual_content(
         | InlineAtomContent::Image(_)
         | InlineAtomContent::Gradient { .. }
         | InlineAtomContent::Svg { .. }
-        | InlineAtomContent::StaticPositionPlaceholder
+        | InlineAtomContent::StaticPositionPlaceholder(_)
         | InlineAtomContent::InlineBox { .. }
         | InlineAtomContent::Ruby { .. }
         | InlineAtomContent::TextCombineUpright { .. }

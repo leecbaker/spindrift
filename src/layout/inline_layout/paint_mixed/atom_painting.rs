@@ -21,7 +21,7 @@ impl<'a> LayoutBuilder<'a> {
             atom.content(),
             InlineAtomContent::InlineEdge(_)
                 | InlineAtomContent::Leader(_)
-                | InlineAtomContent::StaticPositionPlaceholder
+                | InlineAtomContent::StaticPositionPlaceholder(_)
         ) {
             self.replay_escaped_inline_atom_positioned_layers(prepared);
             return;
@@ -176,7 +176,7 @@ impl<'a> LayoutBuilder<'a> {
             atom.content(),
             InlineAtomContent::InlineEdge(_)
                 | InlineAtomContent::Leader(_)
-                | InlineAtomContent::StaticPositionPlaceholder
+                | InlineAtomContent::StaticPositionPlaceholder(_)
         ) && (atom
             .style()
             .background
@@ -193,7 +193,7 @@ impl<'a> LayoutBuilder<'a> {
         match atom.content() {
             InlineAtomContent::InlineEdge(_)
             | InlineAtomContent::Leader(_)
-            | InlineAtomContent::StaticPositionPlaceholder => {}
+            | InlineAtomContent::StaticPositionPlaceholder(_) => {}
             InlineAtomContent::Canvas => {}
             InlineAtomContent::Iframe(element_id) => {
                 let Some(document) = self.iframe_documents.get(element_id) else {

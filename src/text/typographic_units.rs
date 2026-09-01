@@ -1,4 +1,13 @@
-use super::*;
+use std::ops::Range;
+
+use icu_properties::props::LineBreak;
+use icu_segmenter::GraphemeClusterSegmenter;
+
+use crate::text::{
+    character_has_cursive_shaping_behavior, character_is_default_ignorable_code_point,
+    character_is_join_control, character_is_unicode_alphanumeric, character_is_unicode_control,
+    line_break_class,
+};
 
 /// CSS Text units whose boundaries must preserve cursive joining.
 ///

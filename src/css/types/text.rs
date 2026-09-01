@@ -1,5 +1,7 @@
 mod alignment;
 pub(crate) use self::alignment::*;
+mod fit;
+pub(crate) use self::fit::*;
 mod hyphenation;
 pub(crate) use self::hyphenation::*;
 mod spacing;

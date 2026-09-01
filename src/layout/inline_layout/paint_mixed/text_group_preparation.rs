@@ -448,6 +448,7 @@ impl<'a> LayoutBuilder<'a> {
             visual_inline_start + line_geometry.inline_start_offset,
             tab_metric_style,
         )?;
+        group.line_block_size = line_geometry.line_block_size;
         if let Some(content_bottom_y) = horizontal_content_bottom_y {
             let metrics = self.inline_text_box_metrics(&group.style, 0.0);
             position_horizontal_text_group_at_content_bottom(&mut group, content_bottom_y, metrics);
@@ -514,6 +515,7 @@ impl<'a> LayoutBuilder<'a> {
             preserve_leading_summary_space,
             tab_metric_style,
         )?;
+        group.line_block_size = line_geometry.line_block_size;
         if let Some(content_bottom_y) = horizontal_content_bottom_y {
             let metrics = self.inline_text_box_metrics(&group.style, 0.0);
             position_horizontal_text_group_at_content_bottom(&mut group, content_bottom_y, metrics);

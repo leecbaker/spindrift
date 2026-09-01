@@ -900,6 +900,7 @@ mod tests {
                 block_start: TableFragmentainerBlockStart::new(-72.0),
                 block_span: LogicalBlockContentSize::new(content_box_pt(100.0)),
                 writing_mode: WritingMode::SidewaysLr,
+                outer_fragmentainer: None,
             },
         ] {
             assert_eq!(
@@ -913,6 +914,7 @@ mod tests {
     fn table_wrapper_margin_footprint_projects_parent_block_end() {
         let footprint = TableWrapperMarginBoxFootprint::from_table_root_border_box(
             PageTopRect::new(30.0, 180.0, 60.0, 80.0),
+            WritingMode::HorizontalTb,
             PageTopBlockPosition::new(200.0),
             layout_pt(10.0),
             layout_pt(15.0),
@@ -925,7 +927,10 @@ mod tests {
         );
 
         assert_eq!(
-            footprint.horizontal_parent_block_end(),
+            footprint.parent_cursor_after_unfragmented(
+                FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+                PageTopBlockPosition::new(200.0),
+            ),
             PageTopBlockPosition::new(88.0)
         );
     }
@@ -1589,20 +1594,42 @@ mod tests {
     }
 
     #[test]
-    fn table_root_decoration_translation_uses_grid_source_progress_only() {
-        let progress = TableGridBlockOffset::new(TableGridLength::new(37.5));
+    fn table_root_decoration_uses_full_structural_projection() {
+        let axes = TableAxes::for_direction(Direction::Ltr);
+        let source = TableGridPlacement::with_axes(
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(20.0, 100.0)),
+            axes,
+            TableGridLogicalSize::new(
+                LogicalInlineContentSize::new(content_box_pt(60.0)),
+                LogicalBlockContentSize::new(content_box_pt(80.0)),
+            ),
+        );
+        let destination = TableGridPlacement::with_axes(
+            TableGridContentBoxTopLeft::new(PageTopPoint::new(140.0, 10.0)),
+            axes,
+            TableGridLogicalSize::new(
+                LogicalInlineContentSize::new(content_box_pt(60.0)),
+                LogicalBlockContentSize::new(content_box_pt(80.0)),
+            ),
+        );
+        let source_slice = TableGridRect::new(
+            TableGridPoint::from_lengths(TableGridLength::new(0.0), TableGridLength::new(40.0)),
+            TableGridSize::from_lengths(TableGridLength::new(60.0), TableGridLength::new(20.0)),
+        );
+        let projection = TableStructuralPaintProjection::from_grid_slices(
+            source,
+            destination,
+            source_slice,
+            TableGridRect::new(
+                TableGridPoint::from_lengths(TableGridLength::new(0.0), TableGridLength::new(0.0)),
+                source_slice.size,
+            ),
+            TableGridLength::new(0.0),
+        );
 
         assert_eq!(
-            table_grid_source_progress_translation(WritingMode::HorizontalTb, progress),
-            PaintTranslation::new(0.0, 37.5),
-        );
-        assert_eq!(
-            table_grid_source_progress_translation(WritingMode::VerticalLr, progress),
-            PaintTranslation::new(37.5, 0.0),
-        );
-        assert_eq!(
-            table_grid_source_progress_translation(WritingMode::VerticalRl, progress),
-            PaintTranslation::new(-37.5, 0.0),
+            projection.source_to_destination,
+            PaintTranslation::new(120.0, -50.0),
         );
     }
 
@@ -1890,6 +1917,7 @@ mod tests {
         let table_root_border_box = PageTopRect::new(24.0, 190.0, 80.0, 40.0);
         let wrapper = TableWrapperMarginBoxFootprint::from_table_root_border_box(
             table_root_border_box,
+            WritingMode::HorizontalTb,
             PageTopBlockPosition::new(200.0),
             layout_pt(10.0),
             layout_pt(15.0),

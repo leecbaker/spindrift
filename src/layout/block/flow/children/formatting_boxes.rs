@@ -190,6 +190,21 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 _ => (None, raw_child_box),
             };
+            if child_box
+                .element_parts()
+                .is_some_and(|(_, _, child_style, _)| {
+                    self.positioned_auto_size_child_participation(child_style)
+                        == PositionedAutoSizeChildParticipation::ExcludeOutOfFlow
+                })
+            {
+                // Match the DOM traversal: a speculative positioned-root
+                // measurement must not let an out-of-flow child mutate any
+                // normal-flow or static-position state. Anonymous wrappers
+                // remain traversable so their in-flow descendants still
+                // contribute and positioned descendants are rejected here.
+                child_box_index += 1;
+                continue;
+            }
             let child_text_box_line_trim = TextBoxLineTrim {
                 trims_block_start: text_box_trim_start_child == Some(child_box_index),
                 trims_block_end: text_box_trim_end_child == Some(child_box_index)

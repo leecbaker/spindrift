@@ -484,13 +484,17 @@ impl TableWrapperDecorationViewport {
             (root_source_frame.block_span().get() - root_rect.size.height).abs() <= f32::EPSILON
         );
         let root_rect = root_source_frame.root_rect();
-        // `root_rect` already includes both wrapper block insets. Its source
-        // geometry is the complete unfragmented border box used for
-        // `box-decoration-break: slice`; adding the trailing inset again
-        // shifts the positioning area and changes a repeating gradient's
-        // phase in every continuation fragment.
+        // Captions select the first destination fragmentainer but remain
+        // outside the table-root positioning area. The root source rectangle
+        // is therefore grid-local; continuation phase is added below from
+        // preceding *grid* slices, exactly as for an ordinary fragmented box.
+        // <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds>
+        // <https://www.w3.org/TR/css-break-3/#break-decoration>
         let source_positioning_rect = TableGridRect::new(
-            root_rect.origin,
+            TableGridPoint::from_lengths(
+                TableGridLength::new(root_rect.origin.x),
+                TableGridLength::new(root_rect.origin.y),
+            ),
             TableGridSize::from_lengths(
                 TableGridLength::new(root_rect.size.width),
                 TableGridLength::new(root_rect.size.height),
@@ -501,6 +505,16 @@ impl TableWrapperDecorationViewport {
                 .page_top_rect_for(source_positioning_rect)
                 .paint_rect(),
         );
+        // A table is laid out on an anonymous multicolumn *source* canvas.
+        // Its retained outer placement selects an ordinal and capacity, but
+        // the final physical column has not been chosen yet.  The enclosing
+        // multicol replay clips and translates the complete source fragment
+        // exactly once.  Applying the scratch placement's rectangle here
+        // would turn it into a destination clip and translate that clip a
+        // second time during replay.
+        //
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        // <https://www.w3.org/TR/css-break-3/#break-decoration>
         let mut fragments = Vec::new();
         // Structural paint is emitted while each row piece is committed. The
         // current timeline entry is therefore exactly this paint call's
@@ -515,7 +529,22 @@ impl TableWrapperDecorationViewport {
                 .grid_source_start
                 .expect("grid-body timeline entries retain their grid source interval")
                 .length();
-            let destination_placement = projection.destination_placement();
+            // The grid's source-to-destination rebase is table-local.  When
+            // the table is retained by an outer multicolumn fragmentainer,
+            // that outer placement owns the only physical replay translation.
+            // Re-applying the table-local rebase here would place a
+            // monolithic row into an already-consumed outer column before
+            // the parent has selected its slice.
+            let destination_placement =
+                if matches!(
+                    source_placement.writing_mode(),
+                    WritingMode::VerticalRl | WritingMode::SidewaysRl
+                ) && fragmentainer_placement.outer_fragmentainer().is_some()
+                {
+                    source_placement
+                } else {
+                    projection.destination_placement()
+                };
             let block_end = block_start + TableGridLength::new(row_height);
             let before = if block_start.get() <= 0.0 {
                 insets.block_start
@@ -552,30 +581,65 @@ impl TableWrapperDecorationViewport {
                 destination_rect,
                 TableGridLength::new(0.0),
             );
+            let preceding_grid_body_span =
+                wrapper_timeline.preceding_grid_body_block_span(slice).get();
+            // The first root fragment starts at its border edge, before the
+            // cell grid's block-start inset. The ledger records grid-body
+            // intervals only, so every continuation must add that one
+            // omitted leading root span before it advances the unbroken
+            // background positioning area.
+            let preceding_block_span = if preceding_grid_body_span > 0.01 {
+                preceding_grid_body_span + insets.block_start.get()
+            } else {
+                0.0
+            };
+            let source_to_destination = match source_placement.writing_mode() {
+                WritingMode::HorizontalTb => {
+                    PaintTranslation::new(projection.source_to_destination.x, preceding_block_span)
+                }
+                WritingMode::VerticalLr | WritingMode::SidewaysLr => {
+                    PaintTranslation::new(preceding_block_span, projection.source_to_destination.y)
+                }
+                WritingMode::VerticalRl | WritingMode::SidewaysRl => {
+                    PaintTranslation::new(-preceding_block_span, projection.source_to_destination.y)
+                }
+            };
             let owns_block_start = block_start.get() <= 0.01;
             let owns_block_end = block_end.get() >= grid_block.get() - 0.01;
             let destination_clip_border_area =
                 PaintBackgroundArea::from_paint_rect(projection.destination_clip());
             fragments.push(TableWrapperDecorationSlice {
-                destination_clip_border_area: PaintBackgroundArea::from_paint_rect(
-                    projection.destination_clip(),
-                ),
+                destination_clip_border_area,
                 decoration: FragmentedDecorationSlice::new(
                     source_positioning_border_area.paint_rect(),
                     destination_clip_border_area.paint_rect(),
-                    table_grid_source_progress_translation(
-                        source_placement.writing_mode(),
-                        TableGridBlockOffset::new(block_start),
-                    ),
+                    // `box-decoration-break: slice` resolves this one
+                    // positioning area as though the table were unbroken.
+                    // The structural projection is the complete physical
+                    // source-to-destination mapping; retaining only the
+                    // logical row progress loses the destination column
+                    // origin (and restarts repeating backgrounds there).
+                    // <https://www.w3.org/TR/css-break-3/#break-decoration>
+                    source_to_destination,
                     owns_block_start,
                     owns_block_end,
                 ),
             });
         }
         if fragments.is_empty() && !wrapper_timeline.has_grid_body_slices() {
+            let destination_placement =
+                if matches!(
+                    source_placement.writing_mode(),
+                    WritingMode::VerticalRl | WritingMode::SidewaysRl
+                ) && fragmentainer_placement.outer_fragmentainer().is_some()
+                {
+                    source_placement
+                } else {
+                    projection.destination_placement()
+                };
             let projection = TableStructuralPaintProjection::from_grid_slices(
                 source_placement,
-                projection.destination_placement(),
+                destination_placement,
                 root_rect,
                 root_rect,
                 TableGridLength::new(0.0),
@@ -583,9 +647,7 @@ impl TableWrapperDecorationViewport {
             let destination_clip_border_area =
                 PaintBackgroundArea::from_paint_rect(projection.destination_clip());
             fragments.push(TableWrapperDecorationSlice {
-                destination_clip_border_area: PaintBackgroundArea::from_paint_rect(
-                    projection.destination_clip(),
-                ),
+                destination_clip_border_area,
                 decoration: FragmentedDecorationSlice::new(
                     source_positioning_border_area.paint_rect(),
                     destination_clip_border_area.paint_rect(),
@@ -636,6 +698,7 @@ impl TableWrapperDecorationViewport {
                     root_url,
                     resource_cache,
                 )
+                .into_iter()
             })
             .collect()
     }
@@ -670,26 +733,6 @@ impl TableWrapperDecorationViewport {
                     .then(|| PaintPrimitive::Rect(RenderedRect::from_paint_rect(clip, Some(fill))))
             })
             .collect()
-    }
-}
-
-/// Map a table-grid source interval into the table-local replay canvas.
-///
-/// The enclosing fragmentation context later maps completed temporary parent
-/// fragments to columns/pages.  A table-root decoration must therefore carry
-/// only the immutable grid-source progress here: using the difference between
-/// temporary-page origins leaks the parent replay translation into the table
-/// background phase, and makes captions affect `box-decoration-break: slice`.
-/// <https://www.w3.org/TR/css-break-3/#break-decoration>
-pub(in crate::layout::table) fn table_grid_source_progress_translation(
-    writing_mode: WritingMode,
-    source_block_start: TableGridBlockOffset,
-) -> PaintTranslation {
-    let progress = source_block_start.length().get();
-    match writing_mode {
-        WritingMode::HorizontalTb => PaintTranslation::new(0.0, progress),
-        WritingMode::VerticalLr | WritingMode::SidewaysLr => PaintTranslation::new(progress, 0.0),
-        WritingMode::VerticalRl | WritingMode::SidewaysRl => PaintTranslation::new(-progress, 0.0),
     }
 }
 

@@ -6,7 +6,7 @@ use super::*;
 use crate::css::cascade::CascadedProperty;
 use crate::css::component_values::parse_var_function_arguments;
 use crate::css::{
-    ComputedColorScheme, parse_font_palette, parse_font_synthesis,
+    ComputedColorScheme, TextFit, parse_font_palette, parse_font_synthesis,
     parse_font_synthesis_subproperty, parse_object_fit,
 };
 
@@ -184,6 +184,7 @@ pub(in crate::css) fn parse_canonical_declaration<'a>(
         "word-spacing" => {
             value.eq_ignore_ascii_case("normal") || parse_word_spacing(value, 12.0).is_some()
         }
+        "text-fit" => TextFit::parse(value).is_some(),
         "animation" => crate::css::cascade::parse_animation_snapshot_shorthand(value).is_some(),
         "animation-name" => crate::css::component_values::split_css_top_level_delimiter(value, ',')
             .first()

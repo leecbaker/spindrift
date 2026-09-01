@@ -1,5 +1,20 @@
-use super::*;
+use std::num::NonZeroU16;
+
+use super::{
+    AlignContent, AlignItems, AlignSelf, AlignmentSafety, ComputedStyle, ContentAlignmentKeyword,
+    ContentBoxLength, GridChild, GridPercentageBasis, JustifyContent, JustifyItems, JustifySelf,
+    PercentageBasis, SelfAlignmentKeyword, SemanticLengthExt, content_box_pt, css, grid_line_index,
+    layout_pt, negative_named_implicit_grid_line_index, taffy_layout, used_length_percentage,
+};
 use crate::layout::taffy_bridge;
+
+mod placement;
+use placement::{
+    backward_named_span_startward_line_range, negative_named_line_startward_line_range,
+};
+pub(in crate::layout::grid) use placement::{
+    taffy_grid_auto_flow, taffy_grid_line, taffy_grid_line_with_startward_adjustment,
+};
 
 pub(super) fn taffy_dimension(
     value: css::ComputedLengthPercentageOrAuto,
@@ -314,6 +329,7 @@ pub(super) fn taffy_grid_align_content(align_content: AlignContent) -> taffy_lay
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::grid::{GridAvailableSizeSource, grid_percentage_basis};
 
     #[test]
     fn no_grid_template_areas_stays_absent_at_the_taffy_boundary() {
@@ -730,7 +746,7 @@ mod tests {
                     trailing_names: Vec::new(),
                 },
             );
-            let Some(taffy_layout::GridTemplateComponent::Repeat(repeat)) =
+            let taffy_layout::GridTemplateComponent::Repeat(repeat) =
                 taffy_grid_template_component(&component, basis)
             else {
                 panic!("auto-repeat should remain a Taffy repeat");
@@ -742,6 +758,69 @@ mod tests {
                 taffy_layout::MinTrackSizingFunction::length(75.0)
             );
         }
+    }
+
+    fn fixed_track() -> css::GridTrackSize {
+        css::GridTrackSize {
+            min: css::GridMinTrackBreadth::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(10.0),
+            ),
+            max: css::GridMaxTrackBreadth::LengthPercentage(
+                css::ComputedLengthPercentage::from_points(10.0),
+            ),
+        }
+    }
+
+    #[test]
+    fn simple_auto_repeat_count_distinguishes_absent_resolved_and_indeterminate_inputs() {
+        let track = css::GridTrackListComponent::Track(Vec::new(), fixed_track());
+        assert_eq!(
+            simple_fixed_auto_repeat_count(
+                &[track],
+                css::ComputedGap::Normal,
+                content_box_pt(35.0),
+            ),
+            Some(SimpleAutoRepeatCount::NoAutoRepeat),
+        );
+
+        let repeat = css::GridTrackListComponent::Repeat(
+            Vec::new(),
+            css::GridRepeat {
+                count: css::GridRepeatCount::AutoFill,
+                tracks: vec![css::GridTrackListComponent::Track(
+                    Vec::new(),
+                    fixed_track(),
+                )],
+                trailing_names: Vec::new(),
+            },
+        );
+        assert_eq!(
+            simple_fixed_auto_repeat_count(
+                &[repeat],
+                css::ComputedGap::Normal,
+                content_box_pt(35.0),
+            ),
+            Some(SimpleAutoRepeatCount::Count(
+                NonZeroU16::new(3).expect("three is nonzero"),
+            )),
+        );
+
+        let empty_repeat = css::GridTrackListComponent::Repeat(
+            Vec::new(),
+            css::GridRepeat {
+                count: css::GridRepeatCount::AutoFit,
+                tracks: Vec::new(),
+                trailing_names: Vec::new(),
+            },
+        );
+        assert_eq!(
+            simple_fixed_auto_repeat_count(
+                &[empty_repeat],
+                css::ComputedGap::Normal,
+                content_box_pt(35.0),
+            ),
+            None,
+        );
     }
 }
 
@@ -845,9 +924,7 @@ pub(super) fn taffy_grid_template_tracks(
         css::GridTrackList::None | css::GridTrackList::Subgrid { .. } => Vec::new(),
         css::GridTrackList::Tracks { components, .. } => components
             .iter()
-            .filter_map(|component| {
-                taffy_grid_template_component(component, auto_repeat_percentage_basis)
-            })
+            .map(|component| taffy_grid_template_component(component, auto_repeat_percentage_basis))
             .collect(),
     };
     let Some(track_count) = grid_template_track_component_count(tracks) else {
@@ -1098,11 +1175,15 @@ fn simple_explicit_line_names_for_startward_adjustment(
             trailing_names,
         } => {
             let auto_repeat_count = if grid_track_components_have_auto_repeat(components) {
-                simple_fixed_auto_repeat_count(
+                let SimpleAutoRepeatCount::Count(count) = simple_fixed_auto_repeat_count(
                     components,
                     gap,
-                    percentage_basis.points()?.max(0.0),
+                    content_box_pt(percentage_basis.points()?.max(0.0)),
                 )?
+                else {
+                    return None;
+                };
+                Some(count.get())
             } else {
                 None
             };
@@ -1198,14 +1279,25 @@ fn collect_startward_adjustment_line_names(
 /// for simple occupied-track placement; broader empty-track collapse
 /// interactions remain tracked as a grid placement divergence:
 /// <https://www.w3.org/TR/css-grid-1/#auto-repeat>.
+/// The result of resolving a fixed-size auto-repeat fragment.
+///
+/// `Option` around this type denotes an unsupported or indeterminate input;
+/// the enum itself distinguishes a valid non-auto-repeat list from a resolved
+/// auto-repeat count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout::grid) enum SimpleAutoRepeatCount {
+    NoAutoRepeat,
+    Count(NonZeroU16),
+}
+
 pub(in crate::layout::grid) fn simple_fixed_auto_repeat_count(
     components: &[css::GridTrackListComponent],
     gap: css::ComputedGap,
-    container_size: f32,
-) -> Option<Option<u16>> {
+    container_size: ContentBoxLength,
+) -> Option<SimpleAutoRepeatCount> {
     let mut auto_repeat = None;
     let mut non_auto_track_count = 0_usize;
-    let mut non_auto_track_used_space = 0.0_f32;
+    let mut non_auto_track_used_space = content_box_pt(0.0);
     for component in components {
         collect_auto_repeat_count_inputs(
             component,
@@ -1216,70 +1308,82 @@ pub(in crate::layout::grid) fn simple_fixed_auto_repeat_count(
         )?;
     }
     let Some(auto_repeat) = auto_repeat else {
-        return Some(None);
+        return Some(SimpleAutoRepeatCount::NoAutoRepeat);
     };
     let AutoRepeatCountInput {
         track_count,
         used_space,
     } = auto_repeat;
-    if track_count == 0 || used_space <= 0.0 {
+    if track_count == 0 || used_space <= content_box_pt(0.0) {
         return None;
     }
     let gap = definite_auto_repeat_gap(gap, container_size)?;
-    let first_repeat_size = non_auto_track_used_space
-        + used_space
-        + (non_auto_track_count + track_count).saturating_sub(1) as f32 * gap;
+    let first_repeat_size = content_box_pt(
+        non_auto_track_used_space.points()
+            + used_space.points()
+            + (non_auto_track_count + track_count).saturating_sub(1) as f32 * gap.points(),
+    );
     let count = if first_repeat_size > container_size {
-        1
+        NonZeroU16::MIN
     } else {
-        let per_repeat_size = used_space + track_count as f32 * gap;
-        ((container_size - first_repeat_size) / per_repeat_size).floor() as u16 + 1
+        let per_repeat_size = used_space.points() + track_count as f32 * gap.points();
+        let count = ((container_size.points() - first_repeat_size.points()) / per_repeat_size)
+            .floor()
+            .max(0.0)
+            + 1.0;
+        if !count.is_finite() || count > f32::from(u16::MAX) {
+            return None;
+        }
+        // The finite range check above makes this conversion lossless.
+        let count = count as u16;
+        NonZeroU16::new(count).expect("auto-repeat count is at least one")
     };
-    Some(Some(count.max(1)))
+    Some(SimpleAutoRepeatCount::Count(count))
 }
 
 #[derive(Debug, Clone, Copy)]
 struct AutoRepeatCountInput {
     track_count: usize,
-    used_space: f32,
+    used_space: ContentBoxLength,
 }
 
 fn collect_auto_repeat_count_inputs(
     component: &css::GridTrackListComponent,
-    container_width: f32,
+    container_size: ContentBoxLength,
     auto_repeat: &mut Option<AutoRepeatCountInput>,
     non_auto_track_count: &mut usize,
-    non_auto_track_used_space: &mut f32,
+    non_auto_track_used_space: &mut ContentBoxLength,
 ) -> Option<()> {
     match component {
         css::GridTrackListComponent::Track(_, size) => {
             *non_auto_track_count = non_auto_track_count.checked_add(1)?;
-            *non_auto_track_used_space +=
-                definite_auto_repeat_track_size(size.clone(), container_width)?;
+            *non_auto_track_used_space += definite_auto_repeat_track_size(size, container_size)?;
         }
         css::GridTrackListComponent::Repeat(_, repeat) => match repeat.count {
             css::GridRepeatCount::Number(count) => {
                 let mut track_count = 0_usize;
-                let mut used_space = 0.0_f32;
+                let mut used_space = content_box_pt(0.0);
                 collect_repeat_track_count_and_used_space(
                     &repeat.tracks,
-                    container_width,
+                    container_size,
                     &mut track_count,
                     &mut used_space,
                 )?;
                 *non_auto_track_count =
                     non_auto_track_count.checked_add(usize::from(count) * track_count)?;
-                *non_auto_track_used_space += used_space * f32::from(count);
+                *non_auto_track_used_space = content_box_pt(
+                    non_auto_track_used_space.points() + used_space.points() * f32::from(count),
+                );
             }
             css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit => {
                 if auto_repeat.is_some() {
                     return None;
                 }
                 let mut track_count = 0_usize;
-                let mut used_space = 0.0_f32;
+                let mut used_space = content_box_pt(0.0);
                 collect_repeat_track_count_and_used_space(
                     &repeat.tracks,
-                    container_width,
+                    container_size,
                     &mut track_count,
                     &mut used_space,
                 )?;
@@ -1295,30 +1399,35 @@ fn collect_auto_repeat_count_inputs(
 
 fn collect_repeat_track_count_and_used_space(
     components: &[css::GridTrackListComponent],
-    container_width: f32,
+    container_size: ContentBoxLength,
     track_count: &mut usize,
-    used_space: &mut f32,
+    used_space: &mut ContentBoxLength,
 ) -> Option<()> {
     for component in components {
         match component {
             css::GridTrackListComponent::Track(_, size) => {
                 *track_count = track_count.checked_add(1)?;
-                *used_space += definite_auto_repeat_track_size(size.clone(), container_width)?;
+                *used_space = content_box_pt(
+                    used_space.points()
+                        + definite_auto_repeat_track_size(size, container_size)?.points(),
+                );
             }
             css::GridTrackListComponent::Repeat(_, repeat) => {
                 let css::GridRepeatCount::Number(count) = repeat.count else {
                     return None;
                 };
                 let mut repeated_count = 0_usize;
-                let mut repeated_space = 0.0_f32;
+                let mut repeated_space = content_box_pt(0.0);
                 collect_repeat_track_count_and_used_space(
                     &repeat.tracks,
-                    container_width,
+                    container_size,
                     &mut repeated_count,
                     &mut repeated_space,
                 )?;
                 *track_count = track_count.checked_add(usize::from(count) * repeated_count)?;
-                *used_space += repeated_space * f32::from(count);
+                *used_space = content_box_pt(
+                    used_space.points() + repeated_space.points() * f32::from(count),
+                );
             }
         }
     }
@@ -1326,49 +1435,47 @@ fn collect_repeat_track_count_and_used_space(
 }
 
 pub(in crate::layout::grid) fn definite_auto_repeat_track_size(
-    size: css::GridTrackSize,
-    container_width: f32,
-) -> Option<f32> {
-    let max = match size.max {
-        css::GridMaxTrackBreadth::LengthPercentage(value) => value
+    size: &css::GridTrackSize,
+    container_size: ContentBoxLength,
+) -> Option<ContentBoxLength> {
+    let max = match &size.max {
+        css::GridMaxTrackBreadth::LengthPercentage(value)
+        | css::GridMaxTrackBreadth::FitContent(value) => value
             .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
-                container_width,
+                container_size.points(),
             )))
-            .map(layout_points),
-        css::GridMaxTrackBreadth::FitContent(value) => value
-            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
-                container_width,
-            )))
-            .map(layout_points),
+            .map(|value| content_box_pt(value.points())),
         css::GridMaxTrackBreadth::Auto
         | css::GridMaxTrackBreadth::MinContent
         | css::GridMaxTrackBreadth::MaxContent
         | css::GridMaxTrackBreadth::Flex(_) => None,
     };
-    let min = match size.min {
+    let min = match &size.min {
         css::GridMinTrackBreadth::LengthPercentage(value) => value
             .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
-                container_width,
+                container_size.points(),
             )))
-            .map(layout_points),
+            .map(|value| content_box_pt(value.points())),
         css::GridMinTrackBreadth::Auto
         | css::GridMinTrackBreadth::MinContent
         | css::GridMinTrackBreadth::MaxContent => None,
     };
-    max.map(|max| max.max(min.unwrap_or(0.0)))
+    max.map(|max| max.max(min.unwrap_or(content_box_pt(0.0))))
         .or(min)
-        .map(|size| size.max(0.0))
+        .map(|size| size.max(content_box_pt(0.0)))
 }
 
-fn definite_auto_repeat_gap(gap: css::ComputedGap, container_width: f32) -> Option<f32> {
+fn definite_auto_repeat_gap(
+    gap: css::ComputedGap,
+    container_size: ContentBoxLength,
+) -> Option<ContentBoxLength> {
     match gap {
-        css::ComputedGap::Normal => Some(0.0),
+        css::ComputedGap::Normal => Some(content_box_pt(0.0)),
         css::ComputedGap::LengthPercentage(value) => value
             .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
-                container_width,
+                container_size.points(),
             )))
-            .map(layout_points)
-            .map(|gap| gap.max(0.0)),
+            .map(|gap| content_box_pt(gap.points()).max(content_box_pt(0.0))),
     }
 }
 
@@ -1406,10 +1513,7 @@ fn add_shifted_generated_area_line_names(
         return;
     };
     for area in collect_grid_template_area_bounds(rows) {
-        let (start, end) = match axis {
-            GridAxis::Row => (area.row_start + shift, area.row_end + 1 + shift),
-            GridAxis::Column => (area.column_start + shift, area.column_end + 1 + shift),
-        };
+        let (start, end) = axis.area_line_range(&area, shift);
         ensure_grid_line_names_length(line_names, end + 1);
         add_grid_line_name(&mut line_names[start], format!("{}-start", area.name));
         add_grid_line_name(&mut line_names[end], format!("{}-end", area.name));
@@ -1605,13 +1709,7 @@ pub(super) fn grid_template_area_track_count(
     areas: &css::GridTemplateAreas,
     axis: GridAxis,
 ) -> usize {
-    let css::GridTemplateAreas::Areas(rows) = areas else {
-        return 0;
-    };
-    match axis {
-        GridAxis::Row => rows.len(),
-        GridAxis::Column => rows.iter().map(|row| row.cells.len()).max().unwrap_or(0),
-    }
+    axis.template_area_track_count(areas)
 }
 
 fn grid_template_axis_inputs(
@@ -1622,18 +1720,7 @@ fn grid_template_axis_inputs(
     &css::GridTemplateAreas,
     &css::GridAutoTrackList,
 ) {
-    match axis {
-        GridAxis::Row => (
-            &style.grid_template_rows,
-            &style.grid_template_areas,
-            &style.grid_auto_rows,
-        ),
-        GridAxis::Column => (
-            &style.grid_template_columns,
-            &style.grid_template_areas,
-            &style.grid_auto_columns,
-        ),
-    }
+    axis.template_inputs(style)
 }
 
 fn grid_template_axis_inputs_with_gap(
@@ -1646,22 +1733,18 @@ fn grid_template_axis_inputs_with_gap(
     css::ComputedGap,
 ) {
     let (tracks, areas, auto_tracks) = grid_template_axis_inputs(style, axis);
-    let gap = match axis {
-        GridAxis::Row => style.row_gap.clone(),
-        GridAxis::Column => style.column_gap.clone(),
-    };
-    (tracks, areas, auto_tracks, gap)
+    (tracks, areas, auto_tracks, axis.gap(style))
 }
 
 pub(super) fn taffy_grid_template_component(
     component: &css::GridTrackListComponent,
     auto_repeat_percentage_basis: GridPercentageBasis,
-) -> Option<taffy_layout::GridTemplateComponent<String>> {
+) -> taffy_layout::GridTemplateComponent<String> {
     match component {
-        css::GridTrackListComponent::Track(_, size) => Some(
-            taffy_layout::GridTemplateComponent::Single(taffy_track_size(size)),
-        ),
-        css::GridTrackListComponent::Repeat(_, repeat) => Some(
+        css::GridTrackListComponent::Track(_, size) => {
+            taffy_layout::GridTemplateComponent::Single(taffy_track_size(size))
+        }
+        css::GridTrackListComponent::Repeat(_, repeat) => {
             taffy_layout::GridTemplateComponent::Repeat(taffy::style::GridTemplateRepetition {
                 count: match repeat.count {
                     css::GridRepeatCount::Number(count) => {
@@ -1688,8 +1771,8 @@ pub(super) fn taffy_grid_template_component(
                     })
                     .collect(),
                 line_names: taffy_grid_repeat_line_names(repeat),
-            }),
-        ),
+            })
+        }
     }
 }
 
@@ -1709,12 +1792,14 @@ fn taffy_auto_repeat_track_size(
     if let Some(basis) = percentage_basis.points() {
         track.min = resolved_auto_repeat_min_track_breadth(value.min.clone(), percentage_basis);
         track.max = resolved_auto_repeat_max_track_breadth(value.max.clone(), percentage_basis);
-        if definite_auto_repeat_track_size(value.clone(), basis.max(0.0))
-            .is_some_and(|size| size <= 0.0)
+        if definite_auto_repeat_track_size(value, content_box_pt(basis.max(0.0)))
+            .is_some_and(|size| size <= content_box_pt(0.0))
         {
             track.min = taffy_layout::MinTrackSizingFunction::length(0.75);
         }
-    } else if definite_auto_repeat_track_size(value.clone(), 0.0).is_some_and(|size| size <= 0.0) {
+    } else if definite_auto_repeat_track_size(value, content_box_pt(0.0))
+        .is_some_and(|size| size <= content_box_pt(0.0))
+    {
         track.min = taffy_layout::MinTrackSizingFunction::length(0.75);
     }
     track
@@ -1839,10 +1924,7 @@ pub(super) fn add_generated_area_line_names(
         return;
     };
     for area in collect_grid_template_area_bounds(rows) {
-        let (start, end) = match axis {
-            GridAxis::Row => (area.row_start, area.row_end + 1),
-            GridAxis::Column => (area.column_start, area.column_end + 1),
-        };
+        let (start, end) = axis.area_line_range(&area, 0);
         ensure_grid_line_names_length(line_names, end + 1);
         add_grid_line_name(&mut line_names[start], format!("{}-start", area.name));
         add_grid_line_name(&mut line_names[end], format!("{}-end", area.name));
@@ -1863,6 +1945,54 @@ fn add_grid_line_name(names: &mut Vec<String>, name: String) {
 pub(super) enum GridAxis {
     Row,
     Column,
+}
+
+impl GridAxis {
+    fn template_inputs(
+        self,
+        style: &ComputedStyle,
+    ) -> (
+        &css::GridTrackList,
+        &css::GridTemplateAreas,
+        &css::GridAutoTrackList,
+    ) {
+        match self {
+            Self::Row => (
+                &style.grid_template_rows,
+                &style.grid_template_areas,
+                &style.grid_auto_rows,
+            ),
+            Self::Column => (
+                &style.grid_template_columns,
+                &style.grid_template_areas,
+                &style.grid_auto_columns,
+            ),
+        }
+    }
+
+    fn gap(self, style: &ComputedStyle) -> css::ComputedGap {
+        match self {
+            Self::Row => style.row_gap.clone(),
+            Self::Column => style.column_gap.clone(),
+        }
+    }
+
+    fn template_area_track_count(self, areas: &css::GridTemplateAreas) -> usize {
+        let css::GridTemplateAreas::Areas(rows) = areas else {
+            return 0;
+        };
+        match self {
+            Self::Row => rows.len(),
+            Self::Column => rows.iter().map(|row| row.cells.len()).max().unwrap_or(0),
+        }
+    }
+
+    fn area_line_range(self, area: &GridTemplateAreaBounds, shift: usize) -> (usize, usize) {
+        match self {
+            Self::Row => (area.row_start + shift, area.row_end + 1 + shift),
+            Self::Column => (area.column_start + shift, area.column_end + 1 + shift),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1930,190 +2060,5 @@ pub(super) fn taffy_max_track_breadth(
                 taffy_layout::MaxTrackSizingFunction::fit_content_px(value.length_points())
             }
         }
-    }
-}
-
-pub(super) fn taffy_grid_line(
-    start: &css::GridPlacement,
-    end: &css::GridPlacement,
-) -> taffy_layout::Line<taffy_layout::GridPlacement<String>> {
-    let mut start = taffy_grid_placement(start);
-    let mut end = taffy_grid_placement(end);
-    if taffy_grid_placement_is_line(&start) && matches!(end, taffy_layout::GridPlacement::Auto) {
-        end = taffy_layout::GridPlacement::Span(1);
-    } else if matches!(start, taffy_layout::GridPlacement::Auto)
-        && taffy_grid_placement_is_line(&end)
-    {
-        start = taffy_layout::GridPlacement::Span(1);
-    }
-    taffy_layout::Line { start, end }
-}
-
-pub(super) fn taffy_grid_line_with_startward_adjustment(
-    start: &css::GridPlacement,
-    end: &css::GridPlacement,
-    adjustment: &StartwardImplicitTrackAdjustment,
-) -> taffy_layout::Line<taffy_layout::GridPlacement<String>> {
-    if !adjustment.has_startward_tracks() {
-        return taffy_grid_line(start, end);
-    }
-    if let Some(range) =
-        backward_named_span_startward_line_range(start, end, &adjustment.explicit_line_names)
-    {
-        let shift = adjustment.line_shift();
-        return taffy_layout::Line {
-            start: taffy_layout::line((range.start + shift).clamp(1, i32::from(i16::MAX)) as i16),
-            end: taffy_layout::line((range.end + shift).clamp(1, i32::from(i16::MAX)) as i16),
-        };
-    }
-    if let Some(range) =
-        negative_named_line_startward_line_range(start, end, &adjustment.explicit_line_names)
-    {
-        let shift = adjustment.line_shift();
-        return taffy_layout::Line {
-            start: taffy_layout::line((range.start + shift).clamp(1, i32::from(i16::MAX)) as i16),
-            end: taffy_layout::line((range.end + shift).clamp(1, i32::from(i16::MAX)) as i16),
-        };
-    }
-    let mut start = taffy_grid_placement_with_positive_line_shift(start, adjustment.line_shift());
-    let mut end = taffy_grid_placement_with_positive_line_shift(end, adjustment.line_shift());
-    if taffy_grid_placement_is_line(&start) && matches!(end, taffy_layout::GridPlacement::Auto) {
-        end = taffy_layout::GridPlacement::Span(1);
-    } else if matches!(start, taffy_layout::GridPlacement::Auto)
-        && taffy_grid_placement_is_line(&end)
-    {
-        start = taffy_layout::GridPlacement::Span(1);
-    }
-    taffy_layout::Line { start, end }
-}
-
-fn backward_named_span_startward_line_range(
-    start: &css::GridPlacement,
-    end: &css::GridPlacement,
-    explicit_line_names: &[Vec<String>],
-) -> Option<std::ops::Range<i32>> {
-    let css::GridPlacement::Span(span) = start else {
-        return None;
-    };
-    let name = span.name()?;
-    let target = span.count().unwrap_or(1);
-    if target == 0 {
-        return None;
-    }
-    let end = grid_line_index(end, explicit_line_names)?;
-    let mut matches_seen = 0_u16;
-    for (index, names) in explicit_line_names.iter().enumerate().rev() {
-        let line_index = i32::try_from(index + 1).ok()?;
-        if line_index >= end {
-            continue;
-        }
-        if names.iter().any(|line_name| line_name == name) {
-            matches_seen += 1;
-            if matches_seen == target {
-                return Some(line_index..end);
-            }
-        }
-    }
-    let missing = i32::from(target - matches_seen);
-    let start_line = 1_i32.checked_sub(missing)?;
-    Some(start_line..end)
-}
-
-/// Resolve a negative named line placement that falls before the explicit grid.
-///
-/// CSS Grid treats implicit lines on the search side as having the requested
-/// name when an occurrence cannot be satisfied by explicit named lines:
-/// <https://www.w3.org/TR/css-grid-1/#grid-placement-slot>.
-fn negative_named_line_startward_line_range(
-    start: &css::GridPlacement,
-    end: &css::GridPlacement,
-    explicit_line_names: &[Vec<String>],
-) -> Option<std::ops::Range<i32>> {
-    let css::GridPlacement::Line(line) = start else {
-        return None;
-    };
-    let name = line.name()?;
-    let occurrence = line.index().unwrap_or(1);
-    if occurrence >= 0 {
-        return None;
-    }
-    let start_line =
-        negative_named_implicit_grid_line_index(explicit_line_names, name, occurrence)?;
-    if start_line >= 1 {
-        return None;
-    }
-    let end_line = match end {
-        css::GridPlacement::Auto => start_line.checked_add(1)?,
-        css::GridPlacement::Line(_) => grid_line_index(end, explicit_line_names)?,
-        css::GridPlacement::Span(span) if span.name().is_none() => {
-            start_line.checked_add(i32::from(span.count().unwrap_or(1)))?
-        }
-        css::GridPlacement::Span(_) => return None,
-    };
-    Some(start_line..end_line)
-}
-
-pub(super) fn taffy_grid_placement_is_line(value: &taffy_layout::GridPlacement<String>) -> bool {
-    matches!(
-        value,
-        taffy_layout::GridPlacement::Line(_) | taffy_layout::GridPlacement::NamedLine(_, _)
-    )
-}
-
-pub(super) fn taffy_grid_placement(
-    value: &css::GridPlacement,
-) -> taffy_layout::GridPlacement<String> {
-    match value {
-        css::GridPlacement::Auto => taffy_layout::GridPlacement::Auto,
-        css::GridPlacement::Line(line) => match line {
-            css::GridLinePlacement::Number(index) => i16::try_from(index.get())
-                .ok()
-                .map(taffy_layout::line)
-                .unwrap_or(taffy_layout::GridPlacement::Auto),
-            css::GridLinePlacement::Named { name, occurrence } => occurrence
-                .map(|occurrence| occurrence.get())
-                .map(i16::try_from)
-                .transpose()
-                .ok()
-                .flatten()
-                .map(|index| taffy_layout::GridPlacement::NamedLine(name.clone(), index))
-                .unwrap_or_else(|| taffy_layout::GridPlacement::NamedLine(name.clone(), 0)),
-        },
-        css::GridPlacement::Span(span) => match span {
-            css::GridSpanPlacement::Count(count) => taffy_layout::GridPlacement::Span(count.get()),
-            css::GridSpanPlacement::Named { name, count } => count
-                .map(|count| count.get())
-                .map(|count| taffy_layout::GridPlacement::NamedSpan(name.clone(), count))
-                .unwrap_or_else(|| taffy_layout::GridPlacement::NamedSpan(name.clone(), 0)),
-        },
-    }
-}
-
-pub(super) fn taffy_grid_auto_flow(value: css::GridAutoFlow) -> taffy_layout::GridAutoFlow {
-    match value {
-        css::GridAutoFlow::Row => taffy_layout::GridAutoFlow::Row,
-        css::GridAutoFlow::Column => taffy_layout::GridAutoFlow::Column,
-        css::GridAutoFlow::RowDense => taffy_layout::GridAutoFlow::RowDense,
-        css::GridAutoFlow::ColumnDense => taffy_layout::GridAutoFlow::ColumnDense,
-    }
-}
-fn taffy_grid_placement_with_positive_line_shift(
-    value: &css::GridPlacement,
-    shift: i32,
-) -> taffy_layout::GridPlacement<String> {
-    match value {
-        css::GridPlacement::Line(line) if line.name().is_none() => line
-            .index()
-            .and_then(|index| {
-                let shifted = if index > 0 {
-                    index.checked_add(shift)?
-                } else {
-                    index
-                };
-                i16::try_from(shifted).ok()
-            })
-            .map(taffy_layout::line)
-            .unwrap_or(taffy_layout::GridPlacement::Auto),
-        _ => taffy_grid_placement(value),
     }
 }

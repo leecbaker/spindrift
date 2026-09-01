@@ -505,7 +505,7 @@ pub(in crate::layout) fn inline_atom_is_inter_character_unit(atom: &InlineAtom) 
 pub(in crate::layout) fn inline_atom_is_inter_character_transparent(atom: &InlineAtom) -> bool {
     matches!(
         atom.content(),
-        InlineAtomContent::InlineEdge(_) | InlineAtomContent::StaticPositionPlaceholder
+        InlineAtomContent::InlineEdge(_) | InlineAtomContent::StaticPositionPlaceholder(_)
     )
 }
 

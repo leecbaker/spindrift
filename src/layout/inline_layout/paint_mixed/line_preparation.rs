@@ -25,7 +25,8 @@ impl<'a> LayoutBuilder<'a> {
             .first_letter_style
             .as_deref()
             .is_some_and(|style| !style.initial_letter.is_normal());
-        let apply_typographic_pseudos = context.is_first_line
+        let apply_typographic_pseudos = !line_fragment.first_line_style_materialized
+            && context.is_first_line
             && !first_letter_is_initial
             && block_style.first_line_style.is_some();
         let line = if apply_typographic_pseudos {
@@ -696,7 +697,7 @@ impl<'a> LayoutBuilder<'a> {
                     let atom_uses_box_edge_baseline =
                         matches!(
                             atom.content(),
-                            InlineAtomContent::StaticPositionPlaceholder
+                            InlineAtomContent::StaticPositionPlaceholder(_)
                                 | InlineAtomContent::InlineFragment { .. }
                         ) || matches!(atom.content(), InlineAtomContent::InlineBox { .. })
                             && atom.style().overflow != css::Overflow::Visible;

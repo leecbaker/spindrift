@@ -4,12 +4,14 @@ use super::super::*;
 use super::graph::{
     InlineFragmentContinuation, InlineGraphPosition, InlineLineFragment, MeasuredInlineItem,
 };
-use super::mixed::{CommittedInlineFloatReplay, InlineTextBoxMetrics};
+use super::mixed::{CommittedInlineFloatReplay, InlineTextBoxMetrics, TextFitUsedLineStyle};
 use crate::css::{BoxDecorationBreak, TextBoxTrim, TextEdgeMetric};
 use crate::layout::inline_collect::{
     insert_text_autospace_items, normalize_inline_whitespace_items, visible_hanging_edge_word_mut,
 };
-use crate::layout::text_paint::TextDecorationOriginFragmentGeometry;
+use crate::layout::text_paint::{
+    TextDecorationLogicalInlineRange, TextDecorationOriginFragmentGeometry,
+};
 use crate::units::{ContentBoxLength, content_box_pt, layout_points, layout_pt};
 
 /// The content-box extent occupied by a selected line sequence along the
@@ -172,9 +174,10 @@ fn text_combine_upright_text_has_bidi_controls(text: &str) -> bool {
 fn inline_item_can_continue_line_clamp(item: &InlineItem) -> bool {
     match item {
         InlineItem::Word(_) | InlineItem::Break(_) => true,
-        InlineItem::Atom(atom) => {
-            !matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder)
-        }
+        InlineItem::Atom(atom) => !matches!(
+            atom.content(),
+            InlineAtomContent::StaticPositionPlaceholder(_)
+        ),
         InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => false,
     }
 }
@@ -436,7 +439,12 @@ impl<'a> LayoutBuilder<'a> {
         if !inline_items_have_page_scope(&items)
             && (automatic_clamp_requires_collected_reflow
                 || !self.current_text_box_line_trim().is_empty()
-                || inline_items_can_fragment_as_collected_lines(&items))
+                || inline_items_can_fragment_as_collected_lines(&items)
+                // Text fitting establishes used line metrics after wrapping.
+                // Keep every strategy on the durable sequence path so the
+                // actual last formatted line is visible before `per-line`
+                // selects its exclusions.
+                || !matches!(block_style.text_fit, css::TextFit::None))
         {
             let sequence = self.collect_inline_line_sequence_for_items(&items, context);
             self.paint_inline_line_sequence(&sequence, block_style);
@@ -1174,6 +1182,7 @@ impl<'a> LayoutBuilder<'a> {
                         context_before_boundary,
                         cursor,
                         force_empty_line,
+                        InlineLineTermination::ForcedBreak,
                         &mut records,
                     );
                     if clear != Clear::None {
@@ -1222,6 +1231,7 @@ impl<'a> LayoutBuilder<'a> {
                         context_before_boundary,
                         cursor,
                         false,
+                        InlineLineTermination::CollectionBoundary,
                         &mut records,
                     );
                     if next_cursor.line_index != cursor.line_index {
@@ -1250,11 +1260,37 @@ impl<'a> LayoutBuilder<'a> {
             context,
             cursor,
             false,
+            InlineLineTermination::BlockEnd,
             &mut records,
         );
         recover_css_bidi_scope_continuations_across_forced_breaks(&mut records);
+        let text_fit_records = if !cursor.has_flow_side_effects {
+            // Text fitting establishes the used text metrics. `text-box`
+            // trimming is then applied to those fitted metrics so cap/text
+            // edges do not retain the pre-fit font's line-box geometry.
+            self.apply_text_fit_to_records(&mut records, context.block_style)
+        } else {
+            None
+        };
+        let text_box_line_trim = match text_fit_records {
+            Some(applied_records) => {
+                let first_trim = self.effective_text_box_line_trim_for_style(
+                    records[applied_records.first_formatted].used_block_style(context.block_style),
+                );
+                let last_trim = self.effective_text_box_line_trim_for_style(
+                    records[applied_records.last_formatted].used_block_style(context.block_style),
+                );
+                TextBoxLineTrim {
+                    trims_block_start: first_trim.trims_block_start,
+                    trims_block_end: last_trim.trims_block_end,
+                    block_start: first_trim.block_start,
+                    block_end: last_trim.block_end,
+                }
+            }
+            None => self.current_text_box_line_trim(),
+        };
         let (records, fragment_text_box_trim) =
-            self.with_text_box_line_trim_applied(records, context.block_style);
+            self.with_text_box_line_trim_applied(records, context.block_style, text_box_line_trim);
         let mut sequence = InlineLineSequence {
             records,
             available_width: context.available_width,
@@ -1479,8 +1515,8 @@ impl<'a> LayoutBuilder<'a> {
         &self,
         mut records: Vec<InlineLineRecord>,
         block_style: &ComputedStyle,
+        trim: TextBoxLineTrim,
     ) -> (Vec<InlineLineRecord>, TextBoxLineTrim) {
-        let trim = self.current_text_box_line_trim();
         if trim.is_empty() {
             return (records, TextBoxLineTrim::default());
         }
@@ -2044,6 +2080,7 @@ impl<'a> LayoutBuilder<'a> {
         context: InlineParagraphContext<'_>,
         cursor: InlineLineSequenceCursor,
         force_empty_line: bool,
+        terminal_termination: InlineLineTermination,
         output: &mut Vec<InlineLineRecord>,
     ) -> InlineLineSequenceCursor {
         let paragraph_index = cursor.paragraph_index;
@@ -2065,6 +2102,7 @@ impl<'a> LayoutBuilder<'a> {
                     is_phantom: false,
                     is_first_formatted_line,
                     is_last_line_in_paragraph: true,
+                    termination: terminal_termination,
                     is_forced_empty: true,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: cursor
@@ -2083,6 +2121,7 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                     available_width: context.available_width,
                     line_height: context.block_style.line_height,
+                    text_fit_used_style: None,
                     decoration_origin_fragments: Default::default(),
                 });
                 return InlineLineSequenceCursor {
@@ -2159,6 +2198,7 @@ impl<'a> LayoutBuilder<'a> {
                 is_first_formatted_line: context.initial_first_formatted_line
                     && next_line_index == 0,
                 is_last_line_in_paragraph: true,
+                termination: terminal_termination,
                 is_forced_empty: true,
                 used_bidi_base_direction: None,
                 starts_after_preserved_segment_break: cursor.starts_after_preserved_segment_break,
@@ -2176,6 +2216,7 @@ impl<'a> LayoutBuilder<'a> {
                 ),
                 available_width: context.available_width,
                 line_height: context.block_style.line_height,
+                text_fit_used_style: None,
                 decoration_origin_fragments: Default::default(),
             });
             paragraph.clear();
@@ -2212,6 +2253,7 @@ impl<'a> LayoutBuilder<'a> {
                     is_first_formatted_line: context.initial_first_formatted_line
                         && next_record_line_index == 0,
                     is_last_line_in_paragraph: false,
+                    termination: InlineLineTermination::SoftWrap,
                     // Float exclusions can consume a physical line before a
                     // graph range fits the following available float band.
                     is_forced_empty: true,
@@ -2225,6 +2267,7 @@ impl<'a> LayoutBuilder<'a> {
                     used_indent: 0.0,
                     available_width: context.available_width,
                     line_height: context.block_style.line_height,
+                    text_fit_used_style: None,
                     decoration_origin_fragments: Default::default(),
                 });
                 next_record_line_index += 1;
@@ -2275,6 +2318,11 @@ impl<'a> LayoutBuilder<'a> {
                     && line_box_index == 0
                     && !is_phantom,
                 is_last_line_in_paragraph: offset + 1 == line_count,
+                termination: if offset + 1 == line_count {
+                    terminal_termination
+                } else {
+                    InlineLineTermination::SoftWrap
+                },
                 is_forced_empty: false,
                 used_bidi_base_direction: None,
                 starts_after_preserved_segment_break: offset == 0
@@ -2291,6 +2339,7 @@ impl<'a> LayoutBuilder<'a> {
                 used_indent,
                 available_width,
                 line_height,
+                text_fit_used_style: None,
                 decoration_origin_fragments: Default::default(),
             });
             next_record_line_index = line_box_index + 1;
@@ -2407,7 +2456,10 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
         }
-        self.record_in_flow_line_baseline(&paint_line, context.block_style);
+        self.record_in_flow_line_baseline(
+            &paint_line,
+            paint_line.used_block_style(context.block_style),
+        );
         if let Some(prepared) = self.prepare_inline_line_record(&paint_line, paint_context) {
             self.paint_prepared_inline_line_with_text_source(&prepared, text_source);
         }
@@ -2529,7 +2581,7 @@ impl<'a> LayoutBuilder<'a> {
         context: InlineParagraphContext<'_>,
     ) -> Option<PreparedInlineLine> {
         let line_box = line.fragment.as_ref()?;
-        let block_style = context.block_style;
+        let block_style = line.used_block_style(context.block_style);
         let padding_left = context.padding_left;
         let line_text = line_box.text();
         // Most sequences are finalized immediately after line selection.
@@ -2687,6 +2739,7 @@ impl<'a> LayoutBuilder<'a> {
             block_end: line.block_end_trim,
         };
         paint_fragment.float_replay = line_box.float_replay;
+        paint_fragment.first_line_style_materialized = line_box.first_line_style_materialized;
         self.prepare_inline_line_fragment(
             &paint_fragment,
             InlinePaintContext {
@@ -2995,6 +3048,7 @@ mod tests {
             is_phantom,
             is_first_formatted_line: false,
             is_last_line_in_paragraph: false,
+            termination: InlineLineTermination::SoftWrap,
             is_forced_empty,
             used_bidi_base_direction: None,
             starts_after_preserved_segment_break: false,
@@ -3006,6 +3060,7 @@ mod tests {
             used_indent: 0.0,
             available_width: 100.0,
             line_height: 10.0,
+            text_fit_used_style: None,
             decoration_origin_fragments: Default::default(),
         }
     }
@@ -3558,6 +3613,7 @@ fn clearance_only_inline_line_record(
         is_phantom: false,
         is_first_formatted_line: false,
         is_last_line_in_paragraph: true,
+        termination: InlineLineTermination::CollectionBoundary,
         is_forced_empty: false,
         used_bidi_base_direction: None,
         starts_after_preserved_segment_break: false,
@@ -3575,6 +3631,7 @@ fn clearance_only_inline_line_record(
         ),
         available_width: context.available_width,
         line_height: 0.0,
+        text_fit_used_style: None,
         decoration_origin_fragments: Default::default(),
     }
 }
@@ -3911,10 +3968,11 @@ impl InlineLineSequence {
         records
     }
 
-    /// Attach decorating-box fragment extents to the records selected for
-    /// paint.  Decoration receiver provenance is deliberately not consulted:
-    /// descendants receive an origin's line, while the origin's own sequence
-    /// of inline fragments supplies `text-decoration-inset` percentage bases.
+    /// Attach decorating-box fragment topology to the records selected for
+    /// paint. Decoration receiver provenance is deliberately not consulted:
+    /// descendants receive an origin's line, while the source inline boxes
+    /// establish the logical ranges that supply `text-decoration-inset`
+    /// percentage bases.
     ///
     /// CSS Text Decoration Level 4 § 2.9.1 defines those bases in terms of
     /// decorating-box fragments and their complete inline extent:
@@ -3924,31 +3982,71 @@ impl InlineLineSequence {
         selected_start: usize,
         selected_records: &mut [InlineLineRecord],
     ) {
-        #[derive(Clone)]
-        struct OriginExtent {
-            origin_style: Rc<ComputedStyle>,
-            per_record: Vec<f32>,
+        #[derive(Clone, Copy, Default)]
+        struct SourceFragmentRange {
+            start: Option<f32>,
+            end: f32,
         }
 
-        let mut origins: Vec<OriginExtent> = Vec::new();
+        impl SourceFragmentRange {
+            fn include(&mut self, start: f32, end: f32) {
+                self.start = Some(self.start.map_or(start, |previous| previous.min(start)));
+                self.end = self.end.max(end);
+            }
+
+            fn extent(self) -> f32 {
+                self.start.map_or(0.0, |start| (self.end - start).max(0.0))
+            }
+        }
+
+        #[derive(Clone)]
+        struct OriginTopology {
+            origin_style: Rc<ComputedStyle>,
+            per_record: Vec<SourceFragmentRange>,
+        }
+
+        let mut origins: Vec<OriginTopology> = Vec::new();
         for (record_index, record) in self.records.iter().enumerate() {
             let Some(line_fragment) = &record.fragment else {
                 continue;
             };
+            // Phase II retains discarded soft-wrap whitespace in the source
+            // item sequence for extraction, but it is not part of the used
+            // inline box fragment. Decoration percentage bases consequently
+            // end before that source-owned suffix.
+            // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+            // <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+            let source_inline_extent = line_fragment
+                .items()
+                .iter()
+                .map(|item| item.used_advance().points().max(0.0))
+                .sum::<f32>();
+            let used_source_inline_end = (source_inline_extent
+                - line_fragment.edge_effects.collapsed_end_trim_width.max(0.0))
+            .max(0.0);
+            let mut logical_inline_cursor = 0.0;
             for item in line_fragment.items() {
-                let InlineLineItem::Fragment(fragment) = &item.item else {
-                    continue;
+                let item_start = logical_inline_cursor;
+                let item_end = item_start + item.used_advance().points().max(0.0);
+                logical_inline_cursor = item_end;
+                let item_style = match &item.item {
+                    InlineLineItem::Fragment(fragment) => fragment.style(),
+                    InlineLineItem::Atom(atom) => atom.style(),
+                    InlineLineItem::Float(float) => float.style(),
                 };
-                for layer in fragment.style().text_decoration_origins.effective_layers() {
+                for layer in item_style.text_decoration_origins.effective_layers() {
                     let origin = origins
                         .iter_mut()
                         .find(|candidate| Rc::ptr_eq(&candidate.origin_style, &layer.origin_style));
                     let origin = match origin {
                         Some(origin) => origin,
                         None => {
-                            origins.push(OriginExtent {
+                            origins.push(OriginTopology {
                                 origin_style: Rc::clone(&layer.origin_style),
-                                per_record: vec![0.0; self.records.len()],
+                                per_record: vec![
+                                    SourceFragmentRange::default();
+                                    self.records.len()
+                                ],
                             });
                             origins.last_mut().expect("just pushed decoration origin")
                         }
@@ -3959,9 +4057,32 @@ impl InlineLineSequence {
                         // item.  Its used fragment span is the line's Phase
                         // II content measure, rather than the sum of raw
                         // source advances.
-                        origin.per_record[record_index] = line_fragment.metrics.width;
-                    } else {
-                        origin.per_record[record_index] += item.used_advance().points();
+                        origin.per_record[record_index]
+                            .include(0.0, line_fragment.metrics.width.max(0.0));
+                        continue;
+                    }
+
+                    // An inline decorating box's own margin, border, and
+                    // padding are skipped by `text-decoration-inset`.  Its
+                    // descendants' used inline boxes are still part of the
+                    // decorating box's source topology, including their
+                    // edges.  Keep that distinction at the source-item
+                    // boundary instead of reconstructing it from receiver
+                    // glyph spans during paint.
+                    // <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+                    // Compare the stable cascade-time origin through the
+                    // edge's own layer rather than declaration equality.
+                    let is_own_box_edge = matches!(
+                        &item.item,
+                        InlineLineItem::Atom(atom)
+                            if matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_)))
+                                && atom.style().text_decoration_origins.own_layer().is_some_and(|own| Rc::ptr_eq(&own.origin_style, &layer.origin_style))
+                    );
+                    if !is_own_box_edge {
+                        let used_item_end = item_end.min(used_source_inline_end);
+                        if used_item_end > item_start {
+                            origin.per_record[record_index].include(item_start, used_item_end);
+                        }
                     }
                 }
             }
@@ -3974,21 +4095,30 @@ impl InlineLineSequence {
             let geometries = origins
                 .iter()
                 .filter_map(|origin| {
-                    let fragment_inline_extent = origin.per_record[record_index];
+                    let fragment_inline_extent = origin.per_record[record_index].extent();
                     (fragment_inline_extent > 0.0).then(|| {
-                        let preceding_inline_extent =
-                            origin.per_record[..record_index].iter().sum::<f32>();
-                        let total_inline_extent = origin.per_record.iter().sum::<f32>();
-                        let following_inline_extent =
-                            total_inline_extent - preceding_inline_extent - fragment_inline_extent;
+                        let preceding_inline_extent = origin.per_record[..record_index]
+                            .iter()
+                            .map(|range| range.extent())
+                            .sum::<f32>();
+                        let total_inline_extent = origin
+                            .per_record
+                            .iter()
+                            .map(|range| range.extent())
+                            .sum::<f32>();
+                        let fragment_end = preceding_inline_extent + fragment_inline_extent;
                         TextDecorationOriginFragmentGeometry {
                             origin_style: Rc::clone(&origin.origin_style),
-                            total_inline_extent: layout_pt(total_inline_extent),
-                            fragment_inline_extent: layout_pt(fragment_inline_extent),
-                            preceding_inline_extent: layout_pt(preceding_inline_extent),
-                            following_inline_extent: layout_pt(following_inline_extent.max(0.0)),
+                            complete_inline_range: TextDecorationLogicalInlineRange::from_edges(
+                                layout_pt(0.0),
+                                layout_pt(total_inline_extent),
+                            ),
+                            fragment_inline_range: TextDecorationLogicalInlineRange::from_edges(
+                                layout_pt(preceding_inline_extent),
+                                layout_pt(fragment_end),
+                            ),
                             is_first_fragment: preceding_inline_extent <= f32::EPSILON,
-                            is_last_fragment: following_inline_extent <= f32::EPSILON,
+                            is_last_fragment: total_inline_extent - fragment_end <= f32::EPSILON,
                         }
                     })
                 })
@@ -4512,6 +4642,9 @@ pub(in crate::layout) struct InlineLineRecord {
     pub(in crate::layout) is_phantom: bool,
     pub(in crate::layout) is_first_formatted_line: bool,
     pub(in crate::layout) is_last_line_in_paragraph: bool,
+    /// Why this source line ended. Text fitting distinguishes a forced break
+    /// from wrapping, source-block completion, and collection boundaries.
+    pub(in crate::layout) termination: InlineLineTermination,
     pub(in crate::layout) is_forced_empty: bool,
     /// Used inline base direction of this formatted line.
     ///
@@ -4536,6 +4669,12 @@ pub(in crate::layout) struct InlineLineRecord {
     pub(in crate::layout) used_indent: f32,
     pub(in crate::layout) available_width: f32,
     pub(in crate::layout) line_height: f32,
+    /// Line-local parent used style produced by CSS Text fitting.
+    ///
+    /// This is absent when fitting leaves the line at its authored used
+    /// values. Consumers must obtain it through [`Self::used_block_style`] so
+    /// the author style remains the default outside the fitting boundary.
+    pub(in crate::layout) text_fit_used_style: Option<TextFitUsedLineStyle>,
     /// Decorating-box fragment geometry populated from the enclosing selected
     /// line sequence immediately before paint.  This keeps percentage bases
     /// independent of shaped text receiver spans.
@@ -4543,7 +4682,31 @@ pub(in crate::layout) struct InlineLineRecord {
         Rc<[crate::layout::text_paint::TextDecorationOriginFragmentGeometry]>,
 }
 
+/// Source termination of a durable inline line record.
+///
+/// `text-fit: per-line` leaves forced-break lines unscaled, while a collected
+/// block's true final formatted line is selected independently of this value.
+/// Keeping collection boundaries distinct prevents page-scope flushing from
+/// becoming a synthetic forced break.
+/// <https://drafts.csswg.org/css-text-5/#text-fit-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum InlineLineTermination {
+    SoftWrap,
+    ForcedBreak,
+    BlockEnd,
+    CollectionBoundary,
+}
+
 impl InlineLineRecord {
+    pub(in crate::layout) fn used_block_style<'a>(
+        &'a self,
+        authored_block_style: &'a ComputedStyle,
+    ) -> &'a ComputedStyle {
+        self.text_fit_used_style
+            .as_ref()
+            .map_or(authored_block_style, TextFitUsedLineStyle::block_style)
+    }
+
     pub(in crate::layout) fn block_advance(&self) -> f32 {
         self.block_before + self.height()
     }
@@ -4694,7 +4857,7 @@ fn inline_fragment_is_phantom(fragment: &InlineFragment) -> bool {
 
 fn inline_atom_is_phantom(atom: &InlineAtom) -> bool {
     match atom.content() {
-        InlineAtomContent::StaticPositionPlaceholder => true,
+        InlineAtomContent::StaticPositionPlaceholder(_) => true,
         InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut) => false,
         InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
             edge.advance.abs() <= 0.001 && edge.paint_extent <= 0.001

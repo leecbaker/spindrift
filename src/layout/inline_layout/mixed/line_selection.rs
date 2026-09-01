@@ -4,6 +4,7 @@ use super::*;
 use crate::layout::block::{
     FloatContour, FlowExclusionKind, InitialLetterLayout, LogicalFloatPlacement,
 };
+use crate::layout::inline_layout::InlineLineTermination;
 
 /// Whether a graph's source context can reuse cached advances for a selected
 /// line.
@@ -55,6 +56,154 @@ fn source_measurement_matches_selected_line(
 ) -> bool {
     source_measurement_context_matches_selected_line(graph, block_style, line_index)
         && source_measurement_boundary_matches_selected_line(break_opportunity)
+}
+
+/// Establish the per-line used font-size for CSS Text fitting without
+/// modifying the cascaded computed style. `normal` and unitless line heights
+/// follow the used font size; an explicit length, including a percentage that
+/// already computed to a length, remains fixed.
+/// <https://drafts.csswg.org/css-text-5/#text-fit-property>
+pub(in crate::layout) fn scale_text_fit_fragment_style(style: &mut ComputedStyle, scale: f32) {
+    debug_assert!(scale.is_finite() && scale >= 0.0);
+    style.font_size *= scale;
+    if matches!(
+        style.line_height_value,
+        css::ComputedLineHeight::Normal | css::ComputedLineHeight::Number(_)
+    ) {
+        // Re-project from the fitted font size. The cached layout scalar can
+        // originate before a descendant font shorthand or pseudo-style is
+        // materialized, whereas the computed `normal`/unitless value is what
+        // CSS Text fitting makes depend on the used font size.
+        style.line_height = style.line_height_value.clone().projected(style.font_size).0;
+    }
+}
+
+/// A validated non-negative scale selected for one `text-fit` block.
+///
+/// This is a used value, intentionally distinct from the computed CSS
+/// percentage limit. It keeps invalid numeric results from escaping the
+/// fitting analysis into shaping and line-box construction.
+/// <https://drafts.csswg.org/css-text-5/#text-fit-property>
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::layout) struct TextFitScale(f32);
+
+impl TextFitScale {
+    const ONE: Self = Self(1.0);
+
+    fn new(value: f32) -> Option<Self> {
+        (value.is_finite() && value >= 0.0).then_some(Self(value))
+    }
+
+    pub(in crate::layout) fn factor(self) -> f32 {
+        self.0
+    }
+
+    fn min(self, other: Self) -> Self {
+        if self.0 <= other.0 { self } else { other }
+    }
+}
+
+/// The first and last formatted records affected by CSS Text fitting.
+/// `text-box` trims those two logical edges independently in per-line modes.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct TextFitAppliedRecords {
+    pub(in crate::layout) first_formatted: usize,
+    pub(in crate::layout) last_formatted: usize,
+}
+
+/// The parent block's text-fitting used values for one formatted line.
+///
+/// CSS Text fitting changes the used text font size without changing the
+/// computed style. Keeping the resolved parent style with the selected line
+/// prevents its strut, fragment metrics, trimming, and paint geometry from
+/// observing different `line-height: normal` values.
+/// <https://drafts.csswg.org/css-text-5/#text-fit-property>
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct TextFitUsedLineStyle {
+    scale: TextFitScale,
+    block_style: Rc<ComputedStyle>,
+    line_stack_strut: f32,
+}
+
+impl TextFitUsedLineStyle {
+    pub(in crate::layout) fn scale(&self) -> TextFitScale {
+        self.scale
+    }
+
+    pub(in crate::layout) fn block_style(&self) -> &ComputedStyle {
+        &self.block_style
+    }
+
+    /// The scaled containing-block strut used to stack line records.
+    ///
+    /// This remains distinct from a selected font's `normal` metrics: those
+    /// metrics position text within the line, while the strut determines the
+    /// inline block's logical block-size.
+    pub(in crate::layout) fn line_stack_strut(&self) -> f32 {
+        self.line_stack_strut
+    }
+}
+
+fn text_fit_applies_first_line_style(
+    block_style: &ComputedStyle,
+    is_first_formatted_line: bool,
+) -> bool {
+    is_first_formatted_line
+        && block_style.first_line_style.is_some()
+        && !block_style
+            .first_letter_style
+            .as_deref()
+            .is_some_and(|style| !style.initial_letter.is_normal())
+}
+
+/// Select a valid text-fit used scale from two measurements of the same
+/// selected line. The measurements respectively use factors one and two, so
+/// their difference is the scalable advance while `2 * one - two` is the
+/// fixed advance.
+/// <https://drafts.csswg.org/css-text-5/#text-fit-property>
+fn text_fit_scale_from_measurements(
+    available_width: f32,
+    one: f32,
+    two: f32,
+    direction: css::TextFitDirection,
+    limit: Option<f32>,
+) -> TextFitScale {
+    if one <= f32::EPSILON || !one.is_finite() || !two.is_finite() {
+        return TextFitScale::ONE;
+    }
+    let scalable = (two - one).max(0.0);
+    if scalable <= f32::EPSILON || !scalable.is_finite() {
+        return TextFitScale::ONE;
+    }
+    let fixed = (2.0 * one - two).max(0.0);
+    let mut factor = ((available_width.max(0.0) - fixed).max(0.0) / scalable).max(0.0);
+    factor = match direction {
+        css::TextFitDirection::Grow => factor.max(1.0),
+        css::TextFitDirection::Shrink => factor.min(1.0),
+    };
+    if let Some(limit) = limit {
+        factor = match direction {
+            css::TextFitDirection::Grow if limit >= 1.0 => factor.min(limit),
+            css::TextFitDirection::Shrink if (0.0..=1.0).contains(&limit) => factor.max(limit),
+            css::TextFitDirection::Grow | css::TextFitDirection::Shrink => factor,
+        };
+    }
+    TextFitScale::new(factor).unwrap_or(TextFitScale::ONE)
+}
+
+fn text_fit_strategy_scales_record(
+    strategy: css::TextFitStrategy,
+    record_index: usize,
+    last_formatted_record: usize,
+    termination: InlineLineTermination,
+) -> bool {
+    match strategy {
+        css::TextFitStrategy::Consistent | css::TextFitStrategy::PerLineAll => true,
+        css::TextFitStrategy::PerLine => {
+            record_index != last_formatted_record
+                && termination != InlineLineTermination::ForcedBreak
+        }
+    }
 }
 
 /// Whether the selected final line must reserve a block ellipsis for source
@@ -492,6 +641,43 @@ impl std::ops::Deref for SelectedInlineLine {
 }
 
 impl<'a> LayoutBuilder<'a> {
+    /// Apply CSS Text fitting to one used inline style while keeping the
+    /// computed-style representation immutable.
+    pub(in crate::layout) fn scale_text_fit_used_style(
+        &mut self,
+        style: &mut ComputedStyle,
+        scale: f32,
+    ) {
+        scale_text_fit_fragment_style(style, scale);
+    }
+
+    /// Resolve one fitted line's parent text style exactly once.
+    ///
+    /// The selected font owns the used `normal` line-height. This must happen
+    /// for the parent strut as well as for each fitted descendant fragment;
+    /// otherwise right-to-left vertical block progression can position glyphs
+    /// from an inflated fallback line height.
+    fn text_fit_used_line_style(
+        &mut self,
+        block_style: &ComputedStyle,
+        scale: TextFitScale,
+    ) -> TextFitUsedLineStyle {
+        let mut fitted_block_style = block_style.clone();
+        self.scale_text_fit_used_style(&mut fitted_block_style, scale.factor());
+        let line_stack_strut = fitted_block_style.line_height;
+        if fitted_block_style.line_height_is_normal() {
+            fitted_block_style.line_height = self
+                .font_system
+                .used_line_height(&fitted_block_style)
+                .points();
+        }
+        TextFitUsedLineStyle {
+            scale,
+            block_style: Rc::new(fitted_block_style),
+            line_stack_strut,
+        }
+    }
+
     fn inline_line_physical_position_with_block_offset(
         &self,
         line_index: usize,
@@ -714,7 +900,10 @@ impl<'a> LayoutBuilder<'a> {
             line_index,
             starts_after_forced_break,
         );
-        let line_boxes = selected_lines.fragments;
+        let mut line_boxes = selected_lines.fragments;
+        if !selected_lines.has_float_side_effects {
+            self.apply_text_fit(&mut line_boxes, block_style);
+        }
         let next_line_index = selected_lines.next_line_index;
         line_index = next_line_index;
         let line_count = line_boxes.len();
@@ -742,6 +931,7 @@ impl<'a> LayoutBuilder<'a> {
                     is_first_formatted_line: context.initial_first_formatted_line
                         && next_record_line_index == 0,
                     is_last_line_in_paragraph: false,
+                    termination: InlineLineTermination::SoftWrap,
                     is_forced_empty: true,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: false,
@@ -753,6 +943,7 @@ impl<'a> LayoutBuilder<'a> {
                     used_indent: 0.0,
                     available_width: context.available_width,
                     line_height: block_style.line_height,
+                    text_fit_used_style: None,
                     decoration_origin_fragments: Default::default(),
                 });
                 next_record_line_index += 1;
@@ -803,6 +994,11 @@ impl<'a> LayoutBuilder<'a> {
                     && block_line_index == 0
                     && !is_phantom,
                 is_last_line_in_paragraph: offset + 1 == line_count,
+                termination: if offset + 1 == line_count {
+                    InlineLineTermination::BlockEnd
+                } else {
+                    InlineLineTermination::SoftWrap
+                },
                 is_forced_empty: false,
                 used_bidi_base_direction: None,
                 starts_after_preserved_segment_break: false,
@@ -814,6 +1010,7 @@ impl<'a> LayoutBuilder<'a> {
                 used_indent,
                 available_width,
                 line_height,
+                text_fit_used_style: None,
                 decoration_origin_fragments: Default::default(),
             });
             next_record_line_index = block_line_index + 1;
@@ -842,6 +1039,351 @@ impl<'a> LayoutBuilder<'a> {
             has_flow_effects: selected_lines.has_float_side_effects || sequence.has_flow_effects(),
             has_local_continuation_cutoff: sequence.has_local_continuation_cutoff,
         }
+    }
+
+    /// Apply CSS Text Level 5 fitting to already selected lines. Line breaking
+    /// deliberately precedes this pass: fitting changes used font sizes but
+    /// must not select a different source break.
+    ///
+    /// <https://drafts.csswg.org/css-text-5/#text-fit-property>
+    fn apply_text_fit(&mut self, lines: &mut [SelectedInlineLine], block_style: &ComputedStyle) {
+        let css::TextFit::Fit {
+            direction,
+            strategy,
+            limit,
+        } = block_style.text_fit
+        else {
+            return;
+        };
+        if lines.iter().any(|line| {
+            line.fragment
+                .items()
+                .iter()
+                .any(|item| Self::inline_line_item_is_initial_letter(&item.item))
+        }) {
+            // Scaling can change the line block size. An initial letter's
+            // exclusion makes a later line's available inline size depend on
+            // that block position, for which CSS Text disables fitting.
+            return;
+        }
+
+        let last_formatted = lines
+            .iter()
+            .rposition(|line| !inline_line_fragment_is_phantom(&line.fragment));
+        let mut scales = vec![TextFitScale::ONE; lines.len()];
+        match strategy {
+            css::TextFitStrategy::Consistent => {
+                let Some(scale) = lines
+                    .iter()
+                    .filter(|line| !inline_line_fragment_is_phantom(&line.fragment))
+                    .map(|line| {
+                        self.text_fit_scale_for_line(
+                            &line.fragment,
+                            direction,
+                            limit,
+                            line.line_index == 0,
+                            block_style,
+                        )
+                    })
+                    .reduce(TextFitScale::min)
+                else {
+                    return;
+                };
+                scales.fill(scale);
+            }
+            css::TextFitStrategy::PerLine | css::TextFitStrategy::PerLineAll => {
+                for (index, line) in lines.iter().enumerate() {
+                    if inline_line_fragment_is_phantom(&line.fragment)
+                        || (matches!(strategy, css::TextFitStrategy::PerLine)
+                            && Some(index) == last_formatted)
+                    {
+                        continue;
+                    }
+                    scales[index] = self.text_fit_scale_for_line(
+                        &line.fragment,
+                        direction,
+                        limit,
+                        line.line_index == 0,
+                        block_style,
+                    );
+                }
+            }
+        }
+        for (line, scale) in lines.iter_mut().zip(scales) {
+            if (scale.factor() - 1.0).abs() > f32::EPSILON {
+                let used_style = self.text_fit_used_line_style(block_style, scale);
+                self.apply_text_fit_scale_to_line(
+                    &mut line.fragment,
+                    block_style,
+                    &used_style,
+                    line.line_index == 0,
+                );
+            }
+        }
+    }
+
+    /// Apply CSS Text Level 5 fitting to a durable collected sequence.
+    /// Collection can split one source block at forced breaks or page scopes,
+    /// so strategy selection happens only after every record is available.
+    pub(in crate::layout) fn apply_text_fit_to_records(
+        &mut self,
+        records: &mut [InlineLineRecord],
+        block_style: &ComputedStyle,
+    ) -> Option<TextFitAppliedRecords> {
+        let css::TextFit::Fit {
+            direction,
+            strategy,
+            limit,
+        } = block_style.text_fit
+        else {
+            return None;
+        };
+        if records
+            .iter()
+            .filter_map(|record| record.fragment.as_ref())
+            .any(|line| {
+                line.items()
+                    .iter()
+                    .any(|item| Self::inline_line_item_is_initial_letter(&item.item))
+            })
+        {
+            return None;
+        }
+        let formatted_records = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.fragment.is_some() && !record.is_phantom)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let first_formatted = *formatted_records.first()?;
+        let last_formatted = *formatted_records.last()?;
+        let has_multiple_formatted_records = formatted_records.len() > 1;
+        let mut scales = vec![TextFitScale::ONE; records.len()];
+        match strategy {
+            css::TextFitStrategy::Consistent => {
+                let scale = formatted_records
+                    .iter()
+                    .map(|&index| {
+                        let record = &records[index];
+                        self.text_fit_scale_for_line(
+                            record
+                                .fragment
+                                .as_ref()
+                                .expect("formatted record has fragment"),
+                            direction,
+                            limit,
+                            record.is_first_formatted_line,
+                            block_style,
+                        )
+                    })
+                    .reduce(TextFitScale::min)
+                    .expect("formatted records are non-empty");
+                for &index in &formatted_records {
+                    scales[index] = scale;
+                }
+            }
+            css::TextFitStrategy::PerLine | css::TextFitStrategy::PerLineAll => {
+                for &index in &formatted_records {
+                    let record = &records[index];
+                    if !text_fit_strategy_scales_record(
+                        strategy,
+                        index,
+                        last_formatted,
+                        record.termination,
+                    ) {
+                        continue;
+                    }
+                    scales[index] = self.text_fit_scale_for_line(
+                        record
+                            .fragment
+                            .as_ref()
+                            .expect("formatted record has fragment"),
+                        direction,
+                        limit,
+                        record.is_first_formatted_line,
+                        block_style,
+                    );
+                }
+            }
+        }
+        for &index in &formatted_records {
+            let scale = scales[index];
+            if (scale.factor() - 1.0).abs() <= f32::EPSILON {
+                continue;
+            }
+            let used_style = self.text_fit_used_line_style(block_style, scale);
+            let record = &mut records[index];
+            let line = record
+                .fragment
+                .as_mut()
+                .expect("formatted record has fragment");
+            self.apply_text_fit_scale_to_line(
+                line,
+                block_style,
+                &used_style,
+                record.is_first_formatted_line,
+            );
+            record.line_height = if (matches!(strategy, css::TextFitStrategy::PerLine)
+                && scale.factor() > 1.0)
+                || (matches!(strategy, css::TextFitStrategy::PerLineAll)
+                    && has_multiple_formatted_records)
+            {
+                // `per-line` leaves the block strut at its ordinary used
+                // value; only its scalable inline content establishes the
+                // enlarged line box.
+                line.metrics.height
+            } else {
+                // The fitted style supplies font-resolved metrics to the
+                // text fragments and paint context. The shared used style's
+                // containing-block strut determines line-stack geometry.
+                line.metrics.height.max(used_style.line_stack_strut())
+            };
+            record.text_fit_used_style = Some(used_style);
+        }
+        Some(TextFitAppliedRecords {
+            first_formatted,
+            last_formatted,
+        })
+    }
+
+    /// Calculate one line's affine text-fit scale. Measuring at factors one
+    /// and two separates scalable text from fixed inline contributions (such
+    /// as atomic inlines and absolute tracking) without trying to reconstruct
+    /// shaping internals from glyph advances.
+    fn text_fit_scale_for_line(
+        &mut self,
+        line: &InlineLineFragment,
+        direction: css::TextFitDirection,
+        limit: Option<f32>,
+        is_first_formatted_line: bool,
+        block_style: &ComputedStyle,
+    ) -> TextFitScale {
+        let (_, one, _) = self.text_fit_items_at_scale(
+            line,
+            TextFitScale::ONE,
+            is_first_formatted_line,
+            block_style,
+        );
+        let (_, two, _) = self.text_fit_items_at_scale(
+            line,
+            TextFitScale::new(2.0).expect("two is a valid text-fit measurement scale"),
+            is_first_formatted_line,
+            block_style,
+        );
+        text_fit_scale_from_measurements(line.available_width, one, two, direction, limit)
+    }
+
+    fn apply_text_fit_scale_to_line(
+        &mut self,
+        line: &mut InlineLineFragment,
+        block_style: &ComputedStyle,
+        used_style: &TextFitUsedLineStyle,
+        is_first_formatted_line: bool,
+    ) {
+        let materialize_first_line_style =
+            text_fit_applies_first_line_style(block_style, is_first_formatted_line);
+        let (items, width, edge_effects) = self.text_fit_items_at_scale(
+            line,
+            used_style.scale(),
+            is_first_formatted_line,
+            block_style,
+        );
+        line.metrics = self.mixed_inline_line_metrics(&items, used_style.block_style(), width);
+        line.items = Rc::from(items.into_boxed_slice());
+        line.edge_effects = edge_effects;
+        line.text = Rc::from(text_for_measured_items(line.items()));
+        if materialize_first_line_style {
+            line.mark_first_line_style_materialized();
+        }
+    }
+
+    fn text_fit_items_at_scale(
+        &mut self,
+        line: &InlineLineFragment,
+        scale: TextFitScale,
+        is_first_formatted_line: bool,
+        block_style: &ComputedStyle,
+    ) -> (Vec<MeasuredInlineItem>, f32, InlineLineEdgeEffects) {
+        let mut items = line.items().to_vec();
+        if text_fit_applies_first_line_style(block_style, is_first_formatted_line)
+            && !line.first_line_style_materialized
+        {
+            let mut source_items = measured_inline_items(&items);
+            apply_first_line_pseudos_to_line_items(
+                &mut source_items,
+                block_style,
+                false,
+                &mut self.font_system,
+            );
+            for (measured, source) in items.iter_mut().zip(source_items) {
+                measured.item = source;
+            }
+        }
+        for item in &mut items {
+            let InlineLineItem::Fragment(fragment) = &mut item.item else {
+                continue;
+            };
+            let fitted_tracking_scope = fragment
+                .tracking_scope()
+                .map(|scope| scope.scaled_for_text_fit(scale.factor()));
+            self.scale_text_fit_used_style(fragment.style_mut(), scale.factor());
+            if fragment.style().line_height_is_normal() {
+                fragment.style_mut().line_height =
+                    self.font_system.used_line_height(fragment.style()).points();
+            }
+            if let Some(scope) = fitted_tracking_scope {
+                *fragment = fragment.clone().with_tracking_scope(scope);
+            }
+            fragment.clear_cached_shaping_for_used_style_change();
+            remeasure_materialized_item(item, &mut self.font_system);
+        }
+        apply_visual_tracking_boundaries(&mut items);
+        let widths = inline_content_width_for_line_items(&items, &mut self.font_system, |item| {
+            item.used_advance().points()
+        });
+        let mut edge_effects = line.edge_effects.clone();
+        edge_effects.collapsed_end_trim_width = self.text_fit_edge_effect_width(
+            &items,
+            &edge_effects,
+            InlineLineEdgeEffectKind::CollapsedEndTrim,
+        );
+        edge_effects.pre_wrap_hanging_width = self.text_fit_edge_effect_width(
+            &items,
+            &edge_effects,
+            InlineLineEdgeEffectKind::PreWrapHang,
+        );
+        edge_effects.hanging_space_separator_width = widths.trailing_space_width;
+        let width = (widths.content_width
+            - edge_effects.collapsed_end_trim_width
+            - edge_effects.pre_wrap_hanging_width)
+            .max(0.0);
+        (items, width, edge_effects)
+    }
+
+    /// Re-measure a source-owned selected line-edge range in the fitted
+    /// style. The range remains an edge effect rather than a scalable text
+    /// contribution: its newly measured advance is deducted from the line's
+    /// used inline measure.
+    fn text_fit_edge_effect_width(
+        &mut self,
+        items: &[MeasuredInlineItem],
+        edge_effects: &InlineLineEdgeEffects,
+        kind: InlineLineEdgeEffectKind,
+    ) -> f32 {
+        edge_effects
+            .source_effects
+            .iter()
+            .filter(|effect| effect.kind == kind)
+            .filter_map(|effect| {
+                let InlineLineItem::Fragment(fragment) = &items.get(effect.item_index)?.item else {
+                    return None;
+                };
+                fragment
+                    .text()
+                    .get(effect.source_range.clone())
+                    .map(|text| self.font_system.measure_text(text, fragment.style()))
+            })
+            .sum()
     }
 
     /// Select CSS inline line fragments from an opportunity graph.
@@ -5194,7 +5736,76 @@ fn inline_run_is_positioning_source_start_edge(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::css::{self, ComputedLineHeight, FontFamily, Stylesheets};
+    use crate::layout::{LayoutBuilderConfig, RenderOptions};
+    use crate::resource::ResourceCache;
+    use crate::text::FontSystem;
+
+    /// CSS Text fitting changes `font-size` as a used value, while CSS
+    /// Inline's `normal` line height comes from the selected font's metrics.
+    /// <https://drafts.csswg.org/css-text-5/#text-fit-property>
+    /// <https://drafts.csswg.org/css-inline-3/#line-height-property>
+    #[tokio::test]
+    async fn text_fit_used_line_style_resolves_normal_line_height_from_ahem() {
+        let stylesheet = css::parse_stylesheet(
+            &css::Css::from_string(
+                r#"@font-face {
+                    font-family: TextFitAhem;
+                    src: url("tests/fixtures/wpt/css/css-fonts/Ahem.ttf");
+                }"#,
+            )
+            .with_base_path(".")
+            .expect("current directory should be a valid file URL"),
+        );
+        let font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(&[stylesheet])
+            .finish()
+            .await;
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let iframe_documents = HashMap::new();
+        let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
+            options: &options,
+            stylesheets: Stylesheets::document_only(&stylesheets),
+            base_url: None,
+            root_url: None,
+            resource_cache: &resource_cache,
+            iframe_documents: &iframe_documents,
+            iframe_viewport: None,
+            page_progression_direction: Direction::Ltr,
+            page_counter_initial_values: HashMap::new(),
+            target_references: crate::layout::TargetReferenceSnapshot::default(),
+            font_system,
+        });
+        let mut parent = ComputedStyle::initial();
+        parent.font_family = FontFamily::Names(vec!["TextFitAhem".to_string()]);
+        parent.font_size = 7.5;
+        parent.line_height = parent.font_size * 1.2;
+        parent.line_height_value = ComputedLineHeight::Normal;
+
+        let used = builder.text_fit_used_line_style(
+            &parent,
+            TextFitScale::new(2.0).expect("two is a valid text-fit scale"),
+        );
+        let descendant_metrics = builder.inline_text_box_metrics(used.block_style(), 0.0);
+        let font_resolved = builder
+            .font_system
+            .used_line_height(used.block_style())
+            .points();
+
+        assert!((used.block_style().line_height - font_resolved).abs() < 0.001);
+        assert!(
+            (used.block_style().line_height - descendant_metrics.line_block_size).abs() < 0.001
+        );
+        assert!(
+            (used.block_style().line_height - used.block_style().font_size * 1.2).abs() > 0.001,
+            "Ahem's metric line height must not fall back to 1.2em"
+        );
+    }
 
     fn test_break_opportunity(kind: InlineBreakKind) -> InlineBreakOpportunity {
         InlineBreakOpportunity {
@@ -5234,6 +5845,94 @@ mod tests {
     fn float_clearance_caps_an_overwide_line_at_its_containing_measure() {
         assert_eq!(float_clearance_required_width(140.0, 10.0, 100.0), 100.0);
         assert_eq!(float_clearance_required_width(60.0, 10.0, 100.0), 70.0);
+    }
+
+    #[test]
+    fn text_fit_scale_separates_fixed_and_scalable_advances() {
+        // At scale one, this line is 70pt: 20pt fixed plus 50pt scalable.
+        // At scale two it is 120pt, confirming the same 20pt fixed advance.
+        let scale =
+            text_fit_scale_from_measurements(95.0, 70.0, 120.0, css::TextFitDirection::Grow, None);
+        assert_eq!(scale.factor(), 1.5);
+    }
+
+    #[test]
+    fn text_fit_scale_honors_directional_limits_and_fixed_only_lines() {
+        assert_eq!(
+            text_fit_scale_from_measurements(
+                220.0,
+                70.0,
+                120.0,
+                css::TextFitDirection::Grow,
+                Some(1.2),
+            )
+            .factor(),
+            1.2
+        );
+        assert_eq!(
+            text_fit_scale_from_measurements(
+                30.0,
+                70.0,
+                120.0,
+                css::TextFitDirection::Shrink,
+                Some(0.8),
+            )
+            .factor(),
+            0.8
+        );
+        assert_eq!(
+            text_fit_scale_from_measurements(100.0, 40.0, 40.0, css::TextFitDirection::Grow, None,)
+                .factor(),
+            1.0,
+            "a line containing only fixed inline content must not fit"
+        );
+    }
+
+    #[test]
+    fn per_line_excludes_final_and_forced_break_records() {
+        assert!(text_fit_strategy_scales_record(
+            css::TextFitStrategy::PerLine,
+            0,
+            2,
+            InlineLineTermination::SoftWrap,
+        ));
+        assert!(!text_fit_strategy_scales_record(
+            css::TextFitStrategy::PerLine,
+            1,
+            2,
+            InlineLineTermination::ForcedBreak,
+        ));
+        assert!(!text_fit_strategy_scales_record(
+            css::TextFitStrategy::PerLine,
+            2,
+            2,
+            InlineLineTermination::BlockEnd,
+        ));
+        assert!(text_fit_strategy_scales_record(
+            css::TextFitStrategy::PerLineAll,
+            2,
+            2,
+            InlineLineTermination::ForcedBreak,
+        ));
+    }
+
+    #[test]
+    fn text_fit_scales_only_font_dependent_line_height() {
+        let mut unitless = ComputedStyle::initial();
+        unitless.font_size = 10.0;
+        unitless.line_height = 15.0;
+        unitless.line_height_value = css::ComputedLineHeight::Number(1.5);
+        scale_text_fit_fragment_style(&mut unitless, 2.0);
+        assert_eq!(unitless.font_size, 20.0);
+        assert_eq!(unitless.line_height, 30.0);
+
+        let mut fixed = ComputedStyle::initial();
+        fixed.font_size = 10.0;
+        fixed.line_height = 15.0;
+        fixed.line_height_value = css::ComputedLineHeight::from_points(15.0);
+        scale_text_fit_fragment_style(&mut fixed, 2.0);
+        assert_eq!(fixed.font_size, 20.0);
+        assert_eq!(fixed.line_height, 15.0);
     }
 
     #[test]

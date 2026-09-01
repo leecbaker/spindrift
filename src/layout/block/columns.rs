@@ -1569,12 +1569,26 @@ impl<'a> LayoutBuilder<'a> {
         let deferred_positioned_children_start = self.deferred_multicol_positioned_children.len();
         self.multicol_positioned_replay_capture_depth += 1;
         let page_size = outer_snapshot.current_page_context().size;
+        // The temporary page is only a scratch backend for one anonymous
+        // column. Its physical rectangle must nevertheless be the outer
+        // flow's logical fragmentainer rectangle. In vertical writing the
+        // logical inline span is physical height and the column's block span
+        // is physical width; treating `column-height` as physical height
+        // clips a 100%-inline table or caption to the wrong axis before
+        // committed replay can place it.
+        // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+        // <https://www.w3.org/TR/css-multicol-1/#column-box>
+        let scratch_inline_extent = if vertical {
+            available_width
+        } else {
+            fragmentation_column_height
+        };
         let continuation_context = PageContext {
             size: page_size,
             margins: PageMargins::from_points(
                 page_size.height() - previous_cursor_y,
                 page_size.width() - previous_left - column_width,
-                previous_cursor_y - fragmentation_column_height,
+                previous_cursor_y - scratch_inline_extent,
                 previous_left,
             ),
             edges: PageBoxEdges::ZERO,
@@ -1584,7 +1598,12 @@ impl<'a> LayoutBuilder<'a> {
             margins: PageMargins::from_points(
                 page_size.height() - previous_cursor_y,
                 page_size.width() - previous_left - column_width,
-                previous_cursor_y - first_column_height,
+                previous_cursor_y
+                    - if vertical {
+                        scratch_inline_extent
+                    } else {
+                        first_column_height
+                    },
                 previous_left,
             ),
             ..continuation_context
@@ -1600,20 +1619,24 @@ impl<'a> LayoutBuilder<'a> {
         self.current_page_has_named_page_flow_content = false;
         self.current_page_selected_name = None;
         self.current_page_context = first_context;
-        self.fragmentainer_override = Some(FragmentainerOverride {
-            kind: FragmentainerKind::Column,
-            initial_context: first_context,
-            // The first column starts in the remaining block space at this
-            // point in outer flow. Every later anonymous column starts at the
-            // nominal column height, even when it is still in the first
-            // visual column row.
+        let fragmentainer_sequence = FragmentainerSequence::new(
+            FlowAxes::for_style(style),
+            first_context,
+            // The first column starts in the remaining block space at
+            // this point in outer flow. Every later anonymous column
+            // starts at the nominal column height, even when it is still
+            // in the first visual column row.
             // <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
-            initial_fragmentainer_count: if initial_row_capacity.is_some() {
+            if initial_row_capacity.is_some() {
                 column_count
             } else {
                 1
             },
-            context: continuation_context,
+            continuation_context,
+        );
+        self.fragmentainer_override = Some(FragmentainerOverride {
+            kind: FragmentainerKind::Column,
+            sequence: fragmentainer_sequence,
             relax_widows_orphans,
         });
         self.cursor_y = previous_cursor_y;
@@ -2067,9 +2090,11 @@ impl<'a> LayoutBuilder<'a> {
             .current_page
             .paint_band_insertion_point(PaintBand::InFlowBlock);
         let multicol_axes = FlowAxes::for_style(style);
+        let source_fragmentainer_placement = fragmentainer_sequence.current_placement(0);
+        let source_fragmentainer_rect = source_fragmentainer_placement.content_rect();
         let vertical = style.writing_mode.has_vertical_lines();
         let source_inline_extent = if vertical {
-            fragmentation_column_height
+            available_width
         } else {
             column_width
         };
@@ -2196,17 +2221,41 @@ impl<'a> LayoutBuilder<'a> {
                                 block: fragment_slice_size,
                             },
                         };
+                        let destination_placement = fragmentainer_sequence
+                            .placement_at_destination(
+                                fragment_index,
+                                PageTopRect::new(
+                                    row_left,
+                                    row_top,
+                                    if vertical {
+                                        slice_block_size
+                                    } else {
+                                        available_width
+                                    },
+                                    if vertical {
+                                        available_width
+                                    } else {
+                                        slice_block_size
+                                    },
+                                ),
+                            );
                         let projection =
                             FragmentainerProjection::new(FragmentainerProjectionInput {
                                 source_axes: multicol_axes,
-                                source_origin: PageTopPoint::new(previous_left, previous_cursor_y),
+                                source_origin: PageTopPoint::new(
+                                    source_fragmentainer_rect.x(),
+                                    source_fragmentainer_rect.top_y(),
+                                ),
                                 source_extent: LogicalSize {
                                     inline: source_inline_extent,
                                     block: column_height,
                                 },
                                 source_slice,
                                 destination_axes: multicol_axes,
-                                destination_origin: PageTopPoint::new(row_left, row_top),
+                                destination_origin: PageTopPoint::new(
+                                    destination_placement.content_rect().x(),
+                                    destination_placement.content_rect().top_y(),
+                                ),
                                 destination_extent: LogicalSize {
                                     inline: available_width,
                                     block: slice_block_size,
@@ -2350,13 +2399,15 @@ impl<'a> LayoutBuilder<'a> {
                 // would multiply one source subject into an unbounded number
                 // of anonymous columns. A zero-height monolithic fragment
                 // retains its overflow below without manufacturing tails.
-                && (structurally_occupied_columns == 1
-                    // Temporary table row fragments do not make a preceding
-                    // vertical wrapper sibling cease to be continuous source
-                    // overflow. The logical block axis is horizontal here,
-                    // so its visual source range still has to be sliced
-                    // through later anonymous columns.
-                    || vertical)
+                // A structurally fragmented child, including a table wrapper
+                // that has committed its own row or caption continuations,
+                // already has one source range per temporary column.  It
+                // must be projected once per range.  Treating vertical flow
+                // as an exception here reslices every committed range and
+                // duplicates it through the outer column sequence.
+                // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+                // <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+                && structurally_occupied_columns == 1
                 && fragment_block_extent > source_fragment_height * 1.5
                 {
                     SyntheticColumnReplayPlan::for_visual_overflow(
@@ -2570,16 +2621,39 @@ impl<'a> LayoutBuilder<'a> {
                         row_fragment as isize
                     };
                     let destination_inline_extent = available_width;
+                    let destination_placement = fragmentainer_sequence.placement_at_destination(
+                        target_fragment,
+                        PageTopRect::new(
+                            row_left,
+                            row_top,
+                            if vertical {
+                                total_block_extent
+                            } else {
+                                available_width
+                            },
+                            if vertical {
+                                available_width
+                            } else {
+                                slice_height
+                            },
+                        ),
+                    );
                     let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
                         source_axes: multicol_axes,
-                        source_origin: PageTopPoint::new(previous_left, previous_cursor_y),
+                        source_origin: PageTopPoint::new(
+                            source_fragmentainer_rect.x(),
+                            source_fragmentainer_rect.top_y(),
+                        ),
                         source_extent: LogicalSize {
                             inline: source_inline_extent,
                             block: lifted_block_offset + slice_height,
                         },
                         source_slice,
                         destination_axes: multicol_axes,
-                        destination_origin: PageTopPoint::new(row_left, row_top),
+                        destination_origin: PageTopPoint::new(
+                            destination_placement.content_rect().x(),
+                            destination_placement.content_rect().top_y(),
+                        ),
                         destination_extent: LogicalSize {
                             inline: destination_inline_extent,
                             block: if vertical {
@@ -3007,9 +3081,12 @@ impl<'a> LayoutBuilder<'a> {
         self.current_page_context = context;
         self.fragmentainer_override = Some(FragmentainerOverride {
             kind: FragmentainerKind::Column,
-            initial_context: context,
-            initial_fragmentainer_count: input.column_count,
-            context,
+            sequence: FragmentainerSequence::new(
+                FlowAxes::for_style(input.style),
+                context,
+                input.column_count,
+                context,
+            ),
             relax_widows_orphans: input.relax_widows_orphans,
         });
         self.cursor_y = previous_cursor_y;

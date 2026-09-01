@@ -6063,6 +6063,107 @@ async fn parses_percentage_letter_spacing() {
 }
 
 #[tokio::test]
+async fn parses_css_text_level_five_text_fit() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("text-fit: consistent grow 150%"),
+    );
+    assert_eq!(
+        style.text_fit,
+        TextFit::Fit {
+            direction: TextFitDirection::Grow,
+            strategy: TextFitStrategy::Consistent,
+            limit: Some(1.5),
+        }
+    );
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("text-fit: shrink per-line-all 75%"),
+    );
+    assert_eq!(
+        style.text_fit,
+        TextFit::Fit {
+            direction: TextFitDirection::Shrink,
+            strategy: TextFitStrategy::PerLineAll,
+            limit: Some(0.75),
+        }
+    );
+
+    apply_declarations(&mut style, &parse_declarations("text-fit: grow shrink"));
+    assert_eq!(
+        style.text_fit,
+        TextFit::Fit {
+            direction: TextFitDirection::Shrink,
+            strategy: TextFitStrategy::PerLineAll,
+            limit: Some(0.75),
+        }
+    );
+
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        Some("text-fit: shrink 75%"),
+        &[],
+        None,
+        &[],
+    );
+    let inherited = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        None,
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("p", HashMap::new())],
+    );
+    assert_eq!(inherited.text_fit, parent.text_fit);
+    let reset = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("text-fit: initial"),
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("p", HashMap::new())],
+    );
+    assert_eq!(reset.text_fit, TextFit::None);
+    let explicit_inherit = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("text-fit: inherit"),
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("p", HashMap::new())],
+    );
+    assert_eq!(explicit_inherit.text_fit, parent.text_fit);
+    let unset = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("text-fit: unset"),
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("p", HashMap::new())],
+    );
+    assert_eq!(unset.text_fit, parent.text_fit);
+}
+
+#[tokio::test]
+async fn supports_rule_recognizes_valid_text_fit_grammar() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@supports (text-fit: grow per-line 125%) { p { color: blue } }\
+         @supports (text-fit: grow shrink) { p { background-color: red } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(
+        style.background.background_color.color(),
+        Some(CssColor::TRANSPARENT)
+    );
+}
+
+#[tokio::test]
 async fn parses_ch_length_word_spacing() {
     let declarations = parse_declarations("font-size: 20pt; word-spacing: 2ch");
     let mut style = default_style_for_tag("span");

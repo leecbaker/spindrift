@@ -478,10 +478,8 @@ mod tests {
         assert_eq!(axes.main_start_side(), PhysicalSide::Left);
 
         let right =
-            taffy_justify_content(JustifyContent::new(ContentAlignmentKeyword::Right), axes)
-                .expect("justify-content always has a Taffy fallback");
-        let left = taffy_justify_content(JustifyContent::new(ContentAlignmentKeyword::Left), axes)
-            .expect("justify-content always has a Taffy fallback");
+            taffy_justify_content(JustifyContent::new(ContentAlignmentKeyword::Right), axes);
+        let left = taffy_justify_content(JustifyContent::new(ContentAlignmentKeyword::Left), axes);
 
         assert_eq!(right.keyword, taffy_layout::AlignContentKeyword::FlexEnd);
         assert_eq!(left.keyword, taffy_layout::AlignContentKeyword::FlexStart);

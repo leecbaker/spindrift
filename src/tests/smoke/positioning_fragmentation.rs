@@ -614,6 +614,196 @@ async fn consecutive_absolute_block_siblings_keep_their_static_position_after_in
     }
 }
 
+/// A positioned formatting context must retain the normal-flow static source
+/// for every consecutive out-of-flow block child.  In particular, laying out
+/// the first child cannot leak its private layout cursor into the second
+/// child's hypothetical block position.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+#[tokio::test]
+async fn nested_absolute_block_siblings_share_their_captured_static_rectangle() {
+    let red = CssColor::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 240px 180px; margin: 0 }\
+         html, body, p { margin: 0 }\
+         .outer { position: relative; width: 160px; height: 120px }\
+         .inner { position: absolute; padding: 12px }\
+         .inner > p { position: absolute; margin: 10px; width: 40px; height: 20px }\
+         .first { background: red } .second { background: green }\
+         </style>\
+         <div class=\"outer\"><div class=\"inner\">\
+           <p class=\"first\"></p><p class=\"second\"></p>\
+         </div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let first = filled_rect(page, red);
+    let second = filled_rect(page, green);
+    assert!(
+        (first.x() - second.x()).abs() < 0.01 && (first.y() - second.y()).abs() < 0.01,
+        "nested absolute siblings must retain one static rectangle: first={first:?}, second={second:?}"
+    );
+}
+
+/// Static-position capture belongs to the source formatting context's
+/// logical axes, including a vertical context nested in a positioned box.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+/// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+#[tokio::test]
+async fn vertical_nested_absolute_siblings_share_their_captured_static_rectangle() {
+    let red = CssColor::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 240px 180px; margin: 0 }\
+         html, body, p { margin: 0 }\
+         .outer { position: relative; width: 160px; height: 120px; writing-mode: sideways-lr }\
+         .inner { position: absolute; padding: 12px }\
+         .inner > p { position: absolute; margin: 10px; width: 40px; height: 20px }\
+         .first { background: red } .second { background: green }\
+         </style>\
+         <div class=\"outer\"><div class=\"inner\">\
+           <p class=\"first\"></p><p class=\"second\"></p>\
+         </div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let first = filled_rect(page, red);
+    let second = filled_rect(page, green);
+    assert!(
+        (first.x() - second.x()).abs() < 0.01 && (first.y() - second.y()).abs() < 0.01,
+        "vertical nested absolute siblings must retain one static rectangle: first={first:?}, second={second:?}"
+    );
+}
+
+/// An automatic positioned formatting-context root is sized from its in-flow
+/// contents only. Positioned descendants retain their hypothetical static
+/// source for the committed pass, but their margins and used boxes cannot
+/// enlarge the speculative parent measurement.
+/// <https://drafts.csswg.org/css-position-3/#position-property>
+/// <https://drafts.csswg.org/css-position-3/#abspos-layout>
+#[tokio::test]
+async fn positioned_auto_size_excludes_absolute_children_in_every_supported_flow_direction() {
+    let blue = CssColor::new(0, 0, 255);
+    let red = CssColor::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    for (writing_mode, direction) in [
+        ("horizontal-tb", "ltr"),
+        ("horizontal-tb", "rtl"),
+        ("sideways-rl", "ltr"),
+        ("sideways-rl", "rtl"),
+        ("sideways-lr", "ltr"),
+        ("sideways-lr", "rtl"),
+    ] {
+        let document = Html::from_string(format!(
+            "<!DOCTYPE html>\
+             <style>\
+             @page {{ size: 240pt 180pt; margin: 0 }}\
+             html, body, p {{ margin: 0 }}\
+             .outer {{ display: inline-block; vertical-align: top; position: relative; width: 160pt; height: 120pt; writing-mode: {writing_mode}; direction: {direction} }}\
+             .inner {{ position: absolute; padding: 12pt; background: blue }}\
+             .inner > p {{ position: absolute; margin: 10pt; inline-size: 40pt; font: 10pt/10pt sans-serif; text-indent: 8pt }}\
+             .first {{ background: red }} .second {{ background: green }}\
+             </style>\
+             <div class=\"outer\"><div class=\"inner\">\n\
+               <p class=\"first\">one two three</p>\n\
+               <p class=\"second\">one two three</p>\n\
+             </div></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let parent = filled_rect(page, blue);
+        let first = filled_rect(page, red);
+        let second = filled_rect(page, green);
+        let measured_block_size = if writing_mode == "horizontal-tb" {
+            parent.height()
+        } else {
+            parent.width()
+        };
+        assert!(
+            (measured_block_size - 24.0).abs() < 0.01,
+            "{writing_mode}/{direction} positioned children must not enlarge their parent's automatic block size: {parent:?}"
+        );
+        assert!(
+            (first.x() - second.x()).abs() < 0.01 && (first.y() - second.y()).abs() < 0.01,
+            "{writing_mode}/{direction} siblings must share the committed static rectangle: first={first:?}, second={second:?}"
+        );
+    }
+}
+
+/// Out-of-flow content is excluded without hiding an ordinary sibling's
+/// contribution to the positioned parent's automatic size.
+/// <https://drafts.csswg.org/css-position-3/#position-property>
+#[tokio::test]
+async fn positioned_auto_size_uses_only_mixed_in_flow_content() {
+    let blue = CssColor::new(0, 0, 255);
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 240pt 180pt; margin: 0 }\
+         html, body, p { margin: 0 }\
+         .outer { position: relative; width: 160pt; height: 120pt }\
+         .inner { position: absolute; padding: 12pt; background: blue }\
+         .flow { width: 40pt; height: 20pt }\
+         .overlay { position: absolute; width: 100pt; height: 80pt; margin: 30pt; text-indent: 20pt }\
+         </style>\
+         <div class=\"outer\"><div class=\"inner\">\
+           <p class=\"flow\"></p><p class=\"overlay\">overlay</p>\
+         </div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let parent = filled_rect(&document.pages[0], blue);
+    assert!(
+        (parent.height() - 44.0).abs() < 0.01,
+        "only the 20pt in-flow block size plus 12pt padding should size the parent: {parent:?}"
+    );
+}
+
+/// Default block margins participate in an absolute box's own used geometry,
+/// but must not advance the static source retained for a later sibling.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+#[tokio::test]
+async fn consecutive_absolute_headings_keep_one_static_source_through_default_margins() {
+    let red = CssColor::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 320px 220px; margin: 0 }\
+         html, body { margin: 0 }\
+         div { position: relative } h1 { position: absolute; width: 100px; height: 30px }\
+         .first { background: red } .second { background: green }\
+         </style>\
+         <div><h1 class=\"first\">one</h1><h1 class=\"second\">two</h1></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let first = filled_rect(page, red);
+    let second = filled_rect(page, green);
+    assert!(
+        (first.x() - second.x()).abs() < 0.01 && (first.y() - second.y()).abs() < 0.01,
+        "default-margin absolute headings must retain one static source: first={first:?}, second={second:?}"
+    );
+}
+
 /// `justify-self:auto` for an absolutely positioned block source takes its
 /// inline default from the nearest block static-position containing block.
 /// `align-items` on that ordinary block does not move the source on the block

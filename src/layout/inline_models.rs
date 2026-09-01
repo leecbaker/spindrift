@@ -79,6 +79,7 @@ impl InlineLineGeometry {
             inline_start,
             inline_size,
             block_start,
+            line_block_size: line_block_size.max(0.0),
             text_box_line_trim: TextBoxLineTrim::default(),
         }
     }
@@ -439,7 +440,7 @@ impl InlineAtom {
                 source: AtomicInlineBaselineSynthesisSource::MarginBox,
             },
             InlineAtomContent::Leader(_)
-            | InlineAtomContent::StaticPositionPlaceholder
+            | InlineAtomContent::StaticPositionPlaceholder(_)
             | InlineAtomContent::InlineBox { .. }
             | InlineAtomContent::TextCombineUpright { .. }
             | InlineAtomContent::InlineFragment { .. }
@@ -1015,6 +1016,27 @@ impl InlineFloat {
     }
 }
 
+/// Stable identity for a non-painting static-position source in an inline
+/// item stream.
+///
+/// Deferred positioned replay must select the exact normal-flow source that
+/// produced its line geometry. An item index is not stable across inline-box
+/// splitting, bidi reordering, or trimming; a source element identity is.
+/// The block marker is retained for block-in-inline compatibility paths that
+/// do not have an element-level source.
+/// <https://drafts.csswg.org/css-position-3/#static-position>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) enum InlineStaticPositionMarkerId {
+    Element(crate::dom::ElementId),
+    Block,
+}
+
+impl InlineStaticPositionMarkerId {
+    pub(in crate::layout) fn for_element(element: &Element) -> Self {
+        Self::Element(element.id)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::layout) enum InlineAtomContent {
     Canvas,
@@ -1042,7 +1064,7 @@ pub(in crate::layout) enum InlineAtomContent {
     /// static-position rectangle; it must never paint:
     /// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height> and
     /// <https://www.w3.org/TR/css-position-3/#staticpos-rect>.
-    StaticPositionPlaceholder,
+    StaticPositionPlaceholder(InlineStaticPositionMarkerId),
     InlineBox {
         sequence: inline_layout::InlineLineSequence,
     },
@@ -1437,6 +1459,258 @@ impl CommittedInlineFloat {
     }
 }
 
+/// The logical sequence of anonymous multicol fragmentainers.
+///
+/// CSS Fragmentation gives one fragmentation context one block-flow direction;
+/// descendants can use different writing modes without changing that sequence.
+/// The page contexts remain a scratch-layout implementation detail: placement
+/// clients must obtain them through this sequence rather than derive a column
+/// direction from a physical page cursor.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+/// <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FragmentainerSequence {
+    flow_axes: FlowAxes,
+    /// Context used by the initial anonymous fragmentainers in a partial row.
+    initial_context: PageContext,
+    /// Number of fragmentainers that share `initial_context` before later
+    /// rows use `continuation_context`.
+    initial_fragmentainer_count: usize,
+    continuation_context: PageContext,
+}
+
+/// The source-local logical block interval owned by one anonymous
+/// fragmentainer in a multicolumn sequence.
+///
+/// This interval is deliberately independent of a final page rectangle. A
+/// temporary first row may have a shorter capacity than later rows, while the
+/// final replay can place either row on a different physical page or column.
+/// Keeping the two facts together at the sequence boundary prevents a caller
+/// from deriving source progress from physical X/Y coordinates.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FragmentainerBlockInterval {
+    start: f32,
+    capacity: f32,
+}
+
+impl FragmentainerBlockInterval {
+    pub(in crate::layout) fn start(self) -> f32 {
+        self.start
+    }
+
+    pub(in crate::layout) fn capacity(self) -> f32 {
+        self.capacity
+    }
+}
+
+/// One anonymous fragmentainer selected from a [`FragmentainerSequence`].
+///
+/// This is the boundary between the logical multicolumn sequence and the
+/// page-shaped scratch canvas used to lay out its contents.  Consumers use the
+/// logical block edges and physical content rectangle from this value instead
+/// of reconstructing either from a page cursor.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+/// <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FragmentainerPlacement {
+    ordinal: usize,
+    flow_axes: FlowAxes,
+    logical_block_interval: FragmentainerBlockInterval,
+    /// Final destination geometry selected by the owning fragmentation
+    /// context. This deliberately does not follow the scratch context once
+    /// a multicolumn formatter supplies a replay placement.
+    content_rect: PageTopRect,
+    scratch_context: PageContext,
+}
+
+impl FragmentainerPlacement {
+    fn for_scratch_context(
+        ordinal: usize,
+        flow_axes: FlowAxes,
+        logical_block_interval: FragmentainerBlockInterval,
+        scratch_context: PageContext,
+    ) -> Self {
+        Self {
+            ordinal,
+            flow_axes,
+            logical_block_interval,
+            content_rect: PageTopRect::new(
+                scratch_context.left(),
+                scratch_context.top(),
+                scratch_context.area_width(),
+                scratch_context.area_height(),
+            ),
+            scratch_context,
+        }
+    }
+
+    pub(in crate::layout) fn ordinal(self) -> usize {
+        self.ordinal
+    }
+
+    pub(in crate::layout) fn flow_axes(self) -> FlowAxes {
+        self.flow_axes
+    }
+
+    pub(in crate::layout) fn content_rect(self) -> PageTopRect {
+        self.content_rect
+    }
+
+    pub(in crate::layout) fn scratch_context(self) -> PageContext {
+        self.scratch_context
+    }
+
+    pub(in crate::layout) fn logical_block_capacity(self) -> f32 {
+        self.logical_block_interval.capacity()
+    }
+
+    pub(in crate::layout) fn logical_block_start(self) -> f32 {
+        self.logical_block_interval.start()
+    }
+
+    /// Physical edge at logical block start in the owning fragmentation
+    /// context. Callers must use this instead of interpreting a page cursor
+    /// as a block coordinate.
+    pub(in crate::layout) fn block_start_edge(self) -> f32 {
+        match self.flow_axes.block_start_side() {
+            PhysicalSide::Top => self.content_rect.top_y(),
+            PhysicalSide::Bottom => self.content_rect.bottom_y(),
+            PhysicalSide::Left => self.content_rect.x(),
+            PhysicalSide::Right => self.content_rect.x() + self.content_rect.width(),
+        }
+    }
+
+    pub(in crate::layout) fn block_end_edge(self) -> f32 {
+        match self.flow_axes.block_start_side() {
+            PhysicalSide::Top => self.content_rect.bottom_y(),
+            PhysicalSide::Bottom => self.content_rect.top_y(),
+            PhysicalSide::Left => self.content_rect.x() + self.content_rect.width(),
+            PhysicalSide::Right => self.content_rect.x(),
+        }
+    }
+}
+
+impl FragmentainerSequence {
+    pub(in crate::layout) fn new(
+        flow_axes: FlowAxes,
+        initial_context: PageContext,
+        initial_fragmentainer_count: usize,
+        continuation_context: PageContext,
+    ) -> Self {
+        Self {
+            flow_axes,
+            initial_context,
+            initial_fragmentainer_count,
+            continuation_context,
+        }
+    }
+
+    pub(in crate::layout) fn context_for_fragmentainer(self, index: usize) -> PageContext {
+        self.placement_for_fragmentainer(index).scratch_context()
+    }
+
+    pub(in crate::layout) fn placement_for_fragmentainer(
+        self,
+        index: usize,
+    ) -> FragmentainerPlacement {
+        let (context, interval) = self.fragmentainer_context_and_interval(index);
+        FragmentainerPlacement::for_scratch_context(index, self.flow_axes, interval, context)
+    }
+
+    /// Select the ordinal that owns a continuous logical block position.
+    ///
+    /// A wrapper child such as a table caption may consume several outer
+    /// columns without materializing each scratch page. Its following sibling
+    /// still starts in the column containing the resulting source position,
+    /// including when the first row has a distinct capacity.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout) fn placement_for_logical_block_position(
+        self,
+        position: f32,
+    ) -> FragmentainerPlacement {
+        let position = position.max(0.0);
+        let first = self
+            .initial_context
+            .logical_block_size(self.flow_axes.writing_mode())
+            .max(0.0);
+        let initial_span = first * self.initial_fragmentainer_count as f32;
+        let index = if first > 0.01 && position < initial_span {
+            (position / first).floor() as usize
+        } else {
+            let continuation = self
+                .continuation_context
+                .logical_block_size(self.flow_axes.writing_mode())
+                .max(0.0);
+            if continuation <= 0.01 {
+                self.initial_fragmentainer_count
+            } else {
+                self.initial_fragmentainer_count
+                    + ((position - initial_span).max(0.0) / continuation).floor() as usize
+            }
+        };
+        self.placement_for_fragmentainer(index)
+    }
+
+    /// Bind one ordinal to the physical rectangle selected during committed
+    /// multicolumn replay.
+    ///
+    /// The caller may supply final geometry, but cannot independently choose
+    /// its axes, source interval, or scratch context. This keeps speculative
+    /// layout and replay tied to the same sequence ordinal.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout) fn placement_at_destination(
+        self,
+        index: usize,
+        content_rect: PageTopRect,
+    ) -> FragmentainerPlacement {
+        let mut placement = self.placement_for_fragmentainer(index);
+        placement.content_rect = content_rect;
+        placement
+    }
+
+    pub(in crate::layout) fn current_placement(
+        self,
+        completed_fragmentainers: usize,
+    ) -> FragmentainerPlacement {
+        self.placement_for_fragmentainer(completed_fragmentainers)
+    }
+
+    pub(in crate::layout) fn continuation_context(self) -> PageContext {
+        self.continuation_context
+    }
+
+    fn fragmentainer_context_and_interval(
+        self,
+        index: usize,
+    ) -> (PageContext, FragmentainerBlockInterval) {
+        let first_capacity = self
+            .initial_context
+            .logical_block_size(self.flow_axes.writing_mode())
+            .max(0.0);
+        let continuation_capacity = self
+            .continuation_context
+            .logical_block_size(self.flow_axes.writing_mode())
+            .max(0.0);
+        let initial_count = self.initial_fragmentainer_count;
+        let (context, start, capacity) = if index < initial_count {
+            (
+                self.initial_context,
+                index as f32 * first_capacity,
+                first_capacity,
+            )
+        } else {
+            (
+                self.continuation_context,
+                initial_count as f32 * first_capacity
+                    + (index - initial_count) as f32 * continuation_capacity,
+                continuation_capacity,
+            )
+        };
+        (context, FragmentainerBlockInterval { start, capacity })
+    }
+}
+
 /// A temporary fragmentainer materialized through Quire's page cursor.
 ///
 /// Multi-column layout uses isolated page-shaped canvases as anonymous column
@@ -1446,22 +1720,24 @@ impl CommittedInlineFloat {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct FragmentainerOverride {
     pub(in crate::layout) kind: FragmentainerKind,
-    /// Context used by the initial anonymous fragmentainers in a partial row.
-    pub(in crate::layout) initial_context: PageContext,
-    /// Number of fragmentainers that share `initial_context` before later
-    /// rows use `context`.
-    pub(in crate::layout) initial_fragmentainer_count: usize,
-    pub(in crate::layout) context: PageContext,
+    pub(in crate::layout) sequence: FragmentainerSequence,
     pub(in crate::layout) relax_widows_orphans: bool,
 }
 
 impl FragmentainerOverride {
     pub(in crate::layout) fn context_for_fragmentainer(self, index: usize) -> PageContext {
-        if index < self.initial_fragmentainer_count {
-            self.initial_context
-        } else {
-            self.context
-        }
+        self.sequence.context_for_fragmentainer(index)
+    }
+
+    pub(in crate::layout) fn placement_for_fragmentainer(
+        self,
+        index: usize,
+    ) -> FragmentainerPlacement {
+        self.sequence.placement_for_fragmentainer(index)
+    }
+
+    pub(in crate::layout) fn continuation_context(self) -> PageContext {
+        self.sequence.continuation_context()
     }
 }
 
@@ -1547,5 +1823,104 @@ mod atomic_inline_capture_frame_tests {
             translation.transform_point(PaintPoint::new(12.0, 34.0)),
             PaintPoint::new(20.0, 30.0),
         );
+    }
+}
+
+#[cfg(test)]
+mod fragmentainer_sequence_tests {
+    use super::*;
+
+    #[test]
+    fn placement_retains_ordinal_axes_and_scratch_content_geometry() {
+        let options = RenderOptions::default();
+        let context = PageContext::from_options(&options);
+        let sequence = FragmentainerSequence::new(
+            FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
+            context,
+            1,
+            context,
+        );
+        let placement = sequence.placement_for_fragmentainer(2);
+
+        assert_eq!(placement.ordinal(), 2);
+        assert_eq!(
+            placement.flow_axes().writing_mode(),
+            WritingMode::VerticalRl
+        );
+        assert_eq!(placement.scratch_context(), context);
+        assert_eq!(placement.content_rect().x(), context.left());
+        assert_eq!(placement.content_rect().top_y(), context.top());
+        assert_eq!(
+            placement.logical_block_capacity(),
+            context.logical_block_size(WritingMode::VerticalRl),
+        );
+        assert_eq!(
+            placement.logical_block_interval.start,
+            2.0 * context.logical_block_size(WritingMode::VerticalRl),
+        );
+    }
+
+    #[test]
+    fn destination_placement_projects_block_edges_from_outer_axes() {
+        let context = PageContext::from_options(&RenderOptions::default());
+        let rect = PageTopRect::new(20.0, 100.0, 30.0, 40.0);
+
+        let lr = FragmentainerSequence::new(
+            FlowAxes::new(WritingMode::VerticalLr, Direction::Rtl),
+            context,
+            1,
+            context,
+        )
+        .placement_at_destination(3, rect);
+        assert_eq!(lr.block_start_edge(), 20.0);
+        assert_eq!(lr.block_end_edge(), 50.0);
+
+        let rl = FragmentainerSequence::new(
+            FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
+            context,
+            1,
+            context,
+        )
+        .placement_at_destination(3, rect);
+        assert_eq!(rl.block_start_edge(), 50.0);
+        assert_eq!(rl.block_end_edge(), 20.0);
+    }
+
+    #[test]
+    fn first_fragment_variation_precedes_the_continuation_intervals() {
+        let base = PageContext::from_options(&RenderOptions::default());
+        let initial = PageContext {
+            margins: PageMargins::from_points(
+                0.0,
+                base.size.width() - 40.0,
+                base.size.height() - 150.0,
+                0.0,
+            ),
+            ..base
+        };
+        let continuation = PageContext {
+            margins: PageMargins::from_points(
+                0.0,
+                base.size.width() - 30.0,
+                base.size.height() - 150.0,
+                0.0,
+            ),
+            ..base
+        };
+        let sequence = FragmentainerSequence::new(
+            FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
+            initial,
+            1,
+            continuation,
+        );
+
+        let first = sequence.placement_for_fragmentainer(0);
+        let second = sequence.placement_for_fragmentainer(1);
+        let third = sequence.placement_for_fragmentainer(2);
+
+        assert_eq!(first.logical_block_capacity(), 40.0);
+        assert_eq!(second.logical_block_capacity(), 30.0);
+        assert_eq!(second.logical_block_interval.start, 40.0);
+        assert_eq!(third.logical_block_interval.start, 70.0);
     }
 }

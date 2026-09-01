@@ -1,4 +1,6 @@
-use super::*;
+use crate::css::{ComputedStyle, ElementSignature, PercentageBasis, Stylesheets};
+use crate::dom::Element;
+use crate::layout::{IntrinsicBlockBasis, LayoutBuilder, element_signature};
 
 impl<'a> LayoutBuilder<'a> {
     /// Estimate a direct inline row for flex intrinsic sizing.

@@ -923,7 +923,7 @@ impl<'a> LayoutBuilder<'a> {
                     // where it supplies a definite per-line cross-axis
                     // measurement slot.
                     flex_line_count: u16::try_from(style.flex_line_count.get()).unwrap_or(u16::MAX),
-                    justify_content: taffy_justify_content(style.justify_content, flex_axes),
+                    justify_content: Some(taffy_justify_content(style.justify_content, flex_axes)),
                     align_content: Some(taffy_align_content(style.align_content)),
                     align_items: Some(taffy_align_items(style.align_items)),
                     gap: taffy_layout::Size {

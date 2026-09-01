@@ -1075,8 +1075,15 @@ impl TableGridPlacement {
 
     /// Projects one logical table-grid rectangle into page top-edge geometry.
     pub(super) fn page_top_rect_for(self, rect: TableGridRect) -> PageTopRect {
-        let logical_inline_extent = self.logical_size.inline().points().max(rect.max_x());
-        let logical_block_extent = self.logical_size.block().points().max(rect.max_y());
+        // The placement's logical size establishes the one immutable writing
+        // mode conversion basis. Border/padding decoration rectangles may
+        // extend outside that grid (negative logical origins are expected),
+        // but they must not enlarge the basis: in bottom-to-top vertical
+        // flow that would move the physical origin by the added inset.
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        // <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds>
+        let logical_inline_extent = self.logical_size.inline().points();
+        let logical_block_extent = self.logical_size.block().points();
         let physical = self.axes.physical_rect_from_logical_grid(
             rect.origin.x,
             rect.origin.y,

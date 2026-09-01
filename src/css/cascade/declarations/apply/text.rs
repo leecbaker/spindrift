@@ -141,6 +141,11 @@ pub(in crate::css) fn apply_cascaded_text_declaration(
                 style.text_transform = transform;
             }
         }
+        "text-fit" => {
+            if let Some(text_fit) = TextFit::parse(value) {
+                style.text_fit = text_fit;
+            }
+        }
         "tab-size" => {
             if let Some(tab_size) = parse_tab_size(value, style.font_size) {
                 style.tab_size = tab_size;

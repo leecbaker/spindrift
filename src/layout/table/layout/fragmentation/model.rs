@@ -1,6 +1,76 @@
 //! Fragmentation plans, placements, and body replay state.
 
 use super::*;
+use crate::layout::inline_models::FragmentainerPlacement;
+
+/// The table-facing view of an enclosing multicolumn fragmentainer.
+///
+/// A table grid has its own [`TableGridPlacement`] and may be orthogonal to
+/// its parent. It must therefore never use its grid axes to select a parent
+/// continuation. This wrapper exposes the parent sequence's already-selected
+/// capacity, destination rectangle, and logical block edges without exposing
+/// the scratch `PageContext` used to lay out the source column.
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flow>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout::table) struct TableOuterFragmentainerPlacement {
+    placement: FragmentainerPlacement,
+}
+
+impl TableOuterFragmentainerPlacement {
+    pub(in crate::layout::table) fn from_outer(placement: FragmentainerPlacement) -> Self {
+        Self { placement }
+    }
+
+    pub(in crate::layout::table) fn axes(self) -> FlowAxes {
+        self.placement.flow_axes()
+    }
+
+    pub(in crate::layout::table) fn ordinal(self) -> usize {
+        self.placement.ordinal()
+    }
+
+    pub(in crate::layout::table) fn destination_rect(self) -> PageTopRect {
+        self.placement.content_rect()
+    }
+
+    /// The destination paint clip selected by the enclosing fragmentainer.
+    ///
+    /// Wrapper siblings use this rather than rebuilding a physical clip from
+    /// table-grid coordinates: an orthogonal table's grid rectangle is not
+    /// an outer column rectangle.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout::table) fn destination_clip(self) -> PaintClip {
+        self.destination_rect().paint_clip()
+    }
+
+    pub(in crate::layout::table) fn logical_block_capacity(self) -> f32 {
+        self.placement.logical_block_capacity()
+    }
+
+    /// Logical block coordinates used by table row decisions decrease toward
+    /// block-end, including in vertical-lr parent flow.
+    pub(in crate::layout::table) fn block_start(self) -> TableFragmentainerBlockStart {
+        let destination = self.destination_rect();
+        debug_assert!(destination.width() >= 0.0 && destination.height() >= 0.0);
+        let edge = self.placement.block_start_edge();
+        TableFragmentainerBlockStart::new(match self.axes().block_start_side() {
+            PhysicalSide::Left => -edge,
+            PhysicalSide::Top | PhysicalSide::Bottom | PhysicalSide::Right => edge,
+        })
+    }
+
+    pub(in crate::layout::table) fn block_end(self) -> TableFragmentainerBlockStart {
+        let destination = self.destination_rect();
+        debug_assert!(destination.width() >= 0.0 && destination.height() >= 0.0);
+        let edge = self.placement.block_end_edge();
+        TableFragmentainerBlockStart::new(match self.axes().block_start_side() {
+            PhysicalSide::Left => -edge,
+            PhysicalSide::Top | PhysicalSide::Bottom | PhysicalSide::Right => edge,
+        })
+    }
+}
+
 /// The logical block-start coordinate of a committed table destination
 /// fragmentainer.
 ///
@@ -43,6 +113,12 @@ pub(in crate::layout::table) struct TableFragmentainerPlacement {
     pub(in crate::layout::table) block_start: TableFragmentainerBlockStart,
     pub(in crate::layout::table) block_span: LogicalBlockContentSize,
     pub(in crate::layout::table) writing_mode: WritingMode,
+    /// The selected enclosing multicolumn fragmentainer, when this table is
+    /// laid out in one. Page-only table fragmentation has no such outer
+    /// placement. Retaining the complete value prevents wrapper captions and
+    /// grid rows with equal scratch geometry from being treated as one target
+    /// and keeps table-local grid axes from replacing outer capacity/edges.
+    pub(in crate::layout::table) outer_fragmentainer: Option<TableOuterFragmentainerPlacement>,
 }
 
 impl TableFragmentainerPlacement {
@@ -60,6 +136,7 @@ impl TableFragmentainerPlacement {
             block_start: TableFragmentainerBlockStart::new(top.points()),
             block_span,
             writing_mode: WritingMode::HorizontalTb,
+            outer_fragmentainer: None,
         }
     }
 
@@ -78,6 +155,7 @@ impl TableFragmentainerPlacement {
             block_start,
             block_span,
             writing_mode: WritingMode::VerticalLr,
+            outer_fragmentainer: None,
         }
     }
 
@@ -96,12 +174,26 @@ impl TableFragmentainerPlacement {
             block_start,
             block_span,
             writing_mode: WritingMode::VerticalRl,
+            outer_fragmentainer: None,
         }
     }
 
     /// The immutable page origin of this fragment's destination cell grid.
     pub(in crate::layout::table) fn destination_grid_origin(self) -> PageTopPoint {
         self.destination_grid_origin
+    }
+
+    /// Rebase the physical grid origin while retaining the wrapper-selected
+    /// outer fragmentainer and its logical block interval.  The wrapper owns
+    /// the continuation choice; the table grid supplies only its distinct
+    /// content-box origin inside that selected destination.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout::table) fn with_destination_grid_origin(
+        mut self,
+        origin: PageTopPoint,
+    ) -> Self {
+        self.destination_grid_origin = origin;
+        self
     }
 
     pub(in crate::layout::table) fn with_wrapper_table_x(
@@ -112,8 +204,75 @@ impl TableFragmentainerPlacement {
         self
     }
 
+    pub(in crate::layout::table) fn with_outer_fragmentainer(
+        mut self,
+        outer: Option<TableOuterFragmentainerPlacement>,
+    ) -> Self {
+        self.outer_fragmentainer = outer;
+        self
+    }
+
+    /// Select an enclosing fragmentainer as this table fragment's authority.
+    ///
+    /// Unlike [`Self::with_outer_fragmentainer`], this is used when wrapper
+    /// progress selects a different outer ordinal. The selected placement
+    /// consequently replaces both the capacity and the logical block edges;
+    /// retaining those fields from an earlier ordinal would let the first row
+    /// immediately transition back into the ambient scratch fragmentainer.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    pub(in crate::layout::table) fn select_outer_fragmentainer(
+        mut self,
+        outer: TableOuterFragmentainerPlacement,
+    ) -> Self {
+        self.block_start = outer.block_start();
+        self.block_span =
+            LogicalBlockContentSize::new(content_box_pt(outer.logical_block_capacity()));
+        self.outer_fragmentainer = Some(outer);
+        self
+    }
+
+    pub(in crate::layout::table) fn outer_fragmentainer_ordinal(self) -> Option<usize> {
+        self.outer_fragmentainer
+            .map(TableOuterFragmentainerPlacement::ordinal)
+    }
+
+    pub(in crate::layout::table) fn outer_fragmentainer(
+        self,
+    ) -> Option<TableOuterFragmentainerPlacement> {
+        self.outer_fragmentainer
+    }
+
     pub(in crate::layout::table) fn wrapper_table_x(self) -> PageInlinePosition {
         self.wrapper_table_x
+    }
+
+    /// Advance a wrapper-flow sibling through this placement's continuous
+    /// logical block source coordinate.
+    ///
+    /// This is not a fragmentainer transition: an enclosing multicolumn
+    /// formatter will later clip and replay the continuous source interval.
+    /// It prevents a following caption from reusing the grid's opening
+    /// physical X when an unbroken vertical grid overflows its first column.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#block-flow>
+    pub(in crate::layout::table) fn advance_wrapper_source_block(
+        self,
+        span: TableGridLength,
+    ) -> Self {
+        let offset = span.get().max(0.0);
+        let x_offset = match self.writing_mode {
+            WritingMode::HorizontalTb => 0.0,
+            WritingMode::VerticalLr | WritingMode::SidewaysLr => offset,
+            WritingMode::VerticalRl | WritingMode::SidewaysRl => -offset,
+        };
+        Self {
+            destination_grid_origin: PageTopPoint::new(
+                self.destination_grid_origin.x() + x_offset,
+                self.destination_grid_origin.top_y(),
+            ),
+            wrapper_table_x: PageInlinePosition::new(self.wrapper_table_x.points() + x_offset),
+            ..self
+        }
     }
 
     pub(in crate::layout::table) fn paint_top(self) -> PageTopBlockPosition {
@@ -326,16 +485,28 @@ pub(in crate::layout::table) struct TableRowFragmentDecision {
 pub(in crate::layout::table) enum TableRowFragmentMode {
     Whole,
     Sliced,
+    /// A table wrapper can expose consecutive outer fragmentainer slices of
+    /// an otherwise monolithic empty row. The row has no descendant break
+    /// opportunity, so this mode replays only table-root structural paint;
+    /// it never treats the cell contents as independently fragmented.
+    ///
+    /// <https://www.w3.org/TR/css-break-3/#box-splitting>
+    /// <https://drafts.csswg.org/css-tables-3/#table-fragmentation>
+    DecorationOnly,
     KeptByAvoidOverflow,
 }
 
 impl TableRowFragmentMode {
     pub(in crate::layout::table) fn clips_to_row_piece(self) -> bool {
-        self == Self::Sliced
+        matches!(self, Self::Sliced | Self::DecorationOnly)
     }
 
     pub(in crate::layout::table) fn replays_flow_children_from_plan(self) -> bool {
         matches!(self, Self::Sliced | Self::KeptByAvoidOverflow)
+    }
+
+    pub(in crate::layout::table) fn is_decoration_only(self) -> bool {
+        self == Self::DecorationOnly
     }
 }
 
@@ -743,7 +914,15 @@ impl TableBodyPaintFragment {
         decision: TableRowFragmentDecision,
     ) {
         if let Some(viewport) = &mut self.grid_viewport {
-            viewport.record_source_row_slice(decision, self.plan.page_index);
+            // The outer multicolumn sequence, not the temporary page vector,
+            // identifies this destination. Non-multicol page fragmentation
+            // intentionally retains the page-plan index as its backend key.
+            let destination_ordinal = self
+                .plan
+                .placement
+                .outer_fragmentainer_ordinal()
+                .unwrap_or(self.plan.page_index);
+            viewport.record_source_row_slice(decision, destination_ordinal);
         }
     }
 
@@ -877,6 +1056,10 @@ pub(in crate::layout::table) struct TableBodyRowsInput<'table, 'ctx> {
     /// progress. This can differ from the source placement when the caption
     /// crosses a page or column boundary.
     pub(in crate::layout::table) initial_destination_grid_placement: TableGridPlacement,
+    /// Wrapper-selected fragmentainer for the grid's first row. This is kept
+    /// distinct from the grid placement so table-local geometry cannot
+    /// replace the enclosing multicolumn continuation ordinal.
+    pub(in crate::layout::table) initial_fragmentainer_placement: TableFragmentainerPlacement,
     /// Physical top of the destination grid content box after the wrapper's
     /// physical top border and padding. Vertical table rows must start here,
     /// rather than at the wrapper border edge retained by the root-decoration
@@ -974,14 +1157,14 @@ pub(in crate::layout::table) struct TableFragmentainerGridOrigin(PageTopPoint);
 
 impl TableFragmentainerGridOrigin {
     fn for_continuation(
-        style: &ComputedStyle,
+        fragmentainer_axes: FlowAxes,
         content_left: f32,
         content_right: f32,
         horizontal_inline_offset: HorizontalTableContinuationInlineOffset,
         cell_grid_block_extent: TableGridLength,
         inline_top: PageTopBlockPosition,
     ) -> Self {
-        let x = match style.writing_mode {
+        let x = match fragmentainer_axes.writing_mode() {
             WritingMode::VerticalRl | WritingMode::SidewaysRl => {
                 content_right - cell_grid_block_extent.get()
             }
@@ -1026,7 +1209,7 @@ pub(in crate::layout::table) struct TableBodyFragmentCommitContext<'table, 'ctx>
 impl TableBodyFragmentCommitContext<'_, '_> {
     pub(in crate::layout::table) fn rebase_destination_grid_to_fragmentainer(
         &mut self,
-        style: &ComputedStyle,
+        fragmentainer_axes: FlowAxes,
         content_left: f32,
         content_right: f32,
     ) {
@@ -1043,7 +1226,7 @@ impl TableBodyFragmentCommitContext<'_, '_> {
             self.table_metrics.clone(),
         ));
         self.table_x = TableFragmentainerGridOrigin::for_continuation(
-            style,
+            fragmentainer_axes,
             content_left,
             content_right,
             self.continuation_inline_offset,
@@ -1074,14 +1257,9 @@ mod tests {
         let offset = HorizontalTableContinuationInlineOffset::capture(28.0, 20.0);
         let extent = TableGridLength::new(255.0);
         let inline_top = PageTopBlockPosition::new(400.0);
-        let style = |writing_mode| ComputedStyle {
-            writing_mode,
-            ..ComputedStyle::initial()
-        };
-
         assert_eq!(
             TableFragmentainerGridOrigin::for_continuation(
-                &style(WritingMode::HorizontalTb),
+                FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
                 120.0,
                 220.0,
                 offset,
@@ -1093,7 +1271,7 @@ mod tests {
         );
         assert_eq!(
             TableFragmentainerGridOrigin::for_continuation(
-                &style(WritingMode::VerticalLr),
+                FlowAxes::new(WritingMode::VerticalLr, Direction::Ltr),
                 120.0,
                 220.0,
                 offset,
@@ -1105,7 +1283,7 @@ mod tests {
         );
         assert_eq!(
             TableFragmentainerGridOrigin::for_continuation(
-                &style(WritingMode::VerticalRl),
+                FlowAxes::new(WritingMode::VerticalRl, Direction::Ltr),
                 120.0,
                 220.0,
                 offset,

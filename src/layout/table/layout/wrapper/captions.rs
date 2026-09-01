@@ -1,5 +1,5 @@
 use super::*;
-/// Physical width available to a table caption's outer border box.
+/// Logical inline size available to a table caption's outer border box.
 ///
 /// Captions are siblings of the table grid in the table wrapper, so their
 /// auto-width resolution uses the wrapper border-box measure rather than the
@@ -7,9 +7,9 @@ use super::*;
 /// an empty grid from silently dropping its wrapper padding and borders.
 /// <https://www.w3.org/TR/CSS22/tables.html#model>
 #[derive(Debug, Clone, Copy)]
-pub(in crate::layout::table) struct TableCaptionOuterWidth(BorderBoxLength);
+pub(in crate::layout::table) struct TableCaptionOuterInlineSize(BorderBoxLength);
 
-impl TableCaptionOuterWidth {
+impl TableCaptionOuterInlineSize {
     pub(in crate::layout::table) fn from_border_box(width: BorderBoxLength) -> Self {
         Self(width)
     }
@@ -31,32 +31,42 @@ impl TableCaptionOuterWidth {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::table) struct TableCaptionContainingBlock {
     physical_span: PageInlineSpan,
-    outer_width: TableCaptionOuterWidth,
+    outer_inline_size: TableCaptionOuterInlineSize,
     axes: TableAxes,
     wrapper_table_x: PageInlinePosition,
+    /// Whether float avoidance moved the wrapper's margin-box inline origin
+    /// away from the containing block's ordinary start edge. Only then may a
+    /// caption-free vertical wrapper use the resolved wrapper X as its
+    /// continuation origin; a table margin is not outer-fragmentainer
+    /// progress.
+    float_displaced_inline: bool,
+    /// The enclosing fragmentainer selected for this wrapper sibling. This
+    /// is deliberately not a `TableGridPlacement`: captions and the grid
+    /// share outer continuation but not table-grid geometry.
+    outer_fragmentainer: Option<TableOuterFragmentainerPlacement>,
 }
 
 impl TableCaptionContainingBlock {
     pub(in crate::layout::table) fn new(
         physical_span: PageInlineSpan,
-        outer_width: TableCaptionOuterWidth,
+        outer_inline_size: TableCaptionOuterInlineSize,
         axes: TableAxes,
         wrapper_table_x: PageInlinePosition,
+        float_displaced_inline: bool,
+        outer_fragmentainer: Option<TableOuterFragmentainerPlacement>,
     ) -> Self {
         Self {
             physical_span,
-            outer_width,
+            outer_inline_size,
             axes,
             wrapper_table_x,
+            float_displaced_inline,
+            outer_fragmentainer,
         }
     }
 
-    pub(in crate::layout::table) fn physical_span(self) -> PageInlineSpan {
-        self.physical_span
-    }
-
-    pub(in crate::layout::table) fn outer_width(self) -> TableCaptionOuterWidth {
-        self.outer_width
+    pub(in crate::layout::table) fn outer_inline_size(self) -> TableCaptionOuterInlineSize {
+        self.outer_inline_size
     }
 
     pub(in crate::layout::table) fn axes(self) -> TableAxes {
@@ -65,6 +75,17 @@ impl TableCaptionContainingBlock {
 
     pub(in crate::layout::table) fn wrapper_table_x(self) -> PageInlinePosition {
         self.wrapper_table_x
+    }
+
+    pub(in crate::layout::table) fn float_displaced_inline(self) -> bool {
+        self.float_displaced_inline
+    }
+
+    /// Return the outer placement that owns the caption's continuation.
+    pub(in crate::layout::table) fn outer_fragmentainer(
+        self,
+    ) -> Option<TableOuterFragmentainerPlacement> {
+        self.outer_fragmentainer
     }
 
     /// Return the physical span which the legacy generic block entry may use
@@ -164,7 +185,7 @@ impl TableCaptionLayoutOutcome {
 /// fragmentainers. The final-block-boundary flag is kept separate from the
 /// paint slices: the next wrapper part, rather than caption layout itself,
 /// decides whether an empty successor must be materialized.
-struct VerticalTableCaptionConsumption {
+struct TableCaptionConsumption {
     /// The table wrapper's authoritative continuation after this caption's
     /// final slice.  It carries both the destination origin and the remaining
     /// logical block track; callers must not rebuild either from a restored
@@ -213,24 +234,28 @@ impl<'a> LayoutBuilder<'a> {
         containing_block: TableCaptionContainingBlock,
         side: CaptionSide,
     ) -> TableCaptionLayoutOutcome {
-        let table_width = containing_block.outer_width().points();
-        let table_span = containing_block.physical_span();
+        let table_width = containing_block.outer_inline_size().points();
         debug_assert_eq!(
             containing_block.axes().flow.writing_mode(),
             table_style.writing_mode,
             "caption containing block must retain its table-root axes"
         );
-        if std::env::var_os("QUIRE_TRACE_TABLE_CAPTION").is_some() {
-            eprintln!(
-                "table caption container: side={side:?} input_x={} input_width={table_width} parent=({}, {}) cursor={}",
-                table_span.left_x(),
-                self.content_left,
-                self.content_right,
-                self.cursor_y,
-            );
-        }
         let opening_content_left = self.content_left;
-        let mut final_fragmentainer_left = self.content_left;
+        // The wrapper's physical block-start origin has already been chosen
+        // by normal-flow placement (including float avoidance).  The active
+        // scratch column's `content_left` is merely the parent flow edge and
+        // can still point at the float's occupied slab.  Starting a vertical
+        // caption/grid continuation there loses the wrapper placement when
+        // no caption is generated at all.
+        // <https://www.w3.org/TR/css-writing-modes-4/#block-flow>
+        // <https://www.w3.org/TR/css2/visuren.html#floats>
+        let mut final_fragmentainer_left = if table_style.writing_mode.has_vertical_lines()
+            && containing_block.float_displaced_inline()
+        {
+            containing_block.wrapper_table_x().points()
+        } else {
+            opening_content_left
+        };
         // A vertical table wrapper advances along physical X.  Keep this
         // typed destination while the wrapper track still reflects the
         // consumed caption, rather than synthesizing one after generic
@@ -254,7 +279,7 @@ impl<'a> LayoutBuilder<'a> {
                 let horizontal_non_content = caption_style.padding.left
                     + caption_style.padding.right
                     + horizontal_border_width(&caption_style);
-                set_style_used_width(
+                set_style_used_logical_inline_size(
                     &mut caption_style,
                     (table_width - horizontal_non_content).max(0.0),
                 );
@@ -285,7 +310,7 @@ impl<'a> LayoutBuilder<'a> {
                         caption_style.border_width_values.left =
                             css::ComputedLengthPercentage::from_points(0.0);
                         caption_style.border_widths.left = 0.0;
-                        set_style_used_width(
+                        set_style_used_logical_inline_size(
                             &mut caption_style,
                             (table_width - horizontal_non_content + start_border).max(0.0),
                         );
@@ -312,12 +337,6 @@ impl<'a> LayoutBuilder<'a> {
             };
             let previous_left = self.content_left;
             let previous_right = self.content_right;
-            if std::env::var_os("QUIRE_TRACE_TABLE_CAPTION").is_some() {
-                eprintln!(
-                    " caption: style={:?}/{:?} available_width={caption_available_width}",
-                    caption_style.writing_mode, caption_style.caption_side,
-                );
-            }
             if let Some(horizontal_span) = containing_block.legacy_horizontal_span() {
                 self.content_left = horizontal_span.left_x();
                 self.content_right = horizontal_span.right_x();
@@ -338,9 +357,36 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
             // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
             let caption_paint_checkpoint = self.current_page.paint_checkpoint();
-            if vertical_caption {
+            // Paged-media vertical roots own a physical-X page transition.
+            // An anonymous multicolumn fragmentainer does not: its parent
+            // retains the one source fragment and projects it to columns
+            // during final replay. Materializing columns here would give the
+            // caption a second, table-local column sequence.
+            let caption_uses_page_fragmentation = vertical_caption
+                && containing_block.outer_fragmentainer().is_none()
+                && self.active_fragmentainer_kind() == FragmentainerKind::Page;
+            // The table wrapper owns the caption → grid transition. In an
+            // outer multicolumn context, allowing generic caption layout to
+            // call `push_page` would materialize anonymous columns before
+            // the wrapper records its source interval; the later table-grid
+            // replay would then select a second sequence. Suppress generic
+            // fragmentation for every vertical wrapper caption. Paged roots
+            // are consumed explicitly below; multicol captions stay as one
+            // source fragment for their enclosing sequence to replay once.
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            let wrapper_owns_caption_fragmentation = vertical_caption;
+            if wrapper_owns_caption_fragmentation {
                 self.fragmentation_suppression_depth += 1;
             }
+            // Captions resolve their inline size against the table wrapper,
+            // not against the active column's physical X span. This is
+            // observable in vertical writing, where that X span is the
+            // wrapper's block axis.
+            // <https://drafts.csswg.org/css-tables-3/#table-caption-box>
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+            self.content_logical_inline_size_stack
+                .push(caption_available_width);
             // The table-part adapter has already applied the caption's
             // effective zoom. Its generic block replay consumes this value
             // only as used geometry, so prevent that nested entry from
@@ -359,6 +405,9 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 self.layout_element(caption.element, &caption_style, stylesheets);
             }
+            self.content_logical_inline_size_stack
+                .pop()
+                .expect("caption inline-size basis must be balanced");
             if !vertical_caption {
                 // Generic block layout selected the active destination for a
                 // horizontal caption.  Retain that typed track while it is
@@ -366,8 +415,10 @@ impl<'a> LayoutBuilder<'a> {
                 // containing block for the next wrapper sibling.
                 final_fragmentainer_left = self.content_left;
             }
-            if vertical_caption {
+            if wrapper_owns_caption_fragmentation {
                 self.fragmentation_suppression_depth -= 1;
+            }
+            if caption_uses_page_fragmentation {
                 let caption_block_size = layout_pt(
                     self.last_block_layout_outcome
                         .physical_border_box_inline_span
@@ -420,7 +471,7 @@ impl<'a> LayoutBuilder<'a> {
                 // fragmentainer track before consuming wrapper progress.
                 self.content_left = previous_left;
                 self.content_right = previous_right;
-                let consumption = self.consume_vertical_table_caption_block_size(
+                let consumption = self.consume_table_caption_block_size(
                     FlowAxes::for_style(&caption_style),
                     caption_block_size,
                     caption_source
@@ -441,7 +492,7 @@ impl<'a> LayoutBuilder<'a> {
                         slice
                     }));
                     if let Some((source, source_origin, source_extent)) = caption_source {
-                        let projected = self.project_vertical_table_caption_paint(
+                        let projected = self.project_table_caption_paint(
                             source,
                             &consumption.paint_slices,
                             FlowAxes::for_style(&caption_style),
@@ -499,6 +550,82 @@ impl<'a> LayoutBuilder<'a> {
                             .max(0.0),
                 );
                 final_fragmentainer_left = self.content_left;
+            } else if vertical_caption {
+                // Generic vertical caption layout records paint in its local
+                // inline coordinate. The outer column fragmentainer owns the
+                // destination sequence, but it still expects that source
+                // paint to be rebased to the active fragmentainer's inline
+                // origin before its one final projection.
+                let inline_offset =
+                    (caption_inline_block_start.points() - self.current_page_context.top()).abs();
+                let inline_translation = if inline_offset > 0.01 {
+                    match FlowAxes::for_style(&caption_style).inline_start_side() {
+                        PhysicalSide::Top => PaintTranslation::new(0.0, -inline_offset),
+                        PhysicalSide::Bottom => PaintTranslation::new(0.0, inline_offset),
+                        PhysicalSide::Left | PhysicalSide::Right => unreachable!(
+                            "vertical caption projection has a vertical logical inline axis"
+                        ),
+                    }
+                } else {
+                    PaintTranslation::identity()
+                };
+                // Generic caption layout starts its vertical-rl box at the
+                // scratch column's physical left edge. A wrapper sibling's
+                // logical block start is instead the outer placement's right
+                // edge. Rebase the complete source caption to that edge once
+                // before the enclosing multicolumn formatter performs its
+                // own source-to-destination replay.
+                // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+                let table_source_rebase = match FlowAxes::for_style(table_style).block_start_side()
+                {
+                    PhysicalSide::Right => {
+                        let source_border_box = self
+                            .last_block_layout_outcome
+                            .static_border_box
+                            .expect("vertical caption layout must retain its source border box");
+                        let x = containing_block
+                            .outer_fragmentainer()
+                            .map(|placement| {
+                                let destination_block_end = if side == CaptionSide::Top {
+                                    placement.destination_rect().x()
+                                        + placement.destination_rect().width()
+                                } else {
+                                    containing_block.wrapper_table_x().points()
+                                };
+                                destination_block_end
+                                    - (source_border_box.origin.x + source_border_box.size.width)
+                            })
+                            .unwrap_or(0.0);
+                        PaintTranslation::new(x, 0.0)
+                    }
+                    PhysicalSide::Left => PaintTranslation::identity(),
+                    PhysicalSide::Top | PhysicalSide::Bottom => {
+                        unreachable!("vertical table wrappers have a horizontal logical block axis")
+                    }
+                };
+                let translation = PaintTranslation::new(
+                    inline_translation.x + table_source_rebase.x,
+                    inline_translation.y + table_source_rebase.y,
+                );
+                if translation != PaintTranslation::identity() {
+                    let source = self
+                        .current_page
+                        .take_paint_fragment_since(caption_paint_checkpoint.clone());
+                    self.current_page
+                        .append_paint_fragment_owned(source, translation);
+                }
+                // The outer multicolumn formatter keeps this as one source
+                // fragment, but the following wrapper sibling still starts
+                // after the caption in the table root's continuous block
+                // coordinate system.
+                vertical_block_progress = TableGridLength::new(
+                    vertical_block_progress.get()
+                        + self
+                            .last_block_layout_outcome
+                            .physical_border_box_inline_span
+                            .points()
+                            .max(0.0),
+                );
             }
             self.pop_float_context();
             // The generic caption entry temporarily owns its containing
@@ -509,19 +636,44 @@ impl<'a> LayoutBuilder<'a> {
             // `previous_*` here would make both start before the caption.
             // A vertical caption in a horizontal table remains generic
             // caption content, so it retains the existing restoration.
-            if !table_style.writing_mode.has_vertical_lines() || !vertical_caption {
+            if !table_style.writing_mode.has_vertical_lines()
+                || !vertical_caption
+                || !caption_uses_page_fragmentation
+            {
                 self.content_left = previous_left;
                 self.content_right = previous_right;
             }
         }
         let wrapper_translation = final_fragmentainer_left - opening_content_left;
         let final_wrapper_table_x = if table_style.writing_mode.has_vertical_lines() {
-            // A vertical caption's local block slices may consume temporary
-            // parent tracks, but those tracks are not the table grid's local
-            // inline coordinate. The enclosing multicolumn formatter owns
-            // their final physical replay; leaking `content_left` here moves
-            // the grid away from its immutable source frame.
-            containing_block.wrapper_table_x()
+            // The grid is the next wrapper-flow sibling. It therefore begins
+            // in the caption's committed destination track, not at the
+            // wrapper's opening source coordinate. The enclosing multicolumn
+            // replay subsequently projects that selected temporary track
+            // once; retaining the opening X here restarts the grid in the
+            // columns already consumed by the caption.
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            // <https://drafts.csswg.org/css-tables-3/#table-root>
+            let progress = vertical_block_progress.get();
+            // `wrapper_table_x` is the grid's established physical source
+            // origin.  A caption can select a later *outer* fragmentainer,
+            // whose displacement is the delta from the opening parent
+            // content edge; it must not replace the source origin itself.
+            // Replacing it made every unfragmented vertical table start at
+            // the parent edge and dropped the table border-spacing/padding
+            // inset before cell layout.
+            // <https://www.w3.org/TR/css-writing-modes-4/#block-flow>
+            // <https://drafts.csswg.org/css-tables-3/#table-root>
+            let destination_wrapper_x =
+                containing_block.wrapper_table_x().points() + wrapper_translation;
+            let x = match FlowAxes::for_style(table_style).block_start_side() {
+                PhysicalSide::Left => destination_wrapper_x + progress,
+                PhysicalSide::Right => destination_wrapper_x - progress,
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    unreachable!("a vertical table wrapper has a horizontal block axis")
+                }
+            };
+            PageInlinePosition::new(x)
         } else {
             PageInlinePosition::new(
                 containing_block.wrapper_table_x().points() + wrapper_translation,
@@ -535,12 +687,32 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
         let final_destination = if table_style.writing_mode.has_vertical_lines() {
             post_caption_destination.unwrap_or_else(|| {
-                self.table_fragmentainer_placement(
+                let destination = self.table_fragmentainer_placement(
                     table_style,
                     grid_origin.x(),
                     final_wrapper_table_x,
                     grid_origin.top_y(),
-                )
+                );
+                // Generic caption layout is intentionally kept on one
+                // source canvas in an outer multicolumn context. Its next
+                // table sibling must nevertheless carry the ordinal reached
+                // by that caption's complete logical block span; selecting
+                // `pages.len()` here only observes the scratch page used to
+                // measure the caption and restarts the grid in an earlier
+                // outer column.
+                // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+                self.fragmentainer_override
+                    .filter(|override_| override_.kind == FragmentainerKind::Column)
+                    .map(|override_| {
+                        let current = override_.placement_for_fragmentainer(self.pages.len());
+                        let placement = override_.sequence.placement_for_logical_block_position(
+                            current.logical_block_start() + vertical_block_progress.get(),
+                        );
+                        destination.select_outer_fragmentainer(
+                            TableOuterFragmentainerPlacement::from_outer(placement),
+                        )
+                    })
+                    .unwrap_or(destination)
             })
         } else {
             self.table_fragmentainer_placement(
@@ -561,7 +733,7 @@ impl<'a> LayoutBuilder<'a> {
         )
     }
 
-    /// Consume a vertical table-caption's logical block extent through the
+    /// Consume a table-caption's logical block extent through the
     /// table wrapper's active fragmentainer sequence.
     ///
     /// This is deliberately table-local: normal block layout owns caption
@@ -571,24 +743,20 @@ impl<'a> LayoutBuilder<'a> {
     /// as table rows so its anonymous-column page is replayed in source order.
     /// <https://www.w3.org/TR/css-break-3/#possible-breaks>
     /// <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
-    fn consume_vertical_table_caption_block_size(
+    fn consume_table_caption_block_size(
         &mut self,
         axes: FlowAxes,
         block_size: LayoutLength,
         source_inline_extent: f32,
         table_style: &ComputedStyle,
         containing_block: TableCaptionContainingBlock,
-    ) -> Option<VerticalTableCaptionConsumption> {
+    ) -> Option<TableCaptionConsumption> {
         let mut remaining = block_size.points().max(0.0);
         if remaining <= 0.01 {
             return None;
         }
 
         let block_start_side = axes.block_start_side();
-        debug_assert!(matches!(
-            block_start_side,
-            PhysicalSide::Left | PhysicalSide::Right
-        ));
         let initial_context = self.current_page_context;
         let inline_start_inset = self.content_left - initial_context.left();
         let inline_end_inset = initial_context.right() - self.content_right;
@@ -596,7 +764,14 @@ impl<'a> LayoutBuilder<'a> {
         let mut paint_slices = Vec::new();
         loop {
             let context = self.current_page_context;
-            let available = (self.content_right - self.content_left).max(0.0);
+            let available = match block_start_side {
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    (self.cursor_y - self.page_bottom()).max(0.0)
+                }
+                PhysicalSide::Left | PhysicalSide::Right => {
+                    (self.content_right - self.content_left).max(0.0)
+                }
+            };
             if available <= 0.01 {
                 break;
             }
@@ -609,7 +784,7 @@ impl<'a> LayoutBuilder<'a> {
                     table_style,
                     containing_block.wrapper_table_x().points(),
                     containing_block.wrapper_table_x(),
-                    context.top(),
+                    self.cursor_y,
                 ),
                 destination_context: context,
                 // This is a selected temporary parent fragment, not the
@@ -633,7 +808,7 @@ impl<'a> LayoutBuilder<'a> {
                 PhysicalSide::Right => {
                     self.content_right = (self.content_right - used).max(self.content_left);
                 }
-                PhysicalSide::Top | PhysicalSide::Bottom => unreachable!(),
+                PhysicalSide::Top | PhysicalSide::Bottom => self.cursor_y -= used,
             }
             if remaining <= 0.01 {
                 break;
@@ -642,12 +817,20 @@ impl<'a> LayoutBuilder<'a> {
                 self.active_fragmentainer_kind(),
                 FragmentainerAdvance::Unforced,
             )?;
-            self.content_left = self.current_page_context.left() + inline_start_inset;
-            self.content_right =
-                (self.current_page_context.right() - inline_end_inset).max(self.content_left);
+            if matches!(block_start_side, PhysicalSide::Left | PhysicalSide::Right) {
+                self.content_left = self.current_page_context.left() + inline_start_inset;
+                self.content_right =
+                    (self.current_page_context.right() - inline_end_inset).max(self.content_left);
+            }
         }
-        let ends_at_fragmentainer_block_end =
-            (self.content_right - self.content_left).abs() <= 0.01;
+        let ends_at_fragmentainer_block_end = match block_start_side {
+            PhysicalSide::Top | PhysicalSide::Bottom => {
+                (self.cursor_y - self.page_bottom()).abs() <= 0.01
+            }
+            PhysicalSide::Left | PhysicalSide::Right => {
+                (self.content_right - self.content_left).abs() <= 0.01
+            }
+        };
         // Capture this before the caller restores any temporary generic
         // caption bounds.  The grid is the next table-wrapper sibling and
         // must inherit this precise remaining logical block capacity.
@@ -657,7 +840,7 @@ impl<'a> LayoutBuilder<'a> {
             containing_block.wrapper_table_x(),
             self.current_page_context.top(),
         );
-        Some(VerticalTableCaptionConsumption {
+        Some(TableCaptionConsumption {
             post_caption_destination,
             ends_at_fragmentainer_block_end,
             paint_slices,
@@ -669,7 +852,7 @@ impl<'a> LayoutBuilder<'a> {
     /// The parent multicolumn formatter receives the completed fragments as
     /// ordinary parent paint and therefore applies its own projection once.
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-    fn project_vertical_table_caption_paint(
+    fn project_table_caption_paint(
         &self,
         source: PaintFragment,
         slices: &[TableCaptionPaintSlice],

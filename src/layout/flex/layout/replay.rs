@@ -311,9 +311,12 @@ impl<'a> LayoutBuilder<'a> {
             };
             self.fragmentainer_override = Some(FragmentainerOverride {
                 kind: FragmentainerKind::Page,
-                initial_context: replay_page_context,
-                initial_fragmentainer_count: 1,
-                context: continuation_context,
+                sequence: FragmentainerSequence::new(
+                    FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+                    replay_page_context,
+                    1,
+                    continuation_context,
+                ),
                 relax_widows_orphans: false,
             });
         }

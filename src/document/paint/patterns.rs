@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use super::geometry::{PaintPoint, PaintRect, PaintSize, PaintTransform, PaintTranslation};
 use super::images::{InlineRasterImage, RasterSampling, RenderedImageSource};
-use super::paths::{RenderedGradient, RenderedPath, RenderedPathClip};
+use super::paths::{RenderedGradient, RenderedPath, RenderedPathClip, RenderedPathClipPath};
 use crate::image_store::ImageId;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -116,6 +116,18 @@ impl RenderedImagePattern {
     /// <https://www.w3.org/TR/css-backgrounds-3/#background-clip>.
     pub(crate) fn with_clip(mut self, clip: RenderedPathClip) -> Self {
         self.clip = Some(clip);
+        self
+    }
+
+    pub(crate) fn with_intersected_clip(mut self, clip: RenderedPathClip) -> Self {
+        if let Some(existing) = &mut self.clip {
+            existing
+                .additional_clips
+                .push(RenderedPathClipPath::new(clip.commands, clip.fill_rule));
+            existing.additional_clips.extend(clip.additional_clips);
+        } else {
+            self.clip = Some(clip);
+        }
         self
     }
 
@@ -291,6 +303,23 @@ impl RenderedGradientPattern {
         self.clip.as_ref()
     }
 
+    /// Intersect this pattern's existing CSS clip with a destination
+    /// fragmentainer rectangle without changing its source-resolved tiling
+    /// phase. Fragmentation uses this after a source-to-destination transform
+    /// has been selected: the transform belongs to the positioning area,
+    /// while the added clip remains in destination paint coordinates.
+    pub(crate) fn with_intersected_clip(mut self, clip: RenderedPathClip) -> Self {
+        if let Some(existing) = &mut self.clip {
+            existing
+                .additional_clips
+                .push(RenderedPathClipPath::new(clip.commands, clip.fill_rule));
+            existing.additional_clips.extend(clip.additional_clips);
+        } else {
+            self.clip = Some(clip);
+        }
+        self
+    }
+
     pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
         if self.transform != PaintTransform::identity() {
             // Preserve source-local pattern geometry while composing the
@@ -362,6 +391,18 @@ impl RenderedSvgPattern {
 
     pub(crate) fn clip(&self) -> Option<&RenderedPathClip> {
         self.clip.as_ref()
+    }
+
+    pub(crate) fn with_intersected_clip(mut self, clip: RenderedPathClip) -> Self {
+        if let Some(existing) = &mut self.clip {
+            existing
+                .additional_clips
+                .push(RenderedPathClipPath::new(clip.commands, clip.fill_rule));
+            existing.additional_clips.extend(clip.additional_clips);
+        } else {
+            self.clip = Some(clip);
+        }
+        self
     }
 
     pub(crate) fn transform(&self) -> PaintTransform {

@@ -1,4 +1,7 @@
 use super::*;
+use crate::layout::text_paint::{
+    TextDecorationInlineAxis, TextDecorationLogicalInlineRange, TextDecorationPositionedInkBox,
+};
 
 impl<'a> LayoutBuilder<'a> {
     /// Paint a prepared inline line without reshaping text.
@@ -133,7 +136,19 @@ impl<'a> LayoutBuilder<'a> {
                 &mut glyph_runs,
                 &group.shaped,
                 &group.style,
+                group.line_block_size,
             );
+            let positioned_ink_boxes = self
+                .font_system
+                .glyph_ink_boxes_for_runs(&glyph_runs, reference.y)
+                .into_iter()
+                .map(|ink| TextDecorationPositionedInkBox {
+                    x_min: reference.x + ink.x_min,
+                    x_max: reference.x + ink.x_max,
+                    y_min: ink.y_min,
+                    y_max: ink.y_max,
+                })
+                .collect::<Vec<_>>();
             for provenance in &group.decoration_provenance {
                 for receiver in &provenance.receivers {
                     if receiver.style.visibility != Visibility::Visible {
@@ -189,6 +204,30 @@ impl<'a> LayoutBuilder<'a> {
                         if !participates {
                             continue;
                         }
+                        let origin_fragment = line
+                            .decoration_origin_fragments
+                            .iter()
+                            .find(|fragment| {
+                                Rc::ptr_eq(&fragment.origin_style, &decoration.origin_style)
+                            })
+                            .cloned()
+                            // Direct record preparation is also used by a
+                            // few isolated layout tests. Those records do
+                            // not have an enclosing line sequence from
+                            // which to derive fragment geometry.
+                            .unwrap_or_else(|| TextDecorationOriginFragmentGeometry {
+                                origin_style: Rc::clone(&decoration.origin_style),
+                                complete_inline_range: TextDecorationLogicalInlineRange::from_edges(
+                                    layout_pt(0.0),
+                                    layout_pt(coverage.span.length()),
+                                ),
+                                fragment_inline_range: TextDecorationLogicalInlineRange::from_edges(
+                                    layout_pt(0.0),
+                                    layout_pt(coverage.span.length()),
+                                ),
+                                is_first_fragment: true,
+                                is_last_fragment: true,
+                            });
                         if let Some(existing) = geometries.iter_mut().find(|existing| {
                             Rc::ptr_eq(&existing.layer.origin_style, &decoration.origin_style)
                         }) {
@@ -219,6 +258,9 @@ impl<'a> LayoutBuilder<'a> {
                                 .glyph_sequence
                                 .glyphs
                                 .extend(positioned_glyphs.iter().cloned());
+                            existing
+                                .positioned_ink_boxes
+                                .extend(positioned_ink_boxes.iter().copied());
                             match receiver.style.writing_mode {
                                 WritingMode::HorizontalTb => {
                                     existing.line_reference.y =
@@ -241,7 +283,7 @@ impl<'a> LayoutBuilder<'a> {
                                 &receiver.style,
                                 metrics,
                             ),
-                            origin_inline_axis: VerticalInlineAxis::for_style(
+                            origin_inline_axis: TextDecorationInlineAxis::for_style(
                                 decoration.origin_style.as_ref(),
                             ),
                             selected_inline_span: Some(coverage.span),
@@ -249,27 +291,9 @@ impl<'a> LayoutBuilder<'a> {
                             glyph_sequence: TextDecorationLineGlyphSequence {
                                 glyphs: positioned_glyphs.clone(),
                             },
+                            positioned_ink_boxes: positioned_ink_boxes.clone(),
                             line_reference: reference,
-                            origin_fragment: line
-                                .decoration_origin_fragments
-                                .iter()
-                                .find(|fragment| {
-                                    Rc::ptr_eq(&fragment.origin_style, &decoration.origin_style)
-                                })
-                                .cloned()
-                                // Direct record preparation is also used by a
-                                // few isolated layout tests. Those records do
-                                // not have an enclosing line sequence from
-                                // which to derive fragment geometry.
-                                .unwrap_or_else(|| TextDecorationOriginFragmentGeometry {
-                                    origin_style: Rc::clone(&decoration.origin_style),
-                                    total_inline_extent: layout_pt(coverage.span.length()),
-                                    fragment_inline_extent: layout_pt(coverage.span.length()),
-                                    preceding_inline_extent: layout_pt(0.0),
-                                    following_inline_extent: layout_pt(0.0),
-                                    is_first_fragment: true,
-                                    is_last_fragment: true,
-                                }),
+                            origin_fragment,
                         });
                     }
                 }

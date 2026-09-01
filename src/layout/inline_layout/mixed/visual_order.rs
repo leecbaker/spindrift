@@ -1753,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn tracking_averages_adjacent_used_values_and_is_leading_only() {
+    fn tracking_uses_the_preceding_unit_and_is_leading_only() {
         let root_style = tracked_style(11.0);
         let child_style = tracked_style(3.0);
         let root = InlineTrackingScope::root(&root_style);
@@ -1766,14 +1766,14 @@ mod tests {
         apply_visual_tracking_boundaries(&mut items);
 
         assert_eq!(items[0].advance.boundary_before().points(), 0.0);
-        assert_eq!(items[1].advance.boundary_before().points(), 7.0);
+        assert_eq!(items[1].advance.boundary_before().points(), 3.0);
         assert_eq!(items[0].base_advance().points(), 10.0);
         assert_eq!(items[1].base_advance().points(), 10.0);
-        assert_eq!(items[1].used_advance().points(), 17.0);
+        assert_eq!(items[1].used_advance().points(), 13.0);
     }
 
     #[test]
-    fn zero_and_nonzero_tracking_contribute_half_at_a_style_boundary() {
+    fn following_tracking_does_not_affect_a_preceding_boundary() {
         let zero_style = tracked_style(0.0);
         let tracked_style = tracked_style(12.0);
         let zero_scope = InlineTrackingScope::root(&zero_style);
@@ -1785,8 +1785,8 @@ mod tests {
 
         apply_visual_tracking_boundaries(&mut items);
 
-        assert_eq!(items[1].advance.boundary_before().points(), 6.0);
-        assert_eq!(items[1].used_advance().points(), 16.0);
+        assert_eq!(items[1].advance.boundary_before().points(), 0.0);
+        assert_eq!(items[1].used_advance().points(), 10.0);
     }
 
     #[test]
@@ -1819,8 +1819,8 @@ mod tests {
         advance.replace_base_points(15.0);
 
         assert_eq!(advance.base().points(), 15.0);
-        assert_eq!(advance.boundary_before().points(), 10.0);
-        assert_eq!(advance.used().points(), 25.0);
+        assert_eq!(advance.boundary_before().points(), 8.0);
+        assert_eq!(advance.used().points(), 23.0);
     }
 
     #[test]
@@ -1953,7 +1953,7 @@ mod tests {
         let style = tracked_style(11.0);
         let scope = InlineTrackingScope::root(&style);
         let transparent = InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder,
+            InlineAtomContent::StaticPositionPlaceholder(InlineStaticPositionMarkerId::Block),
             style.clone(),
             None,
             InlineSize::new(0.0, 0.0),

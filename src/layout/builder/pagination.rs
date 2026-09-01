@@ -44,9 +44,13 @@ impl<'a> LayoutBuilder<'a> {
             self.flush_current_page_footnotes();
         }
         let next_fragmentainer_index = self.pages.len() + 1;
-        let next_override_context = self
+        let next_override_placement = self
             .fragmentainer_override
-            .map(|override_| override_.context_for_fragmentainer(next_fragmentainer_index));
+            .map(|override_| override_.placement_for_fragmentainer(next_fragmentainer_index));
+        let next_override_context = next_override_placement.map(|placement| {
+            debug_assert_eq!(placement.ordinal(), next_fragmentainer_index);
+            placement.scratch_context()
+        });
         let named_page_transition = self.current_page_name.as_deref() != destination_page_name;
         let fragment_replay_offsets = (!named_page_transition)
             .then(|| {

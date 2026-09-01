@@ -12,7 +12,11 @@ pub(in crate::layout) struct DomFlowTraversalState {
     pub(in crate::layout) seen_flow_child: FirstInFlowChildState,
     pub(in crate::layout) trim_block_start_adjoining_margins: bool,
     pub(in crate::layout) first_formatted_line: FirstFormattedLineState,
-    pub(in crate::layout) out_of_flow_static_source: Option<StaticPositionRectangle>,
+    /// Immutable normal-flow source retained for the next direct positioned
+    /// child.  This is source geometry, not a cursor snapshot: recursive
+    /// positioned layout may freely move its private cursor without changing
+    /// a later sibling's hypothetical rectangle.
+    pub(in crate::layout) out_of_flow_static_capture: Option<StaticPositionCapture>,
     pub(in crate::layout) element_index: usize,
     pub(in crate::layout) float_run: FloatRunState,
     pub(in crate::layout) avoid_run_candidate: Option<AvoidBreakRunCandidate>,
@@ -30,7 +34,7 @@ pub(in crate::layout) struct DomFlowTraversalState {
 impl DomFlowTraversalState {
     pub(in crate::layout) fn new(
         first_formatted_line: FirstFormattedLineState,
-        out_of_flow_static_source: Option<StaticPositionRectangle>,
+        out_of_flow_static_capture: Option<StaticPositionCapture>,
         float_run: FloatRunState,
         trim_block_start_adjoining_margins: bool,
     ) -> Self {
@@ -43,7 +47,7 @@ impl DomFlowTraversalState {
             seen_flow_child: FirstInFlowChildState::NotSeen,
             trim_block_start_adjoining_margins,
             first_formatted_line,
-            out_of_flow_static_source,
+            out_of_flow_static_capture,
             element_index: 0,
             float_run,
             avoid_run_candidate: None,

@@ -1071,12 +1071,13 @@ fn grid_static_placement_is_after_explicit_line(
         return false;
     };
     let line_names = if grid_track_list_has_auto_repeat(tracks) {
-        let Some(Some(auto_repeat_count)) =
-            simple_fixed_auto_repeat_count(components, gap, container_size)
+        let Some(SimpleAutoRepeatCount::Count(auto_repeat_count)) =
+            simple_fixed_auto_repeat_count(components, gap, content_box_pt(container_size))
         else {
             return false;
         };
-        let Some(line_names) = auto_repeat_explicit_line_names(tracks, auto_repeat_count) else {
+        let Some(line_names) = auto_repeat_explicit_line_names(tracks, auto_repeat_count.get())
+        else {
             return false;
         };
         line_names
@@ -1166,11 +1167,15 @@ fn grid_layout_line_static_offset_with_inferred_gaps(
         return None;
     };
     if grid_track_list_has_auto_repeat(tracks) {
-        let auto_repeat_count = simple_fixed_auto_repeat_count(
+        let SimpleAutoRepeatCount::Count(auto_repeat_count) = simple_fixed_auto_repeat_count(
             grid_track_list_components(tracks)?,
             gap.clone(),
-            options.container_size,
-        )??;
+            content_box_pt(options.container_size),
+        )?
+        else {
+            return None;
+        };
+        let auto_repeat_count = auto_repeat_count.get();
         let line_names = auto_repeat_explicit_line_names(tracks, auto_repeat_count)?;
         let auto_fill_line_offsets;
         let line_offsets = if grid_track_list_has_auto_fit(tracks) {
@@ -1348,10 +1353,9 @@ fn collect_auto_repeat_track_sizes(
     for component in components {
         match component {
             css::GridTrackListComponent::Track(_, size) => {
-                sizes.push(definite_auto_repeat_track_size(
-                    size.clone(),
-                    container_size,
-                )?);
+                sizes.push(
+                    definite_auto_repeat_track_size(size, content_box_pt(container_size))?.points(),
+                );
             }
             css::GridTrackListComponent::Repeat(_, repeat) => {
                 let count = match repeat.count {

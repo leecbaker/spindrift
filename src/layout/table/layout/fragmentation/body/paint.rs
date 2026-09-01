@@ -1,7 +1,8 @@
 //! Row-piece layout, row-group paint, and cell-content planning.
 
 use crate::css::{
-    ComputedStyle, EmptyCells, PercentageBasis, Position, Stylesheets, Visibility, layout_pt,
+    ComputedStyle, EmptyCells, PercentageBasis, Position, Stylesheets, Visibility, WritingMode,
+    layout_pt,
 };
 use crate::document::paint::display_list::PaintBand;
 use crate::document::paint::effects::PaintEffects;
@@ -83,6 +84,28 @@ fn table_part_relative_position_offset(
 }
 
 impl<'a> LayoutBuilder<'a> {
+    /// Whether a row has a cell descendant that can provide an internal
+    /// fragmentation opportunity.
+    ///
+    /// A fixed-height empty cell establishes a row track but no class-B/C
+    /// break point. Its row must therefore remain an overflowing whole-row
+    /// fragment instead of entering the oversized-row slice scheduler.
+    /// <https://www.w3.org/TR/css-break-3/#possible-breaks>
+    /// <https://drafts.csswg.org/css-tables-3/#table-fragmentation>
+    pub(in crate::layout::table) fn table_row_has_fragmentable_cell_content(
+        &self,
+        row: &TableRow<'_>,
+        grid: &TableGrid,
+        row_index: usize,
+    ) -> bool {
+        grid.rows[row_index].iter().any(|placement| {
+            row.cells[placement.cell]
+                .children
+                .as_deref()
+                .is_some_and(|children| !children.is_empty())
+        })
+    }
+
     /// Restrict an oversized-row slice to a shared table-cell child boundary.
     ///
     /// Table rows are fragmentation containers, but their cells are block
@@ -123,6 +146,7 @@ impl<'a> LayoutBuilder<'a> {
             let mut restricted_end = piece_end;
             let mut last_shared_boundary = piece_offset;
             let mut source_child_end = piece_offset;
+            let mut has_fragmentable_cell_child = false;
             for placement in &grid.rows[row_index] {
                 let cell = &row.cells[placement.cell];
                 // A cell without in-flow source children cannot constrain a
@@ -196,6 +220,7 @@ impl<'a> LayoutBuilder<'a> {
                         if child_height <= EPSILON {
                             continue;
                         }
+                        has_fragmentable_cell_child = true;
                         let child_block_end = child_block_start + child_height;
                         if child_block_start > piece_offset + EPSILON
                             && child_block_start < piece_end - EPSILON
@@ -228,6 +253,17 @@ impl<'a> LayoutBuilder<'a> {
                 {
                     restricted_end = restricted_end.min(last_shared_boundary);
                 }
+            }
+            // A used row height can come entirely from a fixed-height empty
+            // cell. There is then no class-B/C break opportunity inside the
+            // row: the row is a monolithic overflow subject rather than a
+            // license to invent a raw-height slice at every fragmentainer
+            // boundary. Returning zero lets the caller retain the whole row
+            // when a fresh fragmentainer offers no additional capacity.
+            // <https://www.w3.org/TR/css-break-3/#possible-breaks>
+            // <https://drafts.csswg.org/css-tables-3/#table-fragmentation>
+            if !has_fragmentable_cell_child {
+                return 0.0;
             }
             if restricted_end >= piece_end - EPSILON {
                 return (piece_end - piece_offset).max(0.0);
@@ -634,10 +670,28 @@ impl<'a> LayoutBuilder<'a> {
                                 && row.fragment_mode == TableRowFragmentMode::Whole
                         });
                 let projected_border_box = fragment_state.grid_viewport.as_ref().map(|viewport| {
-                    let grid = viewport
-                        .destination_frame()
-                        .wrapper_grid()
-                        .full_page_top_rect();
+                    // The enclosing multicolumn formatter owns the final
+                    // source-to-destination replay of an outer-fragmented
+                    // table. Keep the root border in the table source frame
+                    // here, matching the sliced background viewport, so the
+                    // outer placement applies that translation once.
+                    // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+                    // <https://www.w3.org/TR/css-break-3/#break-decoration>
+                    let grid = if matches!(
+                        table_style.writing_mode,
+                        WritingMode::VerticalRl | WritingMode::SidewaysRl
+                    ) && viewport
+                        .fragmentainer_placement()
+                        .outer_fragmentainer()
+                        .is_some()
+                    {
+                        viewport.source_placement().full_page_top_rect()
+                    } else {
+                        viewport
+                            .destination_frame()
+                            .wrapper_grid()
+                            .full_page_top_rect()
+                    };
                     let padding = PageTopRect::new(
                         grid.x() - table_width.padding.left,
                         grid.top_y() + table_width.padding.top,
@@ -880,6 +934,24 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             fragment
         };
+        // A monolithic vertical row can overflow its table-local block axis,
+        // but it still belongs to exactly one outer multicolumn
+        // fragmentainer. Clip the complete structural table fragment to that
+        // selected outer placement rather than synthesizing row breaks that
+        // the empty cell has no opportunity to make.
+        // <https://www.w3.org/TR/css-break-3/#box-splitting>
+        let fragment = if table_style.writing_mode.has_vertical_lines()
+            && fragment_state
+                .plan
+                .body_rows
+                .iter()
+                .all(|row| row.fragment_mode == TableRowFragmentMode::Whole)
+            && let Some(outer) = fragment_state.plan.placement.outer_fragmentainer()
+        {
+            fragment.with_effect_scoped_to_rect_all_bands(outer.destination_clip())
+        } else {
+            fragment
+        };
         // The table's outer display role selects its in-flow block or inline
         // band. Relative and positioned tables are promoted by the stacking
         // policy above; the collapsed-border phase remains a separate global
@@ -989,6 +1061,17 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             false
         };
+        if row_fragment_mode.is_decoration_only() {
+            // The wrapper exposes this source interval to the outer
+            // fragmentainer sequence, but the row has no descendant break
+            // opportunity. Its grid/cell content therefore remains
+            // monolithic; `commit_table_body_fragment_boundary` consumes the
+            // recorded source slice to paint the table-root decoration only.
+            //
+            // <https://www.w3.org/TR/css-break-3/#box-splitting>
+            self.pop_overflow_clip(row_piece_clip_active);
+            return;
+        }
         // CSS Containment does not apply to table row tracks or row groups:
         // they have no containment principal box. Their positioned and
         // transformed principal boxes still establish containing blocks for

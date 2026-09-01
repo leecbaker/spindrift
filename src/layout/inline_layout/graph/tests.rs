@@ -1431,7 +1431,7 @@ mod graph_tests {
     fn first_letter_stream_rejects_text_after_an_atomic_inline() {
         let style = ComputedStyle::initial();
         let atom = InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder,
+            InlineAtomContent::StaticPositionPlaceholder(InlineStaticPositionMarkerId::Block),
             style.clone(),
             None,
             InlineSize::new(0.0, 0.0),

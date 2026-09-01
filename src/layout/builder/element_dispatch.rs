@@ -701,6 +701,7 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 table_fragment,
                 style,
+                InlineStaticPositionMarkerId::for_element(element),
                 None,
                 &[],
             );

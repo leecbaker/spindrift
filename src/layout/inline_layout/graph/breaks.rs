@@ -739,7 +739,7 @@ pub(in crate::layout) fn inline_line_item_is_css_atomic(item: &InlineLineItem) -
                 atom.content(),
                 InlineAtomContent::InlineEdge(_)
                     | InlineAtomContent::Leader(_)
-                    | InlineAtomContent::StaticPositionPlaceholder
+                    | InlineAtomContent::StaticPositionPlaceholder(_)
             )
     )
 }
@@ -955,7 +955,7 @@ fn inline_line_item_is_transparent_text_edge(atom: &InlineAtom) -> bool {
         atom.content(),
         InlineAtomContent::InlineEdge(
             InlineEdgeRole::BoxEdge(_) | InlineEdgeRole::TextAutospace(_)
-        ) | InlineAtomContent::StaticPositionPlaceholder
+        ) | InlineAtomContent::StaticPositionPlaceholder(_)
     )
 }
 
@@ -2039,7 +2039,7 @@ mod tests {
         let mut style = ComputedStyle::initial();
         style.white_space = WhiteSpace::NoWrap;
         let placeholder = InlineLineItem::Atom(InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder,
+            InlineAtomContent::StaticPositionPlaceholder(InlineStaticPositionMarkerId::Block),
             style.clone(),
             None,
             InlineSize::new(0.0, style.line_height),

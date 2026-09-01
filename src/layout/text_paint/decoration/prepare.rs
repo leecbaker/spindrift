@@ -218,33 +218,11 @@ pub(in crate::layout) fn text_decoration_inline_span(
     span: TextInlineSpan,
     inset_start: f32,
     inset_end: f32,
-    inset_style: &ComputedStyle,
-    inset_inline_axis: Option<VerticalInlineAxis>,
+    _inset_style: &ComputedStyle,
+    inset_inline_axis: TextDecorationInlineAxis,
 ) -> Option<TextInlineSpan> {
-    let length = (span.length() - inset_start - inset_end).max(0.0);
-    if length <= 0.0 {
-        return None;
-    }
-    match axis {
-        TextDecorationStrokeAxis::Horizontal => {
-            let (start, end) = match inset_style.direction {
-                Direction::Ltr => (span.start + inset_start, span.end - inset_end),
-                Direction::Rtl => (span.start + inset_end, span.end - inset_start),
-            };
-            Some(TextInlineSpan::new(start, end))
-        }
-        TextDecorationStrokeAxis::Vertical => {
-            let inline_axis = inset_inline_axis
-                .or_else(|| VerticalInlineAxis::for_style(inset_style))
-                .expect("vertical decoration strokes require a vertical inline axis");
-            let (start, end) = if inline_axis.advance_sign() < 0.0 {
-                (span.start + inset_end, span.end - inset_start)
-            } else {
-                (span.start + inset_start, span.end - inset_end)
-            };
-            Some(TextInlineSpan::new(start, end))
-        }
-    }
+    debug_assert_eq!(axis, inset_inline_axis.stroke_axis());
+    inset_inline_axis.inset_span(span, inset_start, inset_end)
 }
 
 #[allow(clippy::too_many_arguments)]

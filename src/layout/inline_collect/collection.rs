@@ -5,7 +5,7 @@ use super::generated_content::{
 };
 use super::positioned::{
     DeferredInlinePositionedDescendant, DeferredInlineStaticPositionedDescendant,
-    DeferredStaticPositionedContent,
+    DeferredStaticPositionSource, DeferredStaticPositionedContent,
 };
 use super::ruby::{
     inline_item_has_typographic_content, ruby_has_out_of_flow_descendant, ruby_out_of_flow_overlay,
@@ -417,6 +417,7 @@ impl<'a> LayoutBuilder<'a> {
                         {
                             deferred.push(DeferredInlinePositionedDescendant {
                                 element: child_element.clone(),
+                                signature: child_signature.clone(),
                                 style: child_style,
                                 static_position_container_style: style.clone(),
                                 containing_block_source: containing_block_source.into_owned(),
@@ -435,8 +436,24 @@ impl<'a> LayoutBuilder<'a> {
                             && let Some(deferred) =
                                 deferred_static_positioned_descendants.as_deref_mut()
                         {
+                            let static_position_source =
+                                if child_style.abspos_static_source.is_inline_level()
+                                    || child_style.display.is_inline_level()
+                                {
+                                    let marker =
+                                        InlineStaticPositionMarkerId::for_element(child_element);
+                                    DeferredStaticPositionSource::InlineMarker {
+                                        marker,
+                                        fallback_source_order_index: output.len(),
+                                    }
+                                } else {
+                                    DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(
+                                        output.len(),
+                                    )
+                                };
                             deferred.push(DeferredInlineStaticPositionedDescendant {
                                 element: child_element.clone(),
+                                signature: child_signature.clone(),
                                 style: child_style,
                                 line_formatting_context_style: line_formatting_context_style
                                     .clone(),
@@ -449,7 +466,7 @@ impl<'a> LayoutBuilder<'a> {
                                     ),
                                 hypothetical_ancestor_offset: placement.visual_offset,
                                 content: DeferredStaticPositionedContent::Dom,
-                                static_position_index: output.len(),
+                                static_position_source,
                             });
                             continue;
                         }
@@ -806,7 +823,7 @@ impl<'a> LayoutBuilder<'a> {
             stack_profile_scope.set_source_index(child_index);
             #[cfg(not(all(feature = "stack-profile", target_os = "macos")))]
             let _ = child_index;
-            if let Some((element, _, style, child_boxes)) = child.element_parts()
+            if let Some((element, signature, style, child_boxes)) = child.element_parts()
                 && matches!(style.position, Position::Absolute | Position::Fixed)
             {
                 if positioned_descendant_has_explicit_inset(style)
@@ -815,6 +832,7 @@ impl<'a> LayoutBuilder<'a> {
                 {
                     deferred.push(DeferredInlinePositionedDescendant {
                         element: element.clone(),
+                        signature: signature.clone(),
                         style: style.clone(),
                         static_position_container_style: static_position_container_style.clone(),
                         containing_block_source: containing_block_source.into_owned(),
@@ -825,8 +843,20 @@ impl<'a> LayoutBuilder<'a> {
                     || style.display.is_atomic_inline())
                     && let Some(deferred) = deferred_static_positioned_descendants.as_deref_mut()
                 {
+                    let static_position_source = if style.abspos_static_source.is_inline_level()
+                        || style.display.is_inline_level()
+                    {
+                        let marker = InlineStaticPositionMarkerId::for_element(element);
+                        DeferredStaticPositionSource::InlineMarker {
+                            marker,
+                            fallback_source_order_index: output.len(),
+                        }
+                    } else {
+                        DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(output.len())
+                    };
                     deferred.push(DeferredInlineStaticPositionedDescendant {
                         element: element.clone(),
+                        signature: signature.clone(),
                         style: style.clone(),
                         line_formatting_context_style: block_style.clone(),
                         static_position_container_style: static_position_container_style.clone(),
@@ -836,7 +866,7 @@ impl<'a> LayoutBuilder<'a> {
                             .map(BorrowedInlinePositioningContainingBlockSource::into_owned),
                         hypothetical_ancestor_offset: visual_offset,
                         content: DeferredStaticPositionedContent::Frozen,
-                        static_position_index: output.len(),
+                        static_position_source,
                     });
                     continue;
                 }

@@ -113,6 +113,21 @@ pub(in crate::layout) struct TextDecorationLineGlyphSequence {
     pub(in crate::layout) glyphs: Vec<TextDecorationPositionedGlyph>,
 }
 
+/// A selected glyph's ink bounds in page-local paint coordinates.
+///
+/// Decoration origins can span multiple prepared text groups, whose rendered
+/// runs each use a different local origin. Normalizing the ink bounds while
+/// collecting the line makes `text-decoration-skip-ink` independent of those
+/// shaping boundaries.
+/// <https://www.w3.org/TR/css-text-decor-4/#text-decoration-skip-ink-property>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct TextDecorationPositionedInkBox {
+    pub(in crate::layout) x_min: f32,
+    pub(in crate::layout) x_max: f32,
+    pub(in crate::layout) y_min: f32,
+    pub(in crate::layout) y_max: f32,
+}
+
 /// The shared considered-text selection for one decoration origin and one
 /// prepared line fragment.
 ///
@@ -134,10 +149,9 @@ pub(in crate::layout) struct TextDecorationOriginLineGeometry {
     /// remain independent in the propagation model.
     pub(in crate::layout) layer: TextDecorationLayer,
     pub(in crate::layout) geometry: TextDecorationLineGeometry,
-    /// The origin's vertical logical-inline projection, when its line uses a
-    /// vertical physical inline axis. Endpoint insets belong to this
-    /// decorating box, not to an individual descendant receiver.
-    pub(in crate::layout) origin_inline_axis: Option<VerticalInlineAxis>,
+    /// The decorating origin's logical-inline projection. Endpoint insets
+    /// belong to this box, not to an individual descendant receiver.
+    pub(in crate::layout) origin_inline_axis: TextDecorationInlineAxis,
     /// Complete physical selected-line coverage across eligible contributors.
     pub(in crate::layout) selected_inline_span: Option<TextInlineSpan>,
     /// Receiver spans in inline paint order.  A span is contributed only by a
@@ -145,6 +159,8 @@ pub(in crate::layout) struct TextDecorationOriginLineGeometry {
     /// atomic-inline boundaries and `text-decoration-skip-self`.
     pub(in crate::layout) receiver_spans: Vec<TextInlineSpan>,
     pub(in crate::layout) glyph_sequence: TextDecorationLineGlyphSequence,
+    /// Page-local ink bounds for every contributing receiver on this line.
+    pub(in crate::layout) positioned_ink_boxes: Vec<TextDecorationPositionedInkBox>,
     /// The physical baseline/reference point shared by every selected span.
     pub(in crate::layout) line_reference: PaintPoint,
     /// The decorating box fragment that owns endpoint percentage resolution.
@@ -162,14 +178,46 @@ pub(in crate::layout) struct TextDecorationOriginLineGeometry {
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct TextDecorationOriginFragmentGeometry {
     pub(in crate::layout) origin_style: Rc<ComputedStyle>,
-    pub(in crate::layout) total_inline_extent: LayoutLength,
-    pub(in crate::layout) fragment_inline_extent: LayoutLength,
-    /// Inline extent in earlier fragments of this decorating box.
-    pub(in crate::layout) preceding_inline_extent: LayoutLength,
-    /// Inline extent in later fragments of this decorating box.
-    pub(in crate::layout) following_inline_extent: LayoutLength,
+    /// Logical-inline coverage of the complete decorating box.  This is
+    /// origin-owned geometry: receiver glyph ranges are deliberately absent.
+    pub(in crate::layout) complete_inline_range: TextDecorationLogicalInlineRange,
+    /// This generated decorating-box fragment's logical-inline coverage
+    /// within `complete_inline_range`.
+    pub(in crate::layout) fragment_inline_range: TextDecorationLogicalInlineRange,
     pub(in crate::layout) is_first_fragment: bool,
     pub(in crate::layout) is_last_fragment: bool,
+}
+
+/// One decorating box's logical-inline range, expressed relative to the
+/// start of its first generated fragment.
+///
+/// Decoration endpoints belong to this logical coordinate system.  Receiver
+/// text can be bidi-reordered or orthogonal, so physical paint spans must not
+/// be used as an endpoint percentage basis.
+/// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct TextDecorationLogicalInlineRange {
+    start: LayoutLength,
+    end: LayoutLength,
+}
+
+impl TextDecorationLogicalInlineRange {
+    pub(in crate::layout) fn from_edges(start: LayoutLength, end: LayoutLength) -> Self {
+        debug_assert!(end.points() + f32::EPSILON >= start.points());
+        Self { start, end }
+    }
+
+    pub(in crate::layout) fn start(self) -> LayoutLength {
+        self.start
+    }
+
+    pub(in crate::layout) fn end(self) -> LayoutLength {
+        self.end
+    }
+
+    pub(in crate::layout) fn extent(self) -> LayoutLength {
+        layout_pt((self.end.points() - self.start.points()).max(0.0))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,8 +282,8 @@ pub(in crate::layout) struct TextDecorationPreparationInput<'a> {
     /// The decorating origin supplies logical start/end semantics for
     /// `text-decoration-inset`.
     pub(in crate::layout) inset_style: &'a ComputedStyle,
-    /// The precomputed origin projection for vertical endpoint semantics.
-    pub(in crate::layout) inset_inline_axis: Option<VerticalInlineAxis>,
+    /// The decorating origin's precomputed logical endpoint projection.
+    pub(in crate::layout) inset_inline_axis: TextDecorationInlineAxis,
     pub(in crate::layout) decoration: TextDecoration,
     pub(in crate::layout) phase: TextDecorationPaintPhase,
     pub(in crate::layout) color: CssColor,

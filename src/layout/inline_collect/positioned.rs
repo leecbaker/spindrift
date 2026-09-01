@@ -1,12 +1,14 @@
 use super::collection::positioned_descendant_has_explicit_inset;
 use super::static_position::{HypotheticalBlockMarginBox, StaticHypotheticalBox};
 use super::*;
+use crate::layout::block::children::shared::PositionedAutoSizeChildParticipation;
 use crate::layout::inline_layout::InlineLineStackCursor;
 use crate::units::content_box_to_margin_box_length;
 
 #[derive(Clone)]
 pub(super) struct DeferredInlinePositionedDescendant {
     pub(super) element: Element,
+    pub(super) signature: ElementSignature,
     pub(super) style: ComputedStyle,
     /// The inline source whose hypothetical-flow geometry defines the
     /// static-position rectangle. This is distinct from the enclosing block
@@ -20,13 +22,18 @@ pub(super) struct DeferredInlinePositionedDescendant {
 /// complete line.  The record keeps the DOM/style boundary immutable while
 /// delaying only the geometry-dependent positioned layout.
 ///
-/// The marker index is a source-order boundary, rather than an atom pointer:
-/// line breaking may copy, split, or bidi-reorder the collected items before
-/// the hypothetical placeholder is measured.
+/// The marker is a source-owned boundary, rather than an atom pointer or
+/// source-order index: line breaking may copy, split, or bidi-reorder the
+/// collected items before the selected line is materialized.
 /// <https://drafts.csswg.org/css-position-3/#static-position>
 #[derive(Clone)]
 pub(super) struct DeferredInlineStaticPositionedDescendant {
     pub(super) element: Element,
+    /// Selector ancestry of the positioned source at collection time. The
+    /// deferred replay can run after that source scope has unwound, but its
+    /// descendants must still match child and descendant selectors against
+    /// this element while resolving automatic sizes and final layout.
+    pub(super) signature: ElementSignature,
     pub(super) style: ComputedStyle,
     /// The block formatting context that selected the hypothetical line.
     /// This is deliberately distinct from the lexical inline ancestor: the
@@ -49,7 +56,7 @@ pub(super) struct DeferredInlineStaticPositionedDescendant {
     /// affect the hypothetical box's final page position.
     pub(super) hypothetical_ancestor_offset: InlineVisualOffset,
     pub(super) content: DeferredStaticPositionedContent,
-    pub(super) static_position_index: usize,
+    pub(super) static_position_source: DeferredStaticPositionSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +64,20 @@ pub(super) struct DeferredInlineStaticPositionedDescendant {
 pub(super) enum DeferredStaticPositionedContent {
     Dom,
     Frozen,
+}
+
+/// The immutable normal-flow provenance for a deferred positioned source.
+///
+/// Inline sources use an element-stable marker that survives line processing.
+/// A block source remains on the older source-order path until its distinct
+/// block-in-inline split marker can be materialized by block layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::layout) enum DeferredStaticPositionSource {
+    InlineMarker {
+        marker: InlineStaticPositionMarkerId,
+        fallback_source_order_index: usize,
+    },
+    LegacyBlockSourceOrderIndex(usize),
 }
 
 /// The generated fragment that owns one source-order edge of a positioned
@@ -218,10 +239,20 @@ impl<'a> LayoutBuilder<'a> {
             BorrowedInlinePositioningContainingBlockSource<'_>,
         >,
         static_position_containing_block: Option<StaticPositionContainingBlock>,
-        static_position_index: Option<usize>,
+        static_position_source: Option<DeferredStaticPositionSource>,
         hypothetical_ancestor_offset: InlineVisualOffset,
         output: &[InlineItem],
     ) {
+        if self.positioned_auto_size_child_participation(style)
+            == PositionedAutoSizeChildParticipation::ExcludeOutOfFlow
+        {
+            // A block container with only positioned block children is
+            // represented by the inline collector. Reject the descendant at
+            // this boundary before hypothetical placeholder measurement can
+            // contribute line boxes to the positioned parent's auto-size
+            // probe. The committed pass still constructs its static rectangle.
+            return;
+        }
         if self.positioned_inline_layout_suppression_depth > 0 {
             return;
         }
@@ -267,16 +298,29 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 css::StaticPositionSource::Inline
             };
-            let mut static_position = self.inline_static_position_from_hypothetical_placeholder(
-                element,
-                &positioned_style,
-                stylesheets,
-                child_boxes,
-                table_fragment,
-                block_style,
-                static_position_index,
-                output,
-            );
+            let mut static_position =
+                self.inline_static_position_from_hypothetical_placeholder(
+                    element,
+                    &positioned_style,
+                    stylesheets,
+                    child_boxes,
+                    table_fragment,
+                    block_style,
+                    match static_position_source {
+                        Some(DeferredStaticPositionSource::InlineMarker { marker, .. }) => marker,
+                        Some(DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(_))
+                        | None => InlineStaticPositionMarkerId::for_element(element),
+                    },
+                    match static_position_source {
+                        Some(DeferredStaticPositionSource::InlineMarker {
+                            fallback_source_order_index,
+                            ..
+                        }) => Some(fallback_source_order_index),
+                        Some(DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(_))
+                        | None => None,
+                    },
+                    output,
+                );
             let static_area = static_position.rectangle.area;
             static_position.rectangle.area = PageTopRect::new(
                 static_area.x() + hypothetical_ancestor_offset.x(),
@@ -287,9 +331,9 @@ impl<'a> LayoutBuilder<'a> {
             let static_area = static_position.rectangle.area;
             log::trace!(
                 target: "quire::layout::inline_static_verbose",
-                "checkpoint=deferred-replay element={:?} source=inline deferred_index={:?} static_axes=({:?},{:?}) rect=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
+                "checkpoint=deferred-replay element={:?} source=inline marker={:?} static_axes=({:?},{:?}) rect=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
                 element.id,
-                static_position_index,
+                static_position_source,
                 static_position.rectangle.writing_mode,
                 static_position.rectangle.direction,
                 static_area.x(),
@@ -348,7 +392,10 @@ impl<'a> LayoutBuilder<'a> {
                 output,
                 block_style,
                 placeholder_geometry,
-                static_position_index,
+                static_position_source.and_then(|source| match source {
+                    DeferredStaticPositionSource::InlineMarker { .. } => None,
+                    DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(index) => Some(index),
+                }),
             )
             .unwrap_or_else(|| PageTopRect::new(self.content_left, self.cursor_y, 0.0, 0.0));
         let hypothetical_block_margin_box = HypotheticalBlockMarginBox::from_placeholder(
@@ -457,9 +504,8 @@ impl<'a> LayoutBuilder<'a> {
             });
         log::trace!(
             target: "quire::layout::static_position",
-            "checkpoint=capture element={:?} source=block deferred_index={:?} hypothetical=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) static_axes=({:?},{:?}) rect=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) buffered_block_offset={:.2} containing_inline={:?}",
+            "checkpoint=capture element={:?} source=block hypothetical=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) static_axes=({:?},{:?}) rect=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) buffered_block_offset={:.2} containing_inline={:?}",
             element.id,
-            static_position_index,
             placeholder_box.x(),
             placeholder_box.top_y(),
             placeholder_box.width(),
@@ -775,31 +821,33 @@ impl<'a> LayoutBuilder<'a> {
         output: &mut [InlineItem],
     ) {
         for descendant in descendants {
-            // Rebuild only at the final inline edge, where its ancestor's
-            // containing block can be measured from a complete item stream.
-            // This preserves the immutable frozen-tree boundary without
-            // carrying borrowed child boxes through collection.
-            let child_boxes = self.build_frozen_child_boxes_with_current_ancestors(
-                &descendant.element,
-                stylesheets,
-                &descendant.style,
-            );
-            let positioned_layer_start = self.positioned_layers.len();
-            self.layout_positioned_inline_descendant(
-                &descendant.element,
-                &descendant.style,
-                stylesheets,
-                Some(&child_boxes),
-                None,
-                block_style,
-                &descendant.static_position_container_style,
-                Some(descendant.containing_block_source.as_borrowed()),
-                None,
-                None,
-                InlineVisualOffset::zero(),
-                output,
-            );
-            let layers = self.positioned_layers.split_off(positioned_layer_start);
+            let layers = self.with_ancestor_signature(descendant.signature, |layout| {
+                // Rebuild only at the final inline edge, where its ancestor's
+                // containing block can be measured from a complete item
+                // stream. Retain the positioned source on the selector stack
+                // throughout both child-box construction and layout.
+                let child_boxes = layout.build_frozen_child_boxes_with_current_ancestors(
+                    &descendant.element,
+                    stylesheets,
+                    &descendant.style,
+                );
+                let positioned_layer_start = layout.positioned_layers.len();
+                layout.layout_positioned_inline_descendant(
+                    &descendant.element,
+                    &descendant.style,
+                    stylesheets,
+                    Some(&child_boxes),
+                    None,
+                    block_style,
+                    &descendant.static_position_container_style,
+                    Some(descendant.containing_block_source.as_borrowed()),
+                    None,
+                    None,
+                    InlineVisualOffset::zero(),
+                    output,
+                );
+                layout.positioned_layers.split_off(positioned_layer_start)
+            });
             DeferredClampEffect::PositionedLayers {
                 owner: descendant.containing_block_source.id,
                 layers,
@@ -819,31 +867,35 @@ impl<'a> LayoutBuilder<'a> {
         output: &[InlineItem],
     ) {
         for descendant in descendants {
-            let frozen_child_boxes =
-                matches!(descendant.content, DeferredStaticPositionedContent::Frozen).then(|| {
-                    self.build_frozen_child_boxes_with_current_ancestors(
-                        &descendant.element,
-                        stylesheets,
-                        &descendant.style,
-                    )
-                });
-            self.layout_positioned_inline_descendant(
-                &descendant.element,
-                &descendant.style,
-                stylesheets,
-                frozen_child_boxes.as_deref(),
-                None,
-                &descendant.line_formatting_context_style,
-                &descendant.static_position_container_style,
-                descendant
-                    .positioning_containing_block_source
-                    .as_ref()
-                    .map(InlinePositioningContainingBlockSource::as_borrowed),
-                descendant.static_position_containing_block,
-                Some(descendant.static_position_index),
-                descendant.hypothetical_ancestor_offset,
-                output,
-            );
+            self.with_ancestor_signature(descendant.signature, |layout| {
+                let frozen_child_boxes =
+                    matches!(descendant.content, DeferredStaticPositionedContent::Frozen).then(
+                        || {
+                            layout.build_frozen_child_boxes_with_current_ancestors(
+                                &descendant.element,
+                                stylesheets,
+                                &descendant.style,
+                            )
+                        },
+                    );
+                layout.layout_positioned_inline_descendant(
+                    &descendant.element,
+                    &descendant.style,
+                    stylesheets,
+                    frozen_child_boxes.as_deref(),
+                    None,
+                    &descendant.line_formatting_context_style,
+                    &descendant.static_position_container_style,
+                    descendant
+                        .positioning_containing_block_source
+                        .as_ref()
+                        .map(InlinePositioningContainingBlockSource::as_borrowed),
+                    descendant.static_position_containing_block,
+                    Some(descendant.static_position_source),
+                    descendant.hypothetical_ancestor_offset,
+                    output,
+                );
+            });
         }
     }
 

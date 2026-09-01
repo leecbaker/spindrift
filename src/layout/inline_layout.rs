@@ -17,7 +17,7 @@ pub(in crate::layout) use graph::{
 };
 pub(in crate::layout) use items::{
     InlineLayoutOutcome, InlineLineRecord, InlineLineSequence, InlineLineStackCursor,
-    inline_line_fragment_is_phantom,
+    InlineLineTermination, inline_line_fragment_is_phantom,
 };
 #[cfg(test)]
 pub(in crate::layout) use mixed::{

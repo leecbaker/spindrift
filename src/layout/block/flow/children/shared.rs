@@ -1,5 +1,43 @@
 use super::*;
 
+/// Whether a child can participate while measuring the automatic block size
+/// of an absolutely positioned formatting-context root.
+///
+/// Absolute and fixed positioned descendants are removed from their parent's
+/// formatting context and therefore cannot affect the parent's used size. A
+/// positioned auto-size probe must reject them before block-child traversal
+/// mutates margin, fragmentation, cursor, or static-position state; rejecting
+/// them only at positioned dispatch is too late.
+///
+/// <https://drafts.csswg.org/css-position-3/#position-property>
+/// <https://drafts.csswg.org/css-position-3/#abspos-layout>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum PositionedAutoSizeChildParticipation {
+    MeasureNormally,
+    ExcludeOutOfFlow,
+}
+
+impl PositionedAutoSizeChildParticipation {
+    fn for_child(layout_pass_kind: LayoutPassKind, style: &ComputedStyle) -> Self {
+        if layout_pass_kind == LayoutPassKind::PositionedAutoSizeMeasurement
+            && matches!(style.position, Position::Absolute | Position::Fixed)
+        {
+            Self::ExcludeOutOfFlow
+        } else {
+            Self::MeasureNormally
+        }
+    }
+}
+
+impl<'a> LayoutBuilder<'a> {
+    pub(in crate::layout) fn positioned_auto_size_child_participation(
+        &self,
+        style: &ComputedStyle,
+    ) -> PositionedAutoSizeChildParticipation {
+        PositionedAutoSizeChildParticipation::for_child(self.layout_pass_kind, style)
+    }
+}
+
 /// The physical placement exported to one normal-flow child by a vertical
 /// containing flow.
 ///
@@ -208,6 +246,46 @@ impl<'a> LayoutBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positioned_auto_size_participation_excludes_only_positioned_measurement_children() {
+        for (position, normal, measurement) in [
+            (
+                Position::Static,
+                PositionedAutoSizeChildParticipation::MeasureNormally,
+                PositionedAutoSizeChildParticipation::MeasureNormally,
+            ),
+            (
+                Position::Relative,
+                PositionedAutoSizeChildParticipation::MeasureNormally,
+                PositionedAutoSizeChildParticipation::MeasureNormally,
+            ),
+            (
+                Position::Absolute,
+                PositionedAutoSizeChildParticipation::MeasureNormally,
+                PositionedAutoSizeChildParticipation::ExcludeOutOfFlow,
+            ),
+            (
+                Position::Fixed,
+                PositionedAutoSizeChildParticipation::MeasureNormally,
+                PositionedAutoSizeChildParticipation::ExcludeOutOfFlow,
+            ),
+        ] {
+            let mut style = ComputedStyle::initial();
+            style.position = position;
+            assert_eq!(
+                PositionedAutoSizeChildParticipation::for_child(LayoutPassKind::Normal, &style),
+                normal
+            );
+            assert_eq!(
+                PositionedAutoSizeChildParticipation::for_child(
+                    LayoutPassKind::PositionedAutoSizeMeasurement,
+                    &style,
+                ),
+                measurement
+            );
+        }
+    }
 
     #[test]
     fn vertical_principal_child_placement_projects_inline_and_block_axes() {
@@ -509,7 +587,7 @@ impl<'a> LayoutBuilder<'a> {
                     matches!(
                         &item.item,
                         InlineLineItem::Atom(atom)
-                            if matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder)
+                            if matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder(_))
                     )
                 })
             }) {

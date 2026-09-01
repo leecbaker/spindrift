@@ -61,7 +61,7 @@ pub(in crate::layout) fn text_decoration_segments(
     runs: &[RenderedTextRun],
     ink_boxes: &[GlyphInkBox],
 ) -> Vec<TextDecorationSegment> {
-    text_decoration_segments_with_selected_glyphs(inputs, runs, ink_boxes, None)
+    text_decoration_segments_with_selected_glyphs(inputs, runs, ink_boxes, None, None, None)
 }
 
 pub(in crate::layout) fn text_decoration_segments_with_selected_glyphs(
@@ -69,6 +69,8 @@ pub(in crate::layout) fn text_decoration_segments_with_selected_glyphs(
     runs: &[RenderedTextRun],
     ink_boxes: &[GlyphInkBox],
     selected_glyphs: Option<&[TextDecorationPositionedGlyph]>,
+    positioned_ink_boxes: Option<&[TextDecorationPositionedInkBox]>,
+    receiver_spans: Option<&[TextInlineSpan]>,
 ) -> Vec<TextDecorationSegment> {
     let TextDecorationSegmentInputs {
         axis,
@@ -107,32 +109,77 @@ pub(in crate::layout) fn text_decoration_segments_with_selected_glyphs(
             )
         },
     );
+    // Decoration propagation stops at non-receiving atomic descendants and
+    // `text-decoration-skip-self` boxes. Receiver spans are page-local and
+    // may arrive in bidi paint order, so merge their ordered physical
+    // coverage before turning the complement into stroke gaps.
+    let mut coverage = receiver_spans
+        .into_iter()
+        .flatten()
+        .map(|span| (span.start.max(inline_start), span.end.min(inline_end)))
+        .filter(|(start, end)| end > start)
+        .collect::<Vec<_>>();
+    coverage.sort_by(|left, right| left.0.total_cmp(&right.0));
+    if receiver_spans.is_some() && coverage.len() > 1 {
+        let mut covered_end = coverage[0].1;
+        for (start, end) in coverage.into_iter().skip(1) {
+            if start > covered_end {
+                skips.push((covered_end, start));
+            }
+            covered_end = covered_end.max(end);
+        }
+    }
     if skip_ink != TextDecorationSkipInk::None {
-        skips.extend(
-            ink_boxes
-                .iter()
-                .filter(|ink| {
-                    text_decoration_ink_intersects_cross_axis(
-                        axis,
-                        line_x,
-                        block_position,
-                        thickness,
-                        ink,
-                    )
-                })
-                .filter_map(|ink| {
-                    let (ink_start, ink_end) = text_decoration_ink_inline_range(axis, line_x, ink);
-                    // The stroke must avoid actual ink, not a heuristic box
-                    // inflated by the full decoration thickness.  Inflating
-                    // here can consume the entire span of a short, thick
-                    // decoration before the line painter gets a chance to
-                    // render it.
-                    // <https://www.w3.org/TR/css-text-decor-4/#text-decoration-skip-ink-property>
-                    let start = ink_start.max(inline_start);
-                    let end = ink_end.min(inline_end);
-                    (end > start).then_some((start, end))
-                }),
-        );
+        let positioned_skips = positioned_ink_boxes
+            .into_iter()
+            .flatten()
+            .filter_map(|ink| {
+                let intersects = match axis {
+                    TextDecorationStrokeAxis::Horizontal => {
+                        ink.y_min <= block_position + thickness && ink.y_max >= block_position
+                    }
+                    TextDecorationStrokeAxis::Vertical => {
+                        ink.x_min <= block_position + thickness && ink.x_max >= block_position
+                    }
+                };
+                let (ink_start, ink_end) = match axis {
+                    TextDecorationStrokeAxis::Horizontal => (ink.x_min, ink.x_max),
+                    TextDecorationStrokeAxis::Vertical => (ink.y_min, ink.y_max),
+                };
+                let start = ink_start.max(inline_start);
+                let end = ink_end.min(inline_end);
+                (intersects && end > start).then_some((start, end))
+            })
+            .collect::<Vec<_>>();
+        skips.extend(positioned_skips);
+        if positioned_ink_boxes.is_none() {
+            skips.extend(
+                ink_boxes
+                    .iter()
+                    .filter(|ink| {
+                        text_decoration_ink_intersects_cross_axis(
+                            axis,
+                            line_x,
+                            block_position,
+                            thickness,
+                            ink,
+                        )
+                    })
+                    .filter_map(|ink| {
+                        let (ink_start, ink_end) =
+                            text_decoration_ink_inline_range(axis, line_x, ink);
+                        // The stroke must avoid actual ink, not a heuristic box
+                        // inflated by the full decoration thickness.  Inflating
+                        // here can consume the entire span of a short, thick
+                        // decoration before the line painter gets a chance to
+                        // render it.
+                        // <https://www.w3.org/TR/css-text-decor-4/#text-decoration-skip-ink-property>
+                        let start = ink_start.max(inline_start);
+                        let end = ink_end.min(inline_end);
+                        (end > start).then_some((start, end))
+                    }),
+            );
+        }
     }
     if skips.is_empty() {
         return vec![TextDecorationSegment {

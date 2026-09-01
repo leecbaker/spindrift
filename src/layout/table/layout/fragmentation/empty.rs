@@ -12,7 +12,7 @@ use crate::layout::table::layout::fragmentation::{
     collapsed_cell_decoration_style, table_columns_paint_in_reverse_page_order,
 };
 use crate::layout::table::layout::{
-    CollapsedTableGeometry, TableCaptionContainingBlock, TableCaptionOuterWidth,
+    CollapsedTableGeometry, TableCaptionContainingBlock, TableCaptionOuterInlineSize,
     TableCellBaselineAlignmentContext, TableCellClipRegion, TableWrapperBorderBoxOrigin,
     TableWrapperMarginBoxFootprint, TableWrapperPaintBox, table_atomic_stacking_policy,
     table_box_overflow_clip, table_column_fragment_background_image_primitives,
@@ -30,7 +30,7 @@ use crate::layout::table::{
     used_empty_table_grid_width,
 };
 use crate::layout::{
-    AbsoluteStaticPosition, ContainingBlock, LayoutBuilder, LogicalBlockContentSize,
+    AbsoluteStaticPosition, ContainingBlock, FlowAxes, LayoutBuilder, LogicalBlockContentSize,
     LogicalInlineContentSize, PageInlinePosition, PageInlineSpan, PageTopBlockPosition,
     PageTopPoint, PageTopRect, PhysicalContentWidth, PositionedContainingBlockMode, RelativeOffset,
     assets, block_paint_ops_with_border_insets, element_sibling_signature_list,
@@ -104,7 +104,7 @@ impl<'a> LayoutBuilder<'a> {
         table_width: UsedTableWidth,
         relative_offset: RelativeOffset,
         wrapper_border_box_block_size: Option<BorderBoxLength>,
-    ) -> (f32, f32, f32, f32) {
+    ) -> (f32, f32, f32, f32, bool) {
         let content_width = used_empty_table_grid_width(style, available_table_width, table_width);
         let content_width_points = content_width.points();
         let provisional_caption_width = PhysicalContentWidth::new(content_width);
@@ -168,12 +168,15 @@ impl<'a> LayoutBuilder<'a> {
             style.clear,
             self.containing_block_direction,
         );
+        let wrapper_float_displaced_inline =
+            (placement.origin.x() - self.content_left).abs() > 0.01;
         self.cursor_y = placement.origin.top_y();
         (
             placement.origin.x() + style.margin.left + relative_offset.x(),
             content_width_points,
             content_height,
             border_box_width,
+            wrapper_float_displaced_inline,
         )
     }
 
@@ -198,16 +201,21 @@ impl<'a> LayoutBuilder<'a> {
         table_is_document_canvas: bool,
         wrapper_border_box_block_size: Option<BorderBoxLength>,
     ) {
-        let (table_outer_x, content_width, content_height, border_box_width) = self
-            .place_empty_table_wrapper(
-                captions,
-                style,
-                stylesheets,
-                available_table_width,
-                table_width,
-                relative_offset,
-                wrapper_border_box_block_size,
-            );
+        let (
+            table_outer_x,
+            content_width,
+            content_height,
+            border_box_width,
+            wrapper_float_displaced_inline,
+        ) = self.place_empty_table_wrapper(
+            captions,
+            style,
+            stylesheets,
+            available_table_width,
+            table_width,
+            relative_offset,
+            wrapper_border_box_block_size,
+        );
         let border_box_height = table_wrapper_border_box_height(content_height, table_width);
         let table_x = table_width.content_x(table_outer_x);
         let grid_size = TableGridLogicalSize::new(
@@ -215,6 +223,15 @@ impl<'a> LayoutBuilder<'a> {
             LogicalBlockContentSize::new(content_box_pt(content_height)),
         );
         let physical_grid_width = grid_size.physical_width(TableAxes::for_style(style));
+        let caption_outer_inline_size = if style.writing_mode.has_vertical_lines() {
+            content_width
+                + table_width.border_widths.top
+                + table_width.padding.top
+                + table_width.padding.bottom
+                + table_width.border_widths.bottom
+        } else {
+            border_box_width
+        };
 
         self.push_float_context();
         let table_wrapper_top = self.cursor_y;
@@ -257,9 +274,11 @@ impl<'a> LayoutBuilder<'a> {
         let top_caption_paint_page_index = self.pages.len();
         let top_caption_containing_block = TableCaptionContainingBlock::new(
             PageInlineSpan::new(border_box_x, border_box_width),
-            TableCaptionOuterWidth::from_border_box(border_box_pt(border_box_width)),
+            TableCaptionOuterInlineSize::from_border_box(border_box_pt(caption_outer_inline_size)),
             TableAxes::for_style(style),
             PageInlinePosition::new(table_x),
+            wrapper_float_displaced_inline,
+            self.active_table_fragmentainer_placement(),
         );
         let top_caption_outcome = self.layout_table_captions(
             captions,
@@ -326,6 +345,7 @@ impl<'a> LayoutBuilder<'a> {
         };
         let table_wrapper_margin_box = TableWrapperMarginBoxFootprint::from_table_root_border_box(
             table_root_paint_box.clone().border_box(),
+            style.writing_mode,
             PageTopBlockPosition::new(table_wrapper_top),
             layout_pt(top_caption_height),
             layout_pt(bottom_caption_height),
@@ -357,9 +377,13 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             TableCaptionContainingBlock::new(
                 PageInlineSpan::new(border_box_x, border_box_width),
-                TableCaptionOuterWidth::from_border_box(border_box_pt(border_box_width)),
+                TableCaptionOuterInlineSize::from_border_box(border_box_pt(
+                    caption_outer_inline_size,
+                )),
                 TableAxes::for_style(style),
                 PageInlinePosition::new(table_x),
+                wrapper_float_displaced_inline,
+                self.active_table_fragmentainer_placement(),
             ),
             CaptionSide::Bottom,
         );
@@ -400,9 +424,20 @@ impl<'a> LayoutBuilder<'a> {
                 .paint_clip()
                 .paint_rect(),
         ));
-        self.cursor_y = table_wrapper_margin_box
-            .horizontal_parent_block_end()
-            .points();
+        let parent_axes = FlowAxes::new(
+            self.containing_block_writing_mode,
+            self.containing_block_direction,
+        );
+        self.cursor_y = if parent_axes.writing_mode().has_vertical_lines() {
+            table_wrapper_top
+        } else {
+            table_wrapper_margin_box
+                .parent_cursor_after_unfragmented(
+                    parent_axes,
+                    PageTopBlockPosition::new(self.cursor_y),
+                )
+                .points()
+        };
         if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y -= relative_offset.y();
         }

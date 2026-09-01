@@ -1,6 +1,16 @@
 use super::*;
 use crate::layout::inline_layout::InlineLineStackCursor;
 
+fn static_position_placeholder_has_marker(
+    content: &InlineAtomContent,
+    marker: InlineStaticPositionMarkerId,
+) -> bool {
+    matches!(
+        content,
+        InlineAtomContent::StaticPositionPlaceholder(candidate) if *candidate == marker
+    )
+}
+
 /// The physical block-axis extent needed to capture a block-level
 /// static-position source from an inline collection.
 ///
@@ -322,7 +332,7 @@ impl<'a> LayoutBuilder<'a> {
                     matches!(
                         &item.item,
                         InlineLineItem::Atom(atom)
-                            if matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder)
+                            if matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder(_))
                     )
                 })
             });
@@ -339,7 +349,7 @@ impl<'a> LayoutBuilder<'a> {
                                 };
                                 matches!(
                                     atom.atom.content(),
-                                    InlineAtomContent::StaticPositionPlaceholder
+                                    InlineAtomContent::StaticPositionPlaceholder(_)
                                 )
                                 .then_some(
                                     match block_style.writing_mode {
@@ -422,7 +432,7 @@ impl<'a> LayoutBuilder<'a> {
         inline_size: f32,
     ) -> InlineAtom {
         InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder,
+            InlineAtomContent::StaticPositionPlaceholder(InlineStaticPositionMarkerId::Block),
             block_style.clone(),
             None,
             InlineSize::new(inline_size.max(0.0), block_style.line_height),
@@ -444,23 +454,36 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         block_style: &ComputedStyle,
-        static_position_index: Option<usize>,
+        marker: InlineStaticPositionMarkerId,
+        fallback_static_position_index: Option<usize>,
         output: &[InlineItem],
     ) -> StaticPositionCapture {
-        let placeholder = self.inline_static_position_placeholder_atom(
-            element,
-            style,
-            stylesheets,
-            child_boxes,
-            table_fragment,
-        );
-        let static_position_index = static_position_index
-            .unwrap_or(output.len())
-            .min(output.len());
-        let mut hypothetical_items = Vec::with_capacity(output.len() + 1);
-        hypothetical_items.extend_from_slice(&output[..static_position_index]);
-        hypothetical_items.push(InlineItem::Atom(Box::new(placeholder)));
-        hypothetical_items.extend_from_slice(&output[static_position_index..]);
+        let has_source_marker = output.iter().any(|item| {
+            matches!(item, InlineItem::Atom(atom) if static_position_placeholder_has_marker(atom.content(), marker))
+        });
+        let mut hypothetical_items = output.to_vec();
+        let static_position_index = if has_source_marker {
+            // Normal deferred replay consumes the marker inserted by normal
+            // inline collection. The source stream, not replay, owns the
+            // selected-line participant.
+            output.len()
+        } else {
+            // Direct legacy callers have no collected source stream yet.
+            // Keep the old synthetic path as a deliberately narrow fallback.
+            let insertion_index = fallback_static_position_index
+                .unwrap_or(output.len())
+                .min(output.len());
+            let placeholder = self.inline_static_position_placeholder_atom(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                marker,
+            );
+            hypothetical_items.insert(insertion_index, InlineItem::Atom(Box::new(placeholder)));
+            insertion_index
+        };
         let available_width = self.current_content_logical_inline_size().max(1.0);
         log::trace!(
             target: "quire::layout::inline_static_verbose",
@@ -497,8 +520,12 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
         );
         self.restore(snapshot);
-        let placeholder_capture =
-            self.inline_static_position_from_placeholder_sequence(element, &sequence, block_style);
+        let placeholder_capture = self.inline_static_position_from_placeholder_sequence(
+            element,
+            marker,
+            &sequence,
+            block_style,
+        );
         let capture = placeholder_capture.unwrap_or_else(|| StaticPositionCapture {
             rectangle: StaticPositionRectangle {
                 area: if block_style.writing_mode.has_vertical_lines() {
@@ -547,6 +574,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
+        marker: InlineStaticPositionMarkerId,
     ) -> InlineAtom {
         let available_width = (self.content_right - self.content_left).max(style.font_size);
         let mut hypothetical =
@@ -681,7 +709,7 @@ impl<'a> LayoutBuilder<'a> {
         };
 
         InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder,
+            InlineAtomContent::StaticPositionPlaceholder(marker),
             placeholder_style.clone(),
             None,
             atom_size,
@@ -695,6 +723,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn inline_static_position_from_placeholder_sequence(
         &mut self,
         element: &Element,
+        marker: InlineStaticPositionMarkerId,
         sequence: &inline_layout::InlineLineSequence,
         block_style: &ComputedStyle,
     ) -> Option<StaticPositionCapture> {
@@ -728,13 +757,15 @@ impl<'a> LayoutBuilder<'a> {
         );
         let records = sequence.fragment_records_for_paint(0, sequence.records.len());
         for record in &records {
-            if let Some(fragment) = &record.fragment && fragment.items().iter().any(|item| {
-                matches!(
-                    &item.item,
-                    InlineLineItem::Atom(atom)
-                        if matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder)
-                )
-            }) {
+            if let Some(fragment) = &record.fragment
+                && fragment.items().iter().any(|item| {
+                    matches!(
+                        &item.item,
+                            InlineLineItem::Atom(atom)
+                            if static_position_placeholder_has_marker(atom.content(), marker)
+                    )
+                })
+            {
                 stack.apply(self);
                 // A paintless RTL placeholder is emitted at the physical
                 // edge selected by the float band. A left float leaves that
@@ -829,9 +860,9 @@ impl<'a> LayoutBuilder<'a> {
                             } else {
                                 logical_inline_start_x
                             };
-                            let is_static_placeholder = matches!(
+                            let is_static_placeholder = static_position_placeholder_has_marker(
                                 atom.atom.content(),
-                                InlineAtomContent::StaticPositionPlaceholder
+                                marker,
                             );
                             if is_static_placeholder {
                                 log::trace!(
@@ -923,6 +954,21 @@ impl<'a> LayoutBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_position_marker_selects_its_source_without_source_order() {
+        let first = InlineStaticPositionMarkerId::Element(crate::dom::ElementId::next());
+        let second = InlineStaticPositionMarkerId::Element(crate::dom::ElementId::next());
+
+        assert!(static_position_placeholder_has_marker(
+            &InlineAtomContent::StaticPositionPlaceholder(first),
+            first,
+        ));
+        assert!(!static_position_placeholder_has_marker(
+            &InlineAtomContent::StaticPositionPlaceholder(second),
+            first,
+        ));
+    }
 
     #[test]
     fn static_inline_placeholder_projects_logical_axes_for_all_writing_modes() {

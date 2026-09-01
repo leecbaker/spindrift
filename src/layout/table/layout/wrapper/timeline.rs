@@ -155,7 +155,7 @@ impl TableWrapperFragmentTimeline {
                         ),
                         grid_source_start: None,
                         destination,
-                        destination_page_index: None,
+                        destination_page_index: destination.outer_fragmentainer_ordinal(),
                         destination_grid_start,
                     },
                 );
@@ -173,7 +173,13 @@ impl TableWrapperFragmentTimeline {
                             ),
                             grid_source_start: None,
                             destination: caption.destination,
-                            destination_page_index: None,
+                            // Distinct anonymous columns can share the same
+                            // scratch geometry. Retain their concrete outer
+                            // ordinal so later wrapper scheduling cannot
+                            // collapse caption continuations into one
+                            // destination merely because their rectangles
+                            // compare equal.
+                            destination_page_index: Some(caption.page_index),
                             destination_grid_start: TableGridBlockOffset::new(
                                 TableGridLength::new(0.0),
                             ),
@@ -194,7 +200,7 @@ impl TableWrapperFragmentTimeline {
                     ),
                     grid_source_start: None,
                     destination,
-                    destination_page_index: None,
+                    destination_page_index: destination.outer_fragmentainer_ordinal(),
                     destination_grid_start,
                 },
             );
@@ -218,6 +224,14 @@ impl TableWrapperFragmentTimeline {
     ) {
         if source_size.get() <= 0.0 {
             return;
+        }
+        if let Some(outer) = destination.outer_fragmentainer() {
+            debug_assert_eq!(
+                destination_page_index,
+                outer.ordinal(),
+                "table grid slices must use the same outer fragmentainer ordinal as captions"
+            );
+            debug_assert!(outer.logical_block_capacity() >= 0.0);
         }
         let slice = TableWrapperFragmentSlice {
             kind: TableWrapperTimelineKind::GridBody,
@@ -266,7 +280,7 @@ impl TableWrapperFragmentTimeline {
                 source,
                 grid_source_start: None,
                 destination,
-                destination_page_index: None,
+                destination_page_index: destination.outer_fragmentainer_ordinal(),
                 destination_grid_start,
             },
         );
@@ -324,7 +338,7 @@ impl TableWrapperFragmentTimeline {
                     source: TableWrapperBlockInterval::new(caption_start, source_size),
                     grid_source_start: None,
                     destination,
-                    destination_page_index: None,
+                    destination_page_index: destination.outer_fragmentainer_ordinal(),
                     destination_grid_start,
                 },
             );
@@ -341,7 +355,7 @@ impl TableWrapperFragmentTimeline {
                         ),
                         grid_source_start: None,
                         destination: caption.destination,
-                        destination_page_index: None,
+                        destination_page_index: Some(caption.page_index),
                         destination_grid_start: TableGridBlockOffset::new(TableGridLength::new(
                             0.0,
                         )),
@@ -401,6 +415,31 @@ impl TableWrapperFragmentTimeline {
             })
             .copied()
             .collect()
+    }
+
+    /// Total logical grid block span committed before `slice`.
+    ///
+    /// This is the table-root analogue of a generic fragmented block's
+    /// preceding fragment spans. Captions select the grid's first
+    /// fragmentainer but are outside the table-root background positioning
+    /// area, so they are deliberately excluded here.
+    /// <https://www.w3.org/TR/css-break-3/#break-decoration>
+    pub(in crate::layout::table) fn preceding_grid_body_block_span(
+        &self,
+        slice: TableWrapperFragmentSlice,
+    ) -> TableGridLength {
+        TableGridLength::new(
+            self.state
+                .borrow()
+                .slices
+                .iter()
+                .filter(|candidate| {
+                    candidate.kind == TableWrapperTimelineKind::GridBody
+                        && candidate.source.start().points() < slice.source.start().points() - 0.01
+                })
+                .map(|candidate| candidate.source.size().get())
+                .sum(),
+        )
     }
 
     /// Whether this wrapper has committed any grid-body source interval.

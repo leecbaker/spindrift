@@ -97,9 +97,8 @@ fn prepared_inline_text_group_paint_opacity(group: &PreparedInlineTextGroup) -> 
 
 /// Whether a text receiver carries a decoration from `origin_style`.
 ///
-/// Decoration propagation is modeled by the layer list rather than the
-/// receiver's non-inherited `text-decoration-line` longhand.  The origin's
-/// `Rc` is its stable identity, so equal-valued declarations cannot collapse.
+/// The origin's `Rc` preserves lexical identity through style-equivalent
+/// nested decorations.
 fn text_decoration_layers_receive_origin(
     layers: &[crate::css::TextDecorationLayer],
     origin_style: &Rc<ComputedStyle>,
@@ -136,6 +135,7 @@ impl<'a> LayoutBuilder<'a> {
         runs: &mut [RenderedTextRun],
         shaped: &ShapedInlineLine,
         style: &ComputedStyle,
+        line_block_size: f32,
     ) {
         if !style.writing_mode.has_vertical_lines() {
             return;
@@ -148,7 +148,7 @@ impl<'a> LayoutBuilder<'a> {
             if run.text_matrix == RenderedTextMatrix::ROTATE_CW {
                 run.x_offset += descent;
             } else if run.text_matrix == RenderedTextMatrix::ROTATE_CCW {
-                run.x_offset += (style.line_height - descent).max(0.0);
+                run.x_offset += (line_block_size - descent).max(0.0);
             }
         }
     }
@@ -181,7 +181,12 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
     ) -> Option<RenderedLine> {
         let mut rendered_runs = positioned_rendered_runs_for_writing_mode(shaped, style);
-        self.align_sideways_runs_to_vertical_line_box(&mut rendered_runs, shaped, style);
+        self.align_sideways_runs_to_vertical_line_box(
+            &mut rendered_runs,
+            shaped,
+            style,
+            style.line_height,
+        );
         if rendered_runs.is_empty() {
             return None;
         }
@@ -441,43 +446,51 @@ impl<'a> LayoutBuilder<'a> {
         decoration_geometries: &[TextDecorationOriginLineGeometry],
     ) {
         for geometry in decoration_geometries {
-            for prepared in prepared_groups {
-                for receiver in &prepared.decorations.receivers {
-                    if !text_decoration_layers_receive_origin(
-                        &receiver.layers,
-                        &geometry.layer.origin_style,
-                    ) {
-                        continue;
-                    }
-                    let (x, baseline_y) = match receiver.style.writing_mode {
-                        WritingMode::HorizontalTb => {
-                            (receiver.inline_span.start, prepared.decorations.baseline.y)
-                        }
-                        WritingMode::VerticalRl
-                        | WritingMode::VerticalLr
-                        | WritingMode::SidewaysRl
-                        | WritingMode::SidewaysLr => (
-                            prepared.decorations.baseline.x,
-                            prepared
-                                .decorations
-                                .vertical_inline_start
-                                .expect("vertical decoration paint retains its logical start")
-                                .y(),
-                        ),
-                    };
-                    self.paint_text_decoration_layer(
-                        x,
-                        baseline_y,
-                        receiver.inline_span,
-                        &receiver.style,
-                        &prepared.rendered_line.runs,
-                        &geometry.layer,
-                        phase,
-                        None,
-                        Some(geometry),
-                    );
-                }
-            }
+            let Some(coverage) = geometry.selected_inline_span else {
+                continue;
+            };
+            // The aggregate selected glyph sequence preserves space
+            // clipping. Keep one contributing rendered run as the ink-box
+            // source as well: glyph ink boxes are font-backed and cannot be
+            // reconstructed from the lightweight coverage sequence.
+            let runs = prepared_groups
+                .iter()
+                .find(|prepared| {
+                    prepared.decorations.receivers.iter().any(|receiver| {
+                        text_decoration_layers_receive_origin(
+                            &receiver.layers,
+                            &geometry.layer.origin_style,
+                        )
+                    })
+                })
+                .map_or(&[][..], |prepared| prepared.rendered_line.runs.as_slice());
+            // Endpoint ownership and uniform line geometry belong to the
+            // decorating origin, not to an individual receiver. Resolve the
+            // origin range once, then use receiver spans only as coverage.
+            // This preserves an atomic or `skip-self` gap without applying
+            // the same endpoint adjustment to every descendant text group.
+            // <https://drafts.csswg.org/css-text-decor-4/#text-decoration-line-uniformity>
+            // <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+            let origin_style = geometry.layer.origin_style.as_ref();
+            // The stroke range is already in page coordinates, but glyph ink
+            // boxes remain local to the prepared text group's line origin.
+            // Keep that origin intact instead of replacing its inline
+            // coordinate with the first selected endpoint: doing so shifts
+            // skip-ink ranges whenever a decorating box starts inside a text
+            // group (for example `A<u>BC</u>D`).
+            let x = geometry.line_reference.x;
+            let baseline_y = geometry.line_reference.y;
+            self.paint_text_decoration_layer(
+                x,
+                baseline_y,
+                coverage,
+                origin_style,
+                runs,
+                &geometry.layer,
+                phase,
+                None,
+                Some(geometry),
+            );
         }
 
         // A text group can be materialized outside the line-geometry pass
@@ -556,6 +569,7 @@ impl<'a> LayoutBuilder<'a> {
             &mut rendered_runs,
             &group.shaped,
             &group.style,
+            group.line_block_size,
         );
         if rendered_runs.is_empty() {
             return None;

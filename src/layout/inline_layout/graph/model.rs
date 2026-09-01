@@ -240,8 +240,12 @@ impl InlineBoundaryAdvance {
         Self(layout_pt(0.0))
     }
 
-    pub(in crate::layout) fn between(left: UsedLetterSpacing, right: UsedLetterSpacing) -> Self {
-        Self(layout_pt((left.points() + right.points()) * 0.5))
+    pub(in crate::layout) fn between(left: UsedLetterSpacing, _right: UsedLetterSpacing) -> Self {
+        // Letter spacing is owned by the preceding typographic unit. A
+        // following inline that resets `letter-spacing` must not remove the
+        // preceding unit's trailing gap.
+        // <https://drafts.csswg.org/css-text-4/#letter-spacing-property>
+        Self(left.0)
     }
 
     pub(in crate::layout) fn points(self) -> f32 {
@@ -258,10 +262,6 @@ pub(in crate::layout) struct UsedLetterSpacing(LayoutLength);
 impl UsedLetterSpacing {
     pub(in crate::layout) fn new(value: LayoutLength) -> Self {
         Self(value)
-    }
-
-    pub(in crate::layout) fn points(self) -> f32 {
-        self.0.points()
     }
 }
 
@@ -1004,6 +1004,9 @@ pub(in crate::layout) struct InlineLineFragment {
     /// so automatic clamping can stay attached to source across a balanced
     /// reflow instead of reusing a raw line ordinal.
     pub(in crate::layout) source_end: Option<InlineGraphPosition>,
+    /// The `::first-line` used style has already been materialized into the
+    /// selected items, so paint must not overlay it a second time.
+    pub(in crate::layout) first_line_style_materialized: bool,
 }
 
 impl InlineLineFragment {
@@ -1032,6 +1035,7 @@ impl InlineLineFragment {
             text: Rc::from(text.into()),
             text_box_trim: TextBoxLineTrim::default(),
             source_end: None,
+            first_line_style_materialized: false,
         }
     }
 
@@ -1067,6 +1071,10 @@ impl InlineLineFragment {
     pub(in crate::layout) fn with_source_end(mut self, source_end: InlineGraphPosition) -> Self {
         self.source_end = Some(source_end);
         self
+    }
+
+    pub(in crate::layout) fn mark_first_line_style_materialized(&mut self) {
+        self.first_line_style_materialized = true;
     }
 
     /// Preserve the float band selected by this source line when it is

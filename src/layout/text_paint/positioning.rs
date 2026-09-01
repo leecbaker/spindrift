@@ -4,6 +4,71 @@ use std::rc::Rc;
 use super::*;
 use crate::text::{TextTypesettingPlan, VerticalUnitTypesetting};
 
+/// The physical side from which a decorating box's logical inline
+/// coordinates advance.
+///
+/// `text-decoration-inset` owns logical start/end endpoints even after its
+/// selected descendants have been reordered or projected into page paint
+/// coordinates. Keeping that side as a total (horizontal or vertical) axis
+/// prevents endpoint code from falling back to physical min/max assumptions.
+/// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+/// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct TextDecorationInlineAxis {
+    logical_start_side: PhysicalSide,
+}
+
+impl TextDecorationInlineAxis {
+    pub(in crate::layout) fn from_axes(axes: WritingModeAxes) -> Self {
+        Self {
+            logical_start_side: axes.physical_side(LogicalSide::InlineStart),
+        }
+    }
+
+    pub(in crate::layout) fn for_style(style: &ComputedStyle) -> Self {
+        let placement_direction = if matches!(
+            style.text_layout_policy(),
+            css::TextLayoutPolicy::Vertical(TextOrientation::Upright)
+        ) {
+            Direction::Ltr
+        } else {
+            style.direction
+        };
+        Self::from_axes(WritingModeAxes::new(
+            style.writing_mode,
+            placement_direction,
+        ))
+    }
+
+    pub(in crate::layout) const fn stroke_axis(self) -> TextDecorationStrokeAxis {
+        match self.logical_start_side {
+            PhysicalSide::Left | PhysicalSide::Right => TextDecorationStrokeAxis::Horizontal,
+            PhysicalSide::Top | PhysicalSide::Bottom => TextDecorationStrokeAxis::Vertical,
+        }
+    }
+
+    /// Apply logical start/end insets to an ordered physical span.
+    pub(in crate::layout) fn inset_span(
+        self,
+        span: TextInlineSpan,
+        inset_start: f32,
+        inset_end: f32,
+    ) -> Option<TextInlineSpan> {
+        if span.length() - inset_start - inset_end <= 0.0 {
+            return None;
+        }
+        let (start, end) = match self.logical_start_side {
+            PhysicalSide::Left | PhysicalSide::Bottom => {
+                (span.start + inset_start, span.end - inset_end)
+            }
+            PhysicalSide::Right | PhysicalSide::Top => {
+                (span.start + inset_end, span.end - inset_start)
+            }
+        };
+        Some(TextInlineSpan::new(start, end))
+    }
+}
+
 /// The physical edge from which a vertical logical inline coordinate is
 /// measured.
 ///

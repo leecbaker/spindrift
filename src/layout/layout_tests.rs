@@ -6,7 +6,7 @@ mod tests {
     use crate::css::{
         BoxDecorationBreak, ComputedLengthPercentage, ContentLanguage, Hyphens,
         StylesheetCollection, TextAlignLast, TextBoxEdge, TextBoxTrim, TextEdgeMetric,
-        TextEdgePair, TextOrientation,
+        TextEdgePair, TextFit, TextFitDirection, TextFitStrategy, TextOrientation,
     };
     use crate::layout::grid::GridAxisTopology;
     use crate::layout::inline_collect::{InlineElementScopeOptions, InlinePlacement};
@@ -793,6 +793,55 @@ mod tests {
             "direct text sequence should apply its own text-box-trim"
         );
         assert!(sequence.total_height() < style.line_height);
+    }
+
+    #[test]
+    fn consistent_text_fit_reshapes_each_nested_text_style() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut block = ComputedStyle::initial();
+        block.font_family = css::FontFamily::SansSerif;
+        block.font_size = 10.0;
+        block.line_height = 12.0;
+        block.text_fit = TextFit::Fit {
+            direction: TextFitDirection::Grow,
+            strategy: TextFitStrategy::Consistent,
+            limit: None,
+        };
+        let mut nested = block.clone();
+        nested.font_size = 20.0;
+        nested.line_height = 24.0;
+
+        let sequence = builder.collect_inline_line_sequence(
+            vec![inline_word("A", &block), inline_word("A", &nested)],
+            &block,
+            200.0,
+            0.0,
+            0.0,
+        );
+        let mut used_font_sizes = sequence.records[0]
+            .fragment
+            .as_ref()
+            .expect("one line of nested text")
+            .items()
+            .iter()
+            .filter_map(|item| match &item.item {
+                InlineLineItem::Fragment(fragment) => Some(fragment.style().font_size),
+                InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+            })
+            .collect::<Vec<_>>();
+        used_font_sizes.sort_by(f32::total_cmp);
+        used_font_sizes.dedup_by(|left, right| (*left - *right).abs() < 0.001);
+
+        assert_eq!(
+            used_font_sizes.len(),
+            2,
+            "both nested styles survive fitting"
+        );
+        assert!(used_font_sizes[0] > block.font_size);
+        assert!((used_font_sizes[1] / used_font_sizes[0] - 2.0).abs() < 0.001);
     }
 
     #[test]
@@ -3362,6 +3411,7 @@ mod tests {
             is_phantom,
             is_first_formatted_line: true,
             is_last_line_in_paragraph: true,
+            termination: inline_layout::InlineLineTermination::BlockEnd,
             is_forced_empty: false,
             used_bidi_base_direction: (!is_phantom).then_some(style.used_direction()),
             starts_after_preserved_segment_break: false,
@@ -3373,6 +3423,7 @@ mod tests {
             used_indent: 0.0,
             available_width,
             line_height: style.line_height,
+            text_fit_used_style: None,
             decoration_origin_fragments: Default::default(),
         }
     }

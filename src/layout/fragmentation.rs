@@ -733,6 +733,8 @@ impl LayoutBuilder<'_> {
         source_origin: PageTopPoint,
         source_extent: LogicalSize,
     ) -> Vec<(usize, PaintFragment)> {
+        let block_axis = WritingModeAxes::new(axes.writing_mode(), axes.direction())
+            .physical_axis(LogicalAxis::Block);
         slices
             .iter()
             .filter_map(|slice| {
@@ -776,7 +778,7 @@ impl LayoutBuilder<'_> {
                 let fragment = source
                     .clone()
                     .with_primitives_clipped_to_physical_axis_range_preserving_cross_axis_overflow(
-                        css::PhysicalAxis::Horizontal,
+                        block_axis,
                         projection.source_clip(),
                         true,
                     )
@@ -1877,9 +1879,12 @@ mod tests {
         let initial_context = builder.current_page_context;
         builder.fragmentainer_override = Some(FragmentainerOverride {
             kind: FragmentainerKind::Column,
-            initial_context,
-            initial_fragmentainer_count: 1,
-            context: initial_context,
+            sequence: FragmentainerSequence::new(
+                FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+                initial_context,
+                1,
+                initial_context,
+            ),
             relax_widows_orphans: false,
         });
         builder.mark_current_page_flow_content();
@@ -1905,9 +1910,12 @@ mod tests {
         let initial_context = builder.current_page_context;
         builder.fragmentainer_override = Some(FragmentainerOverride {
             kind: FragmentainerKind::Column,
-            initial_context,
-            initial_fragmentainer_count: 1,
-            context: initial_context,
+            sequence: FragmentainerSequence::new(
+                FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+                initial_context,
+                1,
+                initial_context,
+            ),
             relax_widows_orphans: false,
         });
         let page_count = builder.pages.len();

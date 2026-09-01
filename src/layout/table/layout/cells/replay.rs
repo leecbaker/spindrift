@@ -666,7 +666,9 @@ impl<'a> LayoutBuilder<'a> {
             let root_background_viewport = TableWrapperDecorationViewport::new(
                 projection,
                 fragmentainer_placement,
-                fragment.plan.page_index,
+                fragmentainer_placement
+                    .outer_fragmentainer_ordinal()
+                    .unwrap_or(fragment.plan.page_index),
                 root_source_placement,
                 wrapper_timeline,
                 table_style,
@@ -683,9 +685,18 @@ impl<'a> LayoutBuilder<'a> {
                 && fragment_row_offsets
                     .iter()
                     .all(|offset| offset.abs() <= 0.01);
+            // A table row can remain monolithic while its wrapper is already
+            // participating in an outer multicolumn sequence. In that case
+            // the table-local row plan alone is not evidence that the root
+            // decoration is unfragmented: its background must retain the
+            // outer placement projection for later column slices.
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            // <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds>
             let paints_unfragmented_root = !fragment.plan.metadata.continues_from_previous_page
-                && !fragment.plan.metadata.continues_to_next_page;
-            if paints_complete_source_grid || paints_unfragmented_root {
+                && !fragment.plan.metadata.continues_to_next_page
+                && fragmentainer_placement.outer_fragmentainer().is_none()
+                && paints_complete_source_grid;
+            if paints_unfragmented_root {
                 if let Some(fill) = table_style
                     .background
                     .background_color

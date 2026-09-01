@@ -83,6 +83,24 @@ pub(in crate::layout) fn set_style_used_height(style: &mut ComputedStyle, height
     );
 }
 
+/// Replaces the physical dimension that realizes a definite logical inline
+/// size for a temporary layout style.
+///
+/// CSS logical dimensions project through the element's writing mode: inline
+/// size is physical width in horizontal writing and physical height in
+/// vertical writing.
+/// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+pub(in crate::layout) fn set_style_used_logical_inline_size(
+    style: &mut ComputedStyle,
+    inline_size: f32,
+) {
+    if style.writing_mode.has_vertical_lines() {
+        set_style_used_height(style, inline_size);
+    } else {
+        set_style_used_width(style, inline_size);
+    }
+}
+
 /// Freeze a temporary content-box replay style to a resolved content width.
 ///
 /// This adapter is paired with an explicit border-to-content conversion at
@@ -166,6 +184,27 @@ mod tests {
             css::ComputedLengthPercentageOrAuto::LengthPercentage(
                 css::ComputedLengthPercentage::from_points(42.0)
             )
+        );
+    }
+
+    #[test]
+    fn logical_inline_override_targets_height_in_vertical_writing() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+
+        set_style_used_logical_inline_size(&mut style, 42.0);
+
+        assert_eq!(
+            style.box_values.width,
+            css::ComputedLengthPercentageOrAuto::Auto
+        );
+        assert_eq!(
+            style
+                .box_values
+                .height
+                .length_if_no_percent()
+                .expect("used height is a definite length"),
+            42.0
         );
     }
 

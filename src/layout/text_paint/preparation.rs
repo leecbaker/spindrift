@@ -595,6 +595,7 @@ impl<'a> LayoutBuilder<'a> {
         Some(PreparedInlineTextGroup {
             bounds: PhysicalInlineTextBounds::new(InlinePoint::new(x, y), width),
             style: first.style().clone(),
+            line_block_size: metrics.line_block_size,
             decoration_provenance,
             text_box_trim,
             paint_opacity,

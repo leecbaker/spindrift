@@ -46,11 +46,12 @@ impl<'a> LayoutBuilder<'a> {
         // an automatic-inset block source is hypothetically placed at the
         // inline run's resolved block position.
         // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
-        let out_of_flow_static_source = has_preceding_inline_flow_content.then(|| {
-            self.block_static_position_rectangle_at(PageTopBlockPosition::new(
-                self.cursor_y - preceding_inline_clamp_block_advance.points(),
-            ))
-        });
+        let out_of_flow_static_capture =
+            has_preceding_inline_flow_content.then(|| StaticPositionCapture {
+                rectangle: self.block_static_position_rectangle_at(PageTopBlockPosition::new(
+                    self.cursor_y - preceding_inline_clamp_block_advance.points(),
+                )),
+            });
         let vertical_child_inline_origin = style.writing_mode.has_vertical_lines().then(|| {
             self.vertical_child_inline_origin(element, style.writing_mode, style.used_direction())
         });
@@ -89,7 +90,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://drafts.csswg.org/css-overflow-4/#line-clamp-containers>
         let mut dom_state = Box::new(DomFlowTraversalState::new(
             first_formatted_line,
-            out_of_flow_static_source,
+            out_of_flow_static_capture,
             self.float_run_state(),
             style.margin_trim.block_start,
         ));
@@ -162,6 +163,16 @@ impl<'a> LayoutBuilder<'a> {
             // <https://drafts.csswg.org/css-text-decor-4/#line-decoration>
             let decoration_context = TextDecorationPropagationContext::from_style(style);
             *child_style = decoration_context.used_child_style(&child_style);
+            if self.positioned_auto_size_child_participation(&child_style)
+                == PositionedAutoSizeChildParticipation::ExcludeOutOfFlow
+            {
+                // The speculative positioned-root measurement owns no static
+                // source or positioned output. Skip before this child can
+                // alter first-line, break, margin, cursor, or capture state;
+                // the committed pass will capture and lay it out normally.
+                dom_state.child_node_index += 1;
+                continue;
+            }
             // A block container's first formatted line is supplied by the
             // first line of its first in-flow block child when it has no
             // preceding inline line of its own. Preserve the originating
@@ -932,12 +943,15 @@ impl<'a> LayoutBuilder<'a> {
                         None
                     };
                 if captures_direct_out_of_flow_static_position {
-                    let rectangle = dom_state.out_of_flow_static_source.unwrap_or_else(|| {
-                        self.block_static_position_rectangle_at(PageTopBlockPosition::new(
-                            self.cursor_y,
-                        ))
+                    let capture = dom_state.out_of_flow_static_capture.unwrap_or_else(|| {
+                        StaticPositionCapture {
+                            rectangle: self.block_static_position_rectangle_at(
+                                PageTopBlockPosition::new(self.cursor_y),
+                            ),
+                        }
                     });
-                    dom_state.out_of_flow_static_source = Some(rectangle);
+                    dom_state.out_of_flow_static_capture = Some(capture);
+                    let rectangle = capture.rectangle;
                     self.absolute_static_position = Some(
                         self.absolute_static_position
                             .unwrap_or_else(|| {
@@ -1225,11 +1239,11 @@ impl<'a> LayoutBuilder<'a> {
                 None
             };
             dom_state.previous_break_after = if is_flow_child {
-                dom_state.out_of_flow_static_source = Some(
-                    self.block_static_position_rectangle_at(PageTopBlockPosition::new(
+                dom_state.out_of_flow_static_capture = Some(StaticPositionCapture {
+                    rectangle: self.block_static_position_rectangle_at(PageTopBlockPosition::new(
                         self.cursor_y,
                     )),
-                );
+                });
                 child_break_context
                     .avoid_after_in(fragmentainer_kind)
                     .unwrap_or(PageBreak::Auto)
