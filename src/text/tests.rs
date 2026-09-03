@@ -286,7 +286,7 @@ fn installed_font_fallback_skips_private_use_characters() {
 fn platform_fallback_matches_direct_and_parley_selection() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::Names(vec!["Quire Test Missing Family".to_string()]);
+    style.font_family = FontFamily::Names(vec!["Spindrift Test Missing Family".to_string()]);
 
     for character in ['A', '\u{0634}', '\u{1f600}'] {
         let direct = system
@@ -1850,7 +1850,7 @@ async fn line_measure_excludes_inline_end_letter_spacing() {
 }
 
 #[test]
-fn generic_parley_source_uses_quire_embeddable_face() {
+fn generic_parley_source_uses_spindrift_embeddable_face() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
     style.font_family = FontFamily::Monospace;
@@ -1880,7 +1880,7 @@ fn generic_parley_source_uses_quire_embeddable_face() {
 }
 
 #[test]
-fn named_stack_parley_source_skips_missing_alias_and_uses_quire_selected_bold_face() {
+fn named_stack_parley_source_skips_missing_alias_and_uses_spindrift_selected_bold_face() {
     let mut system = FontSystem::new();
     let mut probe = ComputedStyle::initial();
     probe.font_family = FontFamily::SansSerif;
@@ -1902,7 +1902,7 @@ fn named_stack_parley_source_skips_missing_alias_and_uses_quire_selected_bold_fa
 
     let mut style = probe.clone();
     style.font_family = FontFamily::List(vec![
-        FontFamily::named("quire-missing-platform-alias"),
+        FontFamily::named("spindrift-missing-platform-alias"),
         FontFamily::named(resolved_family.clone()),
         FontFamily::SansSerif,
     ]);
@@ -1910,7 +1910,7 @@ fn named_stack_parley_source_skips_missing_alias_and_uses_quire_selected_bold_fa
     let expected_source = parley_font_family_source(&FontFamily::named(resolved_family.clone()));
     let source = system.resolved_parley_font_family_source(&style);
     assert_eq!(source, format!("{expected_source}, {expected_source}"));
-    assert!(!source.contains("quire-missing-platform-alias"));
+    assert!(!source.contains("spindrift-missing-platform-alias"));
 
     let runs = system.shape_text_runs_with_parley("Bold", &style);
     assert!(runs.iter().all(|run| {
@@ -1931,12 +1931,12 @@ fn unresolved_named_family_does_not_reach_parley_source() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
     style.font_family = FontFamily::List(vec![
-        FontFamily::named("quire-missing-platform-alias"),
+        FontFamily::named("spindrift-missing-platform-alias"),
         FontFamily::Monospace,
     ]);
 
     let source = system.resolved_parley_font_family_source(&style);
-    assert!(!source.contains("quire-missing-platform-alias"));
+    assert!(!source.contains("spindrift-missing-platform-alias"));
     assert!(!source.ends_with("monospace"));
 }
 

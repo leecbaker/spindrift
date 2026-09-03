@@ -728,7 +728,7 @@ struct GridBaselineAlignmentContext<'a, 'box_tree> {
     container_height: f32,
     align_content: css::AlignContent,
 }
-/// Apply Quire-measured baseline self-alignment for simple grid rows.
+/// Apply Spindrift-measured baseline self-alignment for simple grid rows.
 ///
 /// Taffy's grid measure callback does not receive text baseline metadata, so
 /// same-row baseline self-alignment would otherwise synthesize from item boxes.

@@ -453,7 +453,7 @@ impl BlockLayoutGeometry {
     ///
     /// CSS Box defines the border box as the outer painted box excluding
     /// margins. Block layout knows the top edge before descendants are laid out
-    /// and the final block size afterward, so this is the point where Quire can
+    /// and the final block size afterward, so this is the point where Spindrift can
     /// form a typed block-layout rectangle:
     /// <https://www.w3.org/TR/CSS22/box.html#box-dimensions>.
     pub(in crate::layout) fn border_box_top_rect(

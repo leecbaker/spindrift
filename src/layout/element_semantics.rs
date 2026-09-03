@@ -173,7 +173,7 @@ pub(in crate::layout) struct ScrollbarGutterReservation {
 }
 
 impl ScrollbarGutterReservation {
-    /// Quire's static PDF backend has no native interactive scrollbar chrome,
+    /// Spindrift's static PDF backend has no native interactive scrollbar chrome,
     /// and therefore selects the CSS Overflow overlay-scrollbar UA policy.
     /// Overlay scrollbars reserve no layout space.
     /// <https://drafts.csswg.org/css-overflow-3/#scrollbar-gutter-property>
@@ -603,7 +603,7 @@ fn viewport_overflow_axes(style: &ComputedStyle) -> (css::Overflow, css::Overflo
 ///
 /// CSS Overflow keeps `overflow-x` and `overflow-y` distinct, and makes a
 /// visible axis effectively scrollable when the other axis is non-visible.
-/// Quire's clip geometry is rectangular, so any non-visible axis establishes
+/// Spindrift's clip geometry is rectangular, so any non-visible axis establishes
 /// the shared clip/BFC decision while axis-specific scroll UI remains a
 /// separate concern.
 /// <https://www.w3.org/TR/css-overflow-3/#overflow-properties>
@@ -971,7 +971,7 @@ pub(super) fn replaced_element_kind(element: &Element) -> Option<ReplacedElement
         return None;
     }
     match element.tag.as_str() {
-        // Canvas and embedded documents have no Quire paint resource unless a
+        // Canvas and embedded documents have no Spindrift paint resource unless a
         // future renderer supplies one, but CSS still lays each out as one
         // atomic replaced box.  The canvas path already provides the required
         // default-object geometry and paints only author-provided box

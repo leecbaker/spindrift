@@ -2,7 +2,7 @@ use cssparser::{AtRuleParser, DeclarationParser, ToCss};
 
 use super::at_rules::collect_container_style_rules;
 use super::*;
-use crate::css::selector::QuirePseudoElement;
+use crate::css::selector::SpindriftPseudoElement;
 use crate::css::{
     FontPaletteDefinition, LayerName, LayerOrder, LayerSegment, PropertyRegistrationRule,
     StylesheetOrigin, StylesheetScopeAnchor,
@@ -87,17 +87,17 @@ impl RoutedPseudoElement {
     }
 }
 
-fn routed_pseudo_from_selector(pseudo: &QuirePseudoElement) -> RoutedPseudoElement {
+fn routed_pseudo_from_selector(pseudo: &SpindriftPseudoElement) -> RoutedPseudoElement {
     match pseudo {
-        QuirePseudoElement::Marker => RoutedPseudoElement::Marker,
-        QuirePseudoElement::Before => RoutedPseudoElement::Before,
-        QuirePseudoElement::After => RoutedPseudoElement::After,
-        QuirePseudoElement::ScrollMarker => RoutedPseudoElement::ScrollMarker,
-        QuirePseudoElement::ScrollMarkerGroup => RoutedPseudoElement::ScrollMarkerGroup,
-        QuirePseudoElement::FootnoteCall => RoutedPseudoElement::FootnoteCall,
-        QuirePseudoElement::FootnoteMarker => RoutedPseudoElement::FootnoteMarker,
-        QuirePseudoElement::FirstLine => RoutedPseudoElement::FirstLine,
-        QuirePseudoElement::FirstLetter => RoutedPseudoElement::FirstLetter,
+        SpindriftPseudoElement::Marker => RoutedPseudoElement::Marker,
+        SpindriftPseudoElement::Before => RoutedPseudoElement::Before,
+        SpindriftPseudoElement::After => RoutedPseudoElement::After,
+        SpindriftPseudoElement::ScrollMarker => RoutedPseudoElement::ScrollMarker,
+        SpindriftPseudoElement::ScrollMarkerGroup => RoutedPseudoElement::ScrollMarkerGroup,
+        SpindriftPseudoElement::FootnoteCall => RoutedPseudoElement::FootnoteCall,
+        SpindriftPseudoElement::FootnoteMarker => RoutedPseudoElement::FootnoteMarker,
+        SpindriftPseudoElement::FirstLine => RoutedPseudoElement::FirstLine,
+        SpindriftPseudoElement::FirstLetter => RoutedPseudoElement::FirstLetter,
     }
 }
 
@@ -128,7 +128,7 @@ pub(in crate::css) struct CssRuleParser<'a> {
 #[derive(Clone)]
 struct SelectorRoute {
     selector_text: String,
-    selector: SelectorList<QuireSelectorImpl>,
+    selector: SelectorList<SpindriftSelectorImpl>,
     routed_pseudo: Option<RoutedPseudoElement>,
 }
 
@@ -149,7 +149,7 @@ impl SelectorRoute {
 
     fn with_resolved_parent(
         &self,
-        nesting_parent: &SelectorList<QuireSelectorImpl>,
+        nesting_parent: &SelectorList<SpindriftSelectorImpl>,
     ) -> Option<Self> {
         let selector = self.selector.replace_parent_selector(nesting_parent);
         let mut selector_text = String::new();
@@ -188,7 +188,7 @@ impl SelectorRoutes {
         Some(())
     }
 
-    fn nesting_parent(&self) -> Option<SelectorList<QuireSelectorImpl>> {
+    fn nesting_parent(&self) -> Option<SelectorList<SpindriftSelectorImpl>> {
         let branches = self
             .0
             .iter()
@@ -203,8 +203,8 @@ impl SelectorRoutes {
     /// representation; only a validated generated pseudo branch is serialized
     /// and reparsed as the selector for its originating element.
     fn from_parsed_selector_list(
-        selector: SelectorList<QuireSelectorImpl>,
-        selector_parser: &QuireSelectorParser,
+        selector: SelectorList<SpindriftSelectorImpl>,
+        selector_parser: &SpindriftSelectorParser,
         parse_relative: ParseRelative,
     ) -> Option<Self> {
         let mut grouped = Vec::<(Option<RoutedPseudoElement>, Vec<_>)>::new();
@@ -261,7 +261,7 @@ impl SelectorRoutes {
     /// semantics for its ordinary branch.
     fn from_source_fallback(
         selector_text: &str,
-        selector_parser: &QuireSelectorParser,
+        selector_parser: &SpindriftSelectorParser,
         parse_relative: ParseRelative,
     ) -> Option<Self> {
         let mut routes = Vec::new();
@@ -316,7 +316,7 @@ pub(in crate::css) struct NestingContext {
     routes: SelectorRoutes,
     /// Pseudo-element branches cannot be represented by CSS Nesting's `&`.
     /// Direct declarations retain the complete selector list above.
-    nesting_parent: Option<SelectorList<QuireSelectorImpl>>,
+    nesting_parent: Option<SelectorList<SpindriftSelectorImpl>>,
 }
 
 impl NestingContext {
@@ -358,8 +358,8 @@ impl NamespaceRegistry {
         Rc::new(RefCell::new(Self::default()))
     }
 
-    pub(in crate::css) fn selector_parser(&self) -> QuireSelectorParser {
-        QuireSelectorParser::new(self.default_namespace.clone(), self.prefixes.clone())
+    pub(in crate::css) fn selector_parser(&self) -> SpindriftSelectorParser {
+        SpindriftSelectorParser::new(self.default_namespace.clone(), self.prefixes.clone())
     }
 
     pub(in crate::css) fn register(&mut self, prefix: Option<String>, namespace_url: String) {

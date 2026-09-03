@@ -1,17 +1,17 @@
 # Filter Effects parity
 
-For CSS `filter`, Quire proves visual identity for the exact lowering's
+For CSS `filter`, Spindrift proves visual identity for the exact lowering's
 identity result (`grayscale(0)`, `saturate(1)`, `brightness(1)`, and
 `opacity(1)`) and for `blur(0)`, `contrast(1)`, `invert(0)`, `sepia(0)`, and
 whole-turn `hue-rotate()` values. These non-`none` filters retain their CSS
 stacking behavior, but do not create a redundant PDF transparency group.
 
-Quire has no raster SVG filter backend. Most SVG filter graphs are therefore
+Spindrift has no raster SVG filter backend. Most SVG filter graphs are therefore
 suppressed rather than painted as unfiltered source content, because a
 partial vector substitute would not be equivalent to the filtered result.
 
 There is one exact vector lowering. Filter Effects requires an
-`feDisplacementMap` whose `in2` is tainted to act as a pass-through. Quire
+`feDisplacementMap` whose `in2` is tainted to act as a pass-through. Spindrift
 proves that the complete normalized filter sequence ends in that exact
 `SourceGraphic` result, then paints the original vector scene clipped to the
 intersection of the filter region and every exact pass-through primitive

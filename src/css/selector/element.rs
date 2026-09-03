@@ -7,7 +7,7 @@ use selectors::matching::ElementSelectorFlags;
 use selectors::{Element as SelectorElement, OpaqueElement};
 
 use super::{
-    CssAtom, CssString, QuirePseudoClass, QuirePseudoElement, QuireSelectorImpl,
+    CssAtom, CssString, SpindriftPseudoClass, SpindriftPseudoElement, SpindriftSelectorImpl,
     language_from_attrs, language_matches_any_range,
 };
 use crate::css::html_form_state;
@@ -260,7 +260,7 @@ impl StyleElement<'_> {
     /// Match Selectors 4 `:open` for static HTML states visible in markup.
     ///
     /// The pseudo-class represents host-language open/closed state. In static
-    /// HTML documents Quire can deterministically derive that state from
+    /// HTML documents Spindrift can deterministically derive that state from
     /// boolean `open` attributes on elements whose open state is represented in
     /// markup:
     /// <https://drafts.csswg.org/selectors-4/#open-state> and
@@ -334,7 +334,7 @@ impl StyleElement<'_> {
 }
 
 impl SelectorElement for StyleElement<'_> {
-    type Impl = QuireSelectorImpl;
+    type Impl = SpindriftSelectorImpl;
 
     fn opaque(&self) -> OpaqueElement {
         OpaqueElement::new(&*self.signature().opaque_id)
@@ -430,56 +430,62 @@ impl SelectorElement for StyleElement<'_> {
 
     fn match_non_ts_pseudo_class(
         &self,
-        pc: &QuirePseudoClass,
-        _context: &mut MatchingContext<QuireSelectorImpl>,
+        pc: &SpindriftPseudoClass,
+        _context: &mut MatchingContext<SpindriftSelectorImpl>,
     ) -> bool {
         match pc {
-            QuirePseudoClass::AnyLink => self.is_link(),
-            QuirePseudoClass::Link => self.is_link() && self.link_state() == LinkState::Unvisited,
-            QuirePseudoClass::Visited => self.is_link() && self.link_state() == LinkState::Visited,
-            QuirePseudoClass::Dir(direction) => self.directionality() == Some(*direction),
-            QuirePseudoClass::Lang(ranges) => language_matches_any_range(&self.language(), ranges),
-            QuirePseudoClass::StaticFalse(_) => false,
-            QuirePseudoClass::Target => self.signature().is_target,
-            QuirePseudoClass::TargetWithin => {
+            SpindriftPseudoClass::AnyLink => self.is_link(),
+            SpindriftPseudoClass::Link => {
+                self.is_link() && self.link_state() == LinkState::Unvisited
+            }
+            SpindriftPseudoClass::Visited => {
+                self.is_link() && self.link_state() == LinkState::Visited
+            }
+            SpindriftPseudoClass::Dir(direction) => self.directionality() == Some(*direction),
+            SpindriftPseudoClass::Lang(ranges) => {
+                language_matches_any_range(&self.language(), ranges)
+            }
+            SpindriftPseudoClass::StaticFalse(_) => false,
+            SpindriftPseudoClass::Target => self.signature().is_target,
+            SpindriftPseudoClass::TargetWithin => {
                 self.signature().is_target || self.signature().has_target_descendant
             }
             // The static renderer's current target is its fragment-navigation
             // target. Relative marker state needs layout geometry and is
             // therefore supplied only once a render-scoped topology exists.
-            QuirePseudoClass::TargetCurrent => self.signature().is_target,
-            QuirePseudoClass::TargetBefore | QuirePseudoClass::TargetAfter => false,
-            QuirePseudoClass::Open => self.is_open(),
-            QuirePseudoClass::Defined => true,
-            QuirePseudoClass::Enabled => {
+            SpindriftPseudoClass::TargetCurrent => self.signature().is_target,
+            SpindriftPseudoClass::TargetBefore | SpindriftPseudoClass::TargetAfter => false,
+            SpindriftPseudoClass::Open => self.is_open(),
+            SpindriftPseudoClass::Defined => true,
+            SpindriftPseudoClass::Enabled => {
                 html_form_state::disableable_element(self.signature().tag.as_str())
                     && !self.is_disabled()
             }
-            QuirePseudoClass::Disabled => self.is_disabled(),
-            QuirePseudoClass::Checked => self.is_checked(),
-            QuirePseudoClass::Indeterminate => self.is_indeterminate(),
-            QuirePseudoClass::Default => self.is_default(),
-            QuirePseudoClass::Unchecked => self.is_unchecked(),
-            QuirePseudoClass::PlaceholderShown => self.is_placeholder_shown(),
-            QuirePseudoClass::Valid => self.is_valid(),
-            QuirePseudoClass::Invalid => self.is_invalid(),
-            QuirePseudoClass::InRange => self.is_in_range(),
-            QuirePseudoClass::OutOfRange => self.is_out_of_range(),
-            QuirePseudoClass::Required => {
+            SpindriftPseudoClass::Disabled => self.is_disabled(),
+            SpindriftPseudoClass::Checked => self.is_checked(),
+            SpindriftPseudoClass::Indeterminate => self.is_indeterminate(),
+            SpindriftPseudoClass::Default => self.is_default(),
+            SpindriftPseudoClass::Unchecked => self.is_unchecked(),
+            SpindriftPseudoClass::PlaceholderShown => self.is_placeholder_shown(),
+            SpindriftPseudoClass::Valid => self.is_valid(),
+            SpindriftPseudoClass::Invalid => self.is_invalid(),
+            SpindriftPseudoClass::InRange => self.is_in_range(),
+            SpindriftPseudoClass::OutOfRange => self.is_out_of_range(),
+            SpindriftPseudoClass::Required => {
                 self.is_required_capable() && self.signature().attrs.contains_key("required")
             }
-            QuirePseudoClass::Optional => {
+            SpindriftPseudoClass::Optional => {
                 self.is_required_capable() && !self.signature().attrs.contains_key("required")
             }
-            QuirePseudoClass::ReadWrite => self.is_read_write(),
-            QuirePseudoClass::ReadOnly => !self.is_read_write(),
+            SpindriftPseudoClass::ReadWrite => self.is_read_write(),
+            SpindriftPseudoClass::ReadOnly => !self.is_read_write(),
         }
     }
 
     fn match_pseudo_element(
         &self,
-        _pe: &QuirePseudoElement,
-        _context: &mut MatchingContext<QuireSelectorImpl>,
+        _pe: &SpindriftPseudoElement,
+        _context: &mut MatchingContext<SpindriftSelectorImpl>,
     ) -> bool {
         false
     }

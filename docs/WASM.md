@@ -1,6 +1,6 @@
 # Wasm library compilation
 
-Quire's library can be checked for the bare WebAssembly target with:
+Spindrift's library can be checked for the bare WebAssembly target with:
 
 ```sh
 cargo check --target wasm32-unknown-unknown --lib

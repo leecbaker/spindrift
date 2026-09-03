@@ -146,7 +146,7 @@ fn physical_edge_value(edges: Edges, side: PhysicalSide) -> f32 {
 /// CSS 2.2 separates the inline content area from the line-height box:
 /// backgrounds, borders, and padding are anchored to the content area, while
 /// only `line-height` contributes to line box sizing. The content-area height
-/// is intentionally undefined by CSS 2.2; Quire uses its existing em-box
+/// is intentionally undefined by CSS 2.2; Spindrift uses its existing em-box
 /// policy and resolves block-start/block-end leading separately because
 /// fallback-font unions need not be symmetric around the content box:
 /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.

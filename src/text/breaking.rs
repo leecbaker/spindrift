@@ -82,7 +82,7 @@ impl TextBreakPolicy {
         self
     }
 
-    /// Return the ordinary UAX #14 policy before Quire applies virtual phrase
+    /// Return the ordinary UAX #14 policy before Spindrift applies virtual phrase
     /// boundaries. `auto-phrase` begins as `normal`; the phrase filter then
     /// suppresses only candidates inside an ICU-detected phrase.
     const fn effective_word_break(self) -> CssWordBreak {
@@ -526,7 +526,7 @@ pub(super) fn line_break_word_option(word_break: CssWordBreak) -> LineBreakWordO
 ///
 /// ICU's CJK loose/normal tailoring recognizes only Japanese and Chinese
 /// locales. CSS additionally identifies those writing systems through script
-/// subtags, so Quire supplies their canonical locale after resolving the
+/// subtags, so Spindrift supplies their canonical locale after resolving the
 /// content writing system itself.
 /// <https://drafts.csswg.org/css-text-3/#script-tagging>
 fn line_break_content_locale(writing_system: ContentWritingSystem) -> Option<LanguageIdentifier> {
@@ -555,7 +555,7 @@ pub(crate) fn measured_break_opportunities(text: &str, style: &ComputedStyle) ->
 /// Collect CSS Text break opportunities into caller-owned storage.
 ///
 /// The caller can retain the allocation while scanning neighboring inline
-/// fragments. This preserves the complete UAX #14/ICU result and Quire's CSS
+/// fragments. This preserves the complete UAX #14/ICU result and Spindrift's CSS
 /// tailoring without allocating a fresh position vector for every run.
 pub(crate) fn collect_measured_break_opportunities(
     text: &str,
@@ -580,7 +580,7 @@ pub(crate) fn collect_measured_break_opportunities(
     suppress_break_all_prefix_numeric_breaks(text, policy, breaks);
     // ICU owns the ordinary UAX #14 candidate set, including the
     // locale-tailored CJK `line-break` behavior selected above. Keep those
-    // candidates distinct from Quire's fallback candidates: the latter need
+    // candidates distinct from Spindrift's fallback candidates: the latter need
     // generic class protection, but applying that protection to ICU's result
     // would undo a legal locale-specific opportunity.
     let mut synthesized_breaks = Vec::new();
@@ -842,7 +842,7 @@ fn pre_wrap_preserved_tab_breaks(text: &str) -> impl Iterator<Item = usize> + '_
 /// Return whether CSS Text allows a soft wrap at an atomic inline boundary.
 ///
 /// CSS Text says atomic inline-level boxes participate in Unicode line
-/// breaking as U+FFFC OBJECT REPLACEMENT CHARACTER. Quire uses this
+/// breaking as U+FFFC OBJECT REPLACEMENT CHARACTER. Spindrift uses this
 /// helper for mixed inline line construction so no-break characters such as
 /// U+034F COMBINING GRAPHEME JOINER, U+200D ZERO WIDTH JOINER, and U+202F
 /// NARROW NO-BREAK SPACE can suppress the item boundary around an atomic box.
@@ -914,7 +914,7 @@ pub(crate) fn word_break_all_inner_boundaries(text: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Collect and protect Quire-synthesized CSS Text/UAX #14 fallback candidates.
+/// Collect and protect Spindrift-synthesized CSS Text/UAX #14 fallback candidates.
 ///
 /// Opening punctuation must not be left at the end of a line, UAX #14 LB13
 /// classes must not be left at the start of a line, CJK ideographs can break

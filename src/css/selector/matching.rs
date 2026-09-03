@@ -9,7 +9,7 @@ use selectors::context::{
 use selectors::matching::{matches_selector, matches_selector_list};
 use selectors::parser::SelectorList;
 
-use super::{LinkMatching, QuireSelectorImpl, StyleElement};
+use super::{LinkMatching, SpindriftSelectorImpl, StyleElement};
 use crate::css::types::{ElementSignature, ScopeRule};
 use crate::css::{ScopeRoot, StylesheetScopeAnchor};
 
@@ -21,7 +21,7 @@ use crate::css::{ScopeRoot, StylesheetScopeAnchor};
 /// from the element to that root; lower distances sort stronger in Cascade 5:
 /// <https://www.w3.org/TR/css-cascade-5/#scoped-styles>.
 pub(in crate::css) fn selector_matches_with_scope_proximity_in_chain_with_link_matching<'a>(
-    selector: &SelectorList<QuireSelectorImpl>,
+    selector: &SelectorList<SpindriftSelectorImpl>,
     scopes: &[ScopeRule],
     stylesheet_scope_anchor: StylesheetScopeAnchor,
     chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
@@ -107,7 +107,7 @@ pub(in crate::css) fn selector_chain<'a>(
 }
 
 fn selector_matches_at_with_link_matching<'a>(
-    selector: &SelectorList<QuireSelectorImpl>,
+    selector: &SelectorList<SpindriftSelectorImpl>,
     chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
     index: usize,
     scope_index: Option<usize>,
@@ -135,7 +135,7 @@ fn selector_matches_at_with_link_matching<'a>(
 /// the maximum specificity declared elsewhere in the comma-separated list.
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-sort>
 fn selector_matching_specificity_at<'a>(
-    selector: &SelectorList<QuireSelectorImpl>,
+    selector: &SelectorList<SpindriftSelectorImpl>,
     chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
     index: usize,
     scope_index: Option<usize>,
@@ -165,7 +165,7 @@ fn matching_context<'a>(
     caches: &'a mut SelectorCaches,
     scope_element: Option<OpaqueElement>,
     compatibility_mode: crate::dom::DocumentCompatibilityMode,
-) -> MatchingContext<'a, QuireSelectorImpl> {
+) -> MatchingContext<'a, SpindriftSelectorImpl> {
     let mut context = MatchingContext::new(
         MatchingMode::Normal,
         None,

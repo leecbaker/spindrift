@@ -2,11 +2,11 @@
 
 use std::fs::File;
 
-use quire::{Html, PdfOptions, RenderOptions};
+use spindrift::{Html, PdfOptions, RenderOptions};
 
 #[tokio::main]
-async fn main() -> quire::Result<()> {
-    let mut output = File::create("output/quire-basic.pdf")?;
+async fn main() -> spindrift::Result<()> {
+    let mut output = File::create("output/spindrift-basic.pdf")?;
     Html::from_string("<title>Basic</title><p>Hello, world</p>")
         .write_pdf(
             &mut output,

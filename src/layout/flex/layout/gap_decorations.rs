@@ -316,7 +316,7 @@ fn assign_flex_gap_rule_indices(gutters: &mut [GapDecorationGutter], reverse: bo
 
 /// The cross-axis band occupied by a finalized flex line for gap decoration.
 ///
-/// Ordinary lines retain the cross-size slot resolved by Quire's final flex
+/// Ordinary lines retain the cross-size slot resolved by Spindrift's final flex
 /// layout.  Item rectangles cannot stand in for that slot: `align-content:
 /// stretch` grows the line even when its fixed-size items do not stretch.
 /// Reconstructing a band from items is reserved for the exceptional stale-line

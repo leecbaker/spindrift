@@ -47,7 +47,7 @@ impl FlexPostLineRemeasurement {
 /// alignments, but that hypothetical size is still measured from block layout
 /// with the flex line's available cross size. For column flex items this can
 /// change shrink-to-fit auto widths and therefore float layout. Stretch items
-/// also relayout against the resolved line cross size. Quire's wrapped-line
+/// also relayout against the resolved line cross size. Spindrift's wrapped-line
 /// metadata may span to the next line start for alignment and fragmentation, so
 /// this pass excludes the following cross-axis gap from the item stretch slot:
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>,

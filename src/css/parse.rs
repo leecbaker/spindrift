@@ -8,7 +8,7 @@ use cssparser::{
 use selectors::parser::{ParseRelative, SelectorList, SelectorParseErrorKind};
 
 use super::component_values::{parse_css_string_token, split_css_component_values, trim_css_value};
-use super::selector::{QuireSelectorImpl, QuireSelectorParser};
+use super::selector::{SpindriftSelectorImpl, SpindriftSelectorParser};
 use super::types::{
     ContainerRule, CounterStyleRange, CounterStyleRangeInterval, CounterStyleRule,
     CounterStyleSystem, Css, CssFontFace, Declarations, Direction, Display, FontFaceSource,

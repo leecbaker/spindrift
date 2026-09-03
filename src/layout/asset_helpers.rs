@@ -805,7 +805,7 @@ pub(super) fn intrinsic_canvas_size(element: &Element) -> IntrinsicReplacedSize 
     intrinsic_default_replaced_size(element)
 }
 
-/// Return the intrinsic dimensions exposed by Quire's inline SVG support.
+/// Return the intrinsic dimensions exposed by Spindrift's inline SVG support.
 pub(super) fn intrinsic_svg_size(element: &Element) -> Option<IntrinsicReplacedSize> {
     let (size, dimensions) = crate::svg::svg_replaced_size(element)?;
     let width = size.width;
@@ -958,7 +958,7 @@ pub(super) fn used_image(
             let replaced_size = intrinsic.replaced_size();
             (intrinsic.decoded, intrinsic.svg, replaced_size)
         }
-        // A video without a poster still establishes a replaced box.  Quire
+        // A video without a poster still establishes a replaced box.  Spindrift
         // has no media-frame decoder, so represent its unavailable frame with
         // one transparent pixel while retaining its CSS object geometry.
         // <https://html.spec.whatwg.org/multipage/media.html#the-video-element>
@@ -2615,7 +2615,7 @@ fn used_border_image_width_value(
         css::BorderImageWidthValue::Auto => {
             if slice_width > 0.0 {
                 // Border-image slice numbers are source CSS pixels. Convert
-                // the intrinsic slice extent into Quire's PDF-point layout
+                // the intrinsic slice extent into Spindrift's PDF-point layout
                 // space before using it as an `auto` border-image width.
                 // <https://www.w3.org/TR/css-backgrounds-3/#border-image-width>
                 layout_px(slice_width)

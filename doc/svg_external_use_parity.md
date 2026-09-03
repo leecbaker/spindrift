@@ -2,7 +2,7 @@
 
 Inline SVG `<use href="URL#fragment">` resolves a statically preloaded,
 same-origin external HTML, XML, or SVG document before the SVG scene reaches
-`usvg`. Quire selects an SVG-namespace fragment target, imports its owning SVG
+`usvg`. Spindrift selects an SVG-namespace fragment target, imports its owning SVG
 fragment into a private `<defs>` payload, namespaces IDs, and rewrites the
 external use to a local fragment reference. This preserves static SVG
 definitions and allows nested external `<use>` links without parser-time I/O.

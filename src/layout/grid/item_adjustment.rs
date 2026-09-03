@@ -4,7 +4,7 @@ use super::*;
 /// Correct same-page grid self-alignment values outside Taffy's model.
 ///
 /// Taffy 0.13 resolves `self-start`/`self-end` natively for horizontal-tb
-/// alignment subjects. Quire still resolves them for vertical-writing subjects,
+/// alignment subjects. Spindrift still resolves them for vertical-writing subjects,
 /// whose physical sides cannot be represented by Taffy's horizontal-tb model.
 /// Physical `left`/`right` self-position values likewise bypass Taffy's
 /// direction-sensitive start/end mapping. The correction uses effective

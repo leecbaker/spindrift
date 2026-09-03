@@ -1,6 +1,6 @@
 # Concurrency and Parallelism
 
-This document tracks where Quire currently uses async/concurrent execution, and
+This document tracks where Spindrift currently uses async/concurrent execution, and
 where the rendering and PDF output pipelines can safely gain parallelism later.
 It is intentionally a working design note: add new sections as the architecture
 changes or as profiling identifies better targets.
@@ -22,7 +22,7 @@ orchestration, font loading, and one layout worker thread.
   `@font-face` rules with Tokio tasks, and registers loaded font faces on
   `spawn_blocking` in `src/text/system/font_loading.rs`.
 - Layout waits for font loading, then runs the page-box build and flow on one
-  scoped `quire-layout` thread with a larger stack in `src/layout/split_1.rs`.
+  scoped `spindrift-layout` thread with a larger stack in `src/layout/split_1.rs`.
 - PDF serialization is synchronous once a `Document` exists; only the final file
   write in `Html::write_pdf_async` uses `tokio::fs::write`.
 
@@ -60,7 +60,7 @@ flowchart TD
 
   JOIN --> REG["spawn_blocking: register loaded font faces"]
   REG --> PG["Resolve page direction and page counter seeds"]
-  PG --> LT["spawn scoped quire-layout thread"]
+  PG --> LT["spawn scoped spindrift-layout thread"]
   LT --> BX["Build formatting box tree"]
   BX --> FM["Resolve font-metric lengths"]
   FM --> FLOW["Flow page box content"]
@@ -163,7 +163,7 @@ Work that should probably remain serial or have a serial planning phase:
 
 ## Open Questions
 
-- Should Quire use Tokio tasks, scoped threads, or a CPU pool for CPU-bound PDF
+- Should Spindrift use Tokio tasks, scoped threads, or a CPU pool for CPU-bound PDF
   work? Tokio is already present for async I/O, but font subsetting and page
   stream generation are CPU work.
 - Can page content rendering be split into a pure pre-count pass and a render

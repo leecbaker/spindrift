@@ -47,7 +47,7 @@ pub(in crate::layout) fn box_sizing(value: BoxSizing) -> taffy_layout::BoxSizing
 /// Convert a resolved scalar Taffy size into a min/max constraint.
 ///
 /// Taffy 0.14 intentionally separates preferred `Dimension` values from
-/// min/max `LengthPercentageAuto` constraints.  Quire resolves intrinsic and
+/// min/max `LengthPercentageAuto` constraints.  Spindrift resolves intrinsic and
 /// mixed CSS sizing values before this boundary, so callers of this adapter
 /// may only pass a scalar length, percentage, or `auto` value.
 pub(in crate::layout) fn min_max_constraint(
@@ -67,7 +67,7 @@ pub(in crate::layout) fn min_max_constraint(
     }
 }
 
-/// Form Taffy 0.14's leaf-layout result from Quire's measured content-box
+/// Form Taffy 0.14's leaf-layout result from Spindrift's measured content-box
 /// geometry.  Taffy has no logical-writing-mode baseline channel, so callers
 /// pass a baseline only when it is a physical top-edge offset for horizontal
 /// text.
@@ -176,7 +176,7 @@ pub(in crate::layout) fn item_alignment(
             keyword: taffy_layout::AlignItemsKeyword::End,
             safety,
         },
-        // Taffy 0.13 resolves these against the item's direction.  Quire
+        // Taffy 0.13 resolves these against the item's direction.  Spindrift
         // retains its own vertical-writing and final-placement handling where
         // Taffy's horizontal-tb model cannot represent CSS writing modes.
         SelfAlignmentKeyword::SelfStart => taffy_layout::AlignItems {
@@ -241,10 +241,10 @@ pub(in crate::layout) fn gap<Source>(
     }
 }
 
-/// Resolve a gap at the Quire-to-Taffy scalar boundary.
+/// Resolve a gap at the Spindrift-to-Taffy scalar boundary.
 ///
 /// `gap` deliberately returns a Taffy length rather than forwarding a
-/// percentage.  The CSS percentage basis is a Quire-owned decision, so the
+/// percentage.  The CSS percentage basis is a Spindrift-owned decision, so the
 /// expanded value must consequently always be an absolute length here.
 pub(in crate::layout) fn resolved_gap<Source>(
     value: css::ComputedGap,
@@ -252,7 +252,7 @@ pub(in crate::layout) fn resolved_gap<Source>(
 ) -> f32 {
     match gap(value, percentage_basis).expand() {
         taffy::style::ExpandedLengthPercentage::Length(value) => value,
-        _ => unreachable!("Quire resolves a gap percentage before entering Taffy"),
+        _ => unreachable!("Spindrift resolves a gap percentage before entering Taffy"),
     }
 }
 

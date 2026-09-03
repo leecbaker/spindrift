@@ -5,7 +5,7 @@ current behavior rather than treating harness thresholds as renderer support.
 
 ## Current baseline
 
-On 2026-07-24, the local `quire-wpt` raw run of `css/CSS2/pagination/`
+On 2026-07-24, the local `spindrift-wpt` raw run of `css/CSS2/pagination/`
 rendered 43 reftests:
 
 - 42 passed;
@@ -15,18 +15,18 @@ The remaining raw mismatch, `row-page-break-inside-avoid-2-print.html`, is a
 legacy reference incompatibility rather than a renderer target. Its source
 table has no header row, but its assigned reference introduces a `<thead>`
 whose `page-break-after: always` creates different page content. The same
-case fails in all four configured engines. Quire deliberately preserves the
+case fails in all four configured engines. Spindrift deliberately preserves the
 source table's CSS Fragmentation behavior instead of adding a test-specific
 header/repetition exception; see `SPEC_DIVERGENCES.md`.
 
-On 2026-07-18, the local `quire-wpt` raw run of `css/css-page/` rendered 226
+On 2026-07-18, the local `spindrift-wpt` raw run of `css/css-page/` rendered 226
 reftests with the development binary and an equivalent author `@page` rule:
 
 - 175 passed;
 - 51 failed.
 
 The run artifacts are kept under
-`/private/tmp/quire-css-page-logical-page-basis/` for this working session.
+`/private/tmp/spindrift-css-page-logical-page-basis/` for this working session.
 This is three renderer matches above the preceding 172/226 baseline:
 `monolithic-overflow-012-print.html` now retains the final fragmented float
 slice, and `monolithic-overflow-013-print.html` now retains background-only
@@ -34,31 +34,31 @@ absolute-positioned fragments before its first text line.
 `margin-boxes/alignment-001-print.html` also now matches after the current
 margin-box alignment work.
 
-On 2026-07-30, an isolated fresh `quire-wpt` run exercised all fourteen CSS
+On 2026-07-30, an isolated fresh `spindrift-wpt` run exercised all fourteen CSS
 Page fixtures from the root-cause group with the release binary:
 
 - 14 passed;
 - 0 failed.
 
-The run artifacts are under `/private/tmp/quire-wpt-css-page-pictured-final/`
+The run artifacts are under `/private/tmp/spindrift-wpt-css-page-pictured-final/`
 for this working session. HTML presentational hints are now unconditional
 renderer behavior rather than a CLI option.
 
 The corresponding fresh full `css/css-page/` reftest run exercised 226
-non-script tests with the same isolated Quire configuration:
+non-script tests with the same isolated Spindrift configuration:
 
 - 116 passed;
 - 110 failed.
 
 This run is a fresh harness baseline, not directly comparable with the
 2026-07-18 multi-engine/development setup above. Its artifacts are under
-`/private/tmp/quire-wpt-css-page-full-final/` for this working session.
+`/private/tmp/spindrift-wpt-css-page-full-final/` for this working session.
 
-On 2026-08-04, fresh exact `quire-wpt evaluate-test` runs rendered
+On 2026-08-04, fresh exact `spindrift-wpt evaluate-test` runs rendered
 `fixedpos-001-print.html`, `fixedpos-002-print.html`, and
 `fixedpos-004-print.html` as raster-exact matches.
 
-On 2026-08-01, fresh exact `quire-wpt evaluate-test` runs rendered the six
+On 2026-08-01, fresh exact `spindrift-wpt evaluate-test` runs rendered the six
 CSS2 `page-break-inside: avoid` pagination fixtures as matches:
 `float-page-break-inside-avoid-3-print.html` and
 `rowgroup-page-break-inside-avoid-{1,2,3,4,5}-print.html`. The table cases
@@ -66,7 +66,7 @@ cover separated-border row-group fit decisions and repeated header/footer
 fragment chrome; broader cloned-decoration and complex nested-fragmentation
 limitations remain tracked in `SPEC_DIVERGENCES.md`.
 
-On 2026-08-03, fresh exact `quire-wpt evaluate-test` runs rendered
+On 2026-08-03, fresh exact `spindrift-wpt evaluate-test` runs rendered
 `monolithic-overflow-005-print.html` and `monolithic-overflow-006-print.html`
 as matches. Size-contained definite-height flex items now retain a single
 monolithic source canvas across page continuations, including the wrapped

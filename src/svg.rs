@@ -2,7 +2,7 @@
 //!
 //! SVG 2 defines an SVG element as a replaced element when embedded in HTML,
 //! while SVG user units use CSS pixels at the default 96 DPI. The parser keeps
-//! the normalized tree in SVG units; conversion to Quire paint points happens
+//! the normalized tree in SVG units; conversion to Spindrift paint points happens
 //! only when a replaced SVG is painted.
 
 use std::collections::{HashMap, VecDeque};
@@ -37,7 +37,7 @@ const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
-const SVG_IMAGE_ROOT_MARKER_ATTRIBUTE: &str = "data-quire-svg-root";
+const SVG_IMAGE_ROOT_MARKER_ATTRIBUTE: &str = "data-spindrift-svg-root";
 
 /// Resource-processing policy for SVG image documents.
 ///
@@ -423,7 +423,7 @@ impl SvgPresentationOverride {
     }
 }
 
-/// A transform selected by Quire's host-document cascade for an inline SVG
+/// A transform selected by Spindrift's host-document cascade for an inline SVG
 /// node. Scene-local values serialize into SVG user units; root SVG values
 /// are applied only to the enclosing CSS layout box.
 #[derive(Debug, Clone, Copy)]
@@ -443,7 +443,7 @@ pub(crate) enum SvgUsedTransform {
     Affine(SvgElementTransform),
 }
 
-/// A root `<svg>` transform projected into Quire's page-paint coordinate
+/// A root `<svg>` transform projected into Spindrift's page-paint coordinate
 /// system. Keeping this distinct from [`SvgElementTransform`] prevents a CSS
 /// box transform from being serialized into the SVG scene a second time.
 #[derive(Debug, Clone, Copy)]
@@ -485,7 +485,7 @@ impl SvgPresentationOverrides {
     }
 }
 
-/// A parsed inline SVG plus its intrinsic viewport size in Quire points.
+/// A parsed inline SVG plus its intrinsic viewport size in Spindrift points.
 #[derive(Debug, Clone)]
 pub(crate) struct SvgAsset {
     tree: usvg::Tree,
@@ -692,7 +692,7 @@ impl SvgAsset {
     /// The root SVG viewport in SVG user units.
     ///
     /// CSS image slicing operates on the concrete source viewport, whereas
-    /// [`Self::intrinsic_size`] is expressed in Quire points for layout.
+    /// [`Self::intrinsic_size`] is expressed in Spindrift points for layout.
     pub(crate) fn source_viewport_size(&self) -> SvgSourceSize {
         let size = self.tree.size();
         SvgSourceSize::new(size.width(), size.height())
@@ -1638,7 +1638,7 @@ fn collect_svg_group_with_options(
             usvg::Node::Text(text) => {
                 // Stock usvg owns SVG text layout and lowers it into its
                 // normal path/image scene. Keep that visual result separate
-                // from Quire's HTML text pipeline, but retain the normalized
+                // from Spindrift's HTML text pipeline, but retain the normalized
                 // source text for one accessible PDF ActualText span.
                 let flattened = collect_svg_group_with_options(
                     text.flattened(),
@@ -2164,7 +2164,7 @@ fn apply_svg_flood_in_source_alpha(data: &mut [u8], color: CssColor) {
 ///
 /// Both inputs must be same-sized premultiplied RGBA surfaces. Keeping this
 /// operation independent from SVG paths and text lets the future named-surface
-/// graph executor compose retained Quire-shaped text without another renderer.
+/// graph executor compose retained Spindrift-shaped text without another renderer.
 fn apply_svg_composite(
     input1: &[u8],
     input2: &[u8],
@@ -2888,7 +2888,7 @@ fn svg_flood_in_source_alpha(primitives: &[usvg::filter::Primitive]) -> Option<C
 ///
 /// This is an exact named-input graph, not a heuristic for arbitrary merge or
 /// composite nodes. Its output is identical to `feDropShadow`, so it reuses
-/// the same bounded Quire-shaped source surface and compositing operation.
+/// the same bounded Spindrift-shaped source surface and compositing operation.
 /// <https://www.w3.org/TR/filter-effects/#element-attrdef-fedropshadow-in>
 fn svg_blurred_flood_shadow_merge(
     primitives: &[usvg::filter::Primitive],
@@ -4486,7 +4486,7 @@ fn parse_svg_bytes_with_optional_image_context_and_filter_taint(
 /// `usvg` so its viewport path is not transformed through the root `viewBox`.
 ///
 /// SVG's root presentation attribute and inline style both establish a root
-/// viewport background. We retain only colors that Quire can resolve without
+/// viewport background. We retain only colors that Spindrift can resolve without
 /// a scene-local cascade (for example, not `currentColor`), leaving all other
 /// declarations untouched for `usvg`'s existing handling.
 /// <https://www.w3.org/TR/SVG2/styling.html#PresentationAttributes>
@@ -4578,7 +4578,7 @@ fn svg_attribute(name: &str, value: &str) -> String {
 /// Normalize the small CSS boundary between an image SVG and `usvg`.
 ///
 /// `usvg` deliberately uses SimpleCSS, which skips conditional rules and does
-/// not implement `:root`. Quire evaluates the image document's media queries
+/// not implement `:root`. Spindrift evaluates the image document's media queries
 /// before that handoff, then gives SimpleCSS an equivalent static stylesheet.
 /// The upstream limitation, including both `:root` and `@media`, is tracked
 /// at <https://github.com/linebender/resvg/issues/960>.
@@ -5633,7 +5633,7 @@ fn serialize_element(
             // other presentation declaration, so omit the source style.
             continue;
         } else if name == "transform" && transform_is_owned {
-            // Quire owns the selected cascade result. The source presentation
+            // Spindrift owns the selected cascade result. The source presentation
             // attribute must not enter `usvg`'s second cascade.
             emitted_transform = true;
             if let Some(transform) = resolved_transform.as_deref() {
@@ -5806,7 +5806,7 @@ fn svg_element_transform_attribute(transform: SvgElementTransform) -> String {
     )
 }
 
-/// Remove declarations whose used values Quire has already applied to the
+/// Remove declarations whose used values Spindrift has already applied to the
 /// serialized SVG transform attribute. Rebuilding only the declaration list
 /// is safe here: this is a private payload for `usvg`, not the source DOM.
 fn sanitize_inline_svg_presentation_style(

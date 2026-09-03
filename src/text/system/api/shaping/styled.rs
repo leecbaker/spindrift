@@ -481,7 +481,7 @@ impl FontSystem {
     /// CSS Fonts applies `@font-face unicode-range` during font matching, while
     /// CSS Text still requires one shaping context across join controls and
     /// cursive-script neighbors. Parley/fontique does not expose the descriptor
-    /// on registration, so Quire resolves range-limited named families before
+    /// on registration, so Spindrift resolves range-limited named families before
     /// shaping and passes the result back to Parley as styled ranges:
     /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>,
     /// <https://www.w3.org/TR/css-text-3/#text-processing-order>, and

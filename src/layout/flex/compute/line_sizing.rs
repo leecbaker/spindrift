@@ -185,7 +185,7 @@ pub(in crate::layout::flex) fn stretch_wrapped_flex_lines_to_container_cross_siz
 
 /// Pack final flex-line slots after every post-measurement size refinement.
 ///
-/// Taffy correctly packs the initial line boxes, but Quire subsequently
+/// Taffy correctly packs the initial line boxes, but Spindrift subsequently
 /// rebuilds their cross sizes from the Flexbox line-sizing inputs. That
 /// reconstruction deliberately makes adjacent slots so later stretch and
 /// fragmentation measurements have stable inputs. Repack those final slots

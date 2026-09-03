@@ -97,7 +97,7 @@ pub(in crate::layout::flex) fn taffy_self_alignment(
 /// CSS Box Alignment defines `self-start` and `self-end` from the alignment
 /// subject's writing mode, which Taffy's flex alignment model does not carry.
 /// Those values are given a start-side placeholder for sizing and line
-/// construction; Quire corrects their final cross-axis offsets after
+/// construction; Spindrift corrects their final cross-axis offsets after
 /// Taffy returns item geometry:
 /// <https://www.w3.org/TR/css-align-3/#self-position> and
 /// <https://www.w3.org/TR/css-flexbox-1/#align-items-property>.
@@ -200,7 +200,7 @@ pub(in crate::layout::flex) fn taffy_justify_content(
 /// top-to-bottom/bottom-to-top equivalent. A vertical-writing column flex
 /// container therefore needs a coordinate conversion when its inline axis is
 /// RTL. Taffy still forms and sizes the lines; this maps its top-origin cross
-/// coordinates to CSS's bottom-origin inline axis before Quire constructs line
+/// coordinates to CSS's bottom-origin inline axis before Spindrift constructs line
 /// metadata or performs any CSS Align placement.
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-direction-property>
 /// <https://www.w3.org/TR/css-writing-modes-4/#inline-flow>

@@ -6,7 +6,7 @@
         {
             "label": "signed release binary",
             "type": "shell",
-            "command": "cargo build --release && codesign --force  --sign - --timestamp=none --entitlements debug.entitlements target/release/quire"
+            "command": "cargo build --release && codesign --force  --sign - --timestamp=none --entitlements debug.entitlements target/release/spindrift"
         }
     ]
 }

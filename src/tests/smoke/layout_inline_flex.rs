@@ -19,7 +19,7 @@ async fn render_text_box_trim_case(
     target_extra: &str,
     child_extra: &str,
     body: &str,
-) -> quire::Document {
+) -> spindrift::Document {
     Html::from_string(format!(
         r#"<!DOCTYPE html>
 <meta charset="utf-8">
@@ -45,7 +45,7 @@ async fn render_text_box_trim_case(
     .unwrap()
 }
 
-fn bottom_lightgray_spacer_y(document: &quire::Document) -> f32 {
+fn bottom_lightgray_spacer_y(document: &spindrift::Document) -> f32 {
     document.pages[0]
         .rects()
         .iter()
@@ -55,7 +55,7 @@ fn bottom_lightgray_spacer_y(document: &quire::Document) -> f32 {
         .expect("bottom lightgray spacer should paint")
 }
 
-fn rendered_text_lines(document: &quire::Document) -> Vec<String> {
+fn rendered_text_lines(document: &spindrift::Document) -> Vec<String> {
     document.pages[0]
         .lines()
         .iter()
@@ -64,7 +64,7 @@ fn rendered_text_lines(document: &quire::Document) -> Vec<String> {
         .collect()
 }
 
-async fn render_inline_box_text_box_trim_case(span_extra: &str, body: &str) -> quire::Document {
+async fn render_inline_box_text_box_trim_case(span_extra: &str, body: &str) -> spindrift::Document {
     Html::from_string(format!(
         r#"<!DOCTYPE html>
 <meta charset="utf-8">
@@ -89,7 +89,7 @@ async fn render_inline_box_text_box_trim_case(span_extra: &str, body: &str) -> q
     .unwrap()
 }
 
-async fn render_inline_box_text_box_trim_layout_case(span_extra: &str) -> quire::Document {
+async fn render_inline_box_text_box_trim_layout_case(span_extra: &str) -> spindrift::Document {
     Html::from_string(format!(
         r#"<!DOCTYPE html>
 <meta charset="utf-8">
@@ -119,7 +119,7 @@ async fn render_inline_box_text_box_trim_layout_case(span_extra: &str) -> quire:
 async fn render_vertical_inline_box_text_box_trim_case(
     span_extra: &str,
     body: &str,
-) -> quire::Document {
+) -> spindrift::Document {
     Html::from_string(format!(
         r#"<!DOCTYPE html>
 <meta charset="utf-8">
@@ -145,7 +145,7 @@ async fn render_vertical_inline_box_text_box_trim_case(
     .unwrap()
 }
 
-fn inline_trim_background_rect(document: &quire::Document) -> (f32, f32, f32, f32) {
+fn inline_trim_background_rect(document: &spindrift::Document) -> (f32, f32, f32, f32) {
     let rect = document.pages[0]
         .rects()
         .iter()
@@ -154,7 +154,7 @@ fn inline_trim_background_rect(document: &quire::Document) -> (f32, f32, f32, f3
     (rect.x(), rect.y(), rect.width(), rect.height())
 }
 
-fn inline_trim_background_rects(document: &quire::Document) -> Vec<(f32, f32, f32, f32)> {
+fn inline_trim_background_rects(document: &spindrift::Document) -> Vec<(f32, f32, f32, f32)> {
     document.pages[0]
         .rects()
         .iter()
@@ -163,7 +163,7 @@ fn inline_trim_background_rects(document: &quire::Document) -> Vec<(f32, f32, f3
         .collect()
 }
 
-fn inline_trim_decoration_rect(document: &quire::Document) -> (f32, f32, f32, f32) {
+fn inline_trim_decoration_rect(document: &spindrift::Document) -> (f32, f32, f32, f32) {
     let rect = document.pages[0]
         .rects()
         .iter()
@@ -175,7 +175,7 @@ fn inline_trim_decoration_rect(document: &quire::Document) -> (f32, f32, f32, f3
 async fn render_inline_decoration_break_case(
     box_decoration_break: &str,
     content: &str,
-) -> quire::Document {
+) -> spindrift::Document {
     Html::from_string(format!(
         r#"<!DOCTYPE html>
 <style>
@@ -204,7 +204,7 @@ async fn render_inline_decoration_break_case(
 }
 
 fn inline_decoration_rects(
-    document: &quire::Document,
+    document: &spindrift::Document,
     color: CssColor,
 ) -> Vec<(f32, f32, f32, f32)> {
     document.pages[0]
@@ -241,7 +241,7 @@ async fn inline_box_decoration_clone_repeats_edges_across_forced_and_soft_breaks
             .nth(1)
             .expect("second formatted line should paint");
         let red_text_left = first_visible_glyph_x(red_line);
-        let continuation_has_left_border = |document: &quire::Document| {
+        let continuation_has_left_border = |document: &spindrift::Document| {
             inline_decoration_rects(document, red)
                 .iter()
                 .any(|(x, _, width, _)| {
@@ -426,7 +426,7 @@ async fn text_box_trim_start_does_not_skip_padded_first_child() {
     let untrimmed = render_text_box_trim_case("", "margin: 0", body).await;
     let trimmed = render_text_box_trim_case("text-box-trim: trim-start;", "margin: 0", body).await;
 
-    let line_y = |document: &quire::Document, text: &str| {
+    let line_y = |document: &spindrift::Document, text: &str| {
         document.pages[0]
             .lines()
             .iter()
@@ -732,7 +732,7 @@ async fn text_box_trim_end_fits_direct_inline_multicol_columns() {
         ["AAAA", "BBBB", "CCCC", "DDDD"]
     );
 
-    let column_index = |document: &quire::Document, text: &str| {
+    let column_index = |document: &spindrift::Document, text: &str| {
         let line = document.pages[0]
             .lines()
             .iter()
@@ -781,7 +781,7 @@ async fn text_box_trim_end_fits_normalized_inline_multicol_columns() {
         ["AAAA", "BBBB", "CCCC", "DDDD"]
     );
 
-    let column_index = |document: &quire::Document, text: &str| {
+    let column_index = |document: &spindrift::Document, text: &str| {
         let line = document.pages[0]
             .lines()
             .iter()
@@ -913,7 +913,7 @@ async fn text_box_trim_start_applies_per_block_child_multicol_column() {
         .await
         .unwrap();
 
-    let line_y = |document: &quire::Document, text: &str| {
+    let line_y = |document: &spindrift::Document, text: &str| {
         document.pages[0]
             .lines()
             .iter()
@@ -964,7 +964,7 @@ async fn text_box_trim_start_applies_per_multicol_column() {
         .await
         .unwrap();
 
-    let line_y = |document: &quire::Document, text: &str| {
+    let line_y = |document: &spindrift::Document, text: &str| {
         document.pages[0]
             .lines()
             .iter()
@@ -1015,7 +1015,7 @@ async fn text_box_trim_start_multicol_does_not_skip_padded_first_column_items() 
         .await
         .unwrap();
 
-    let line_y = |document: &quire::Document, text: &str| {
+    let line_y = |document: &spindrift::Document, text: &str| {
         document.pages[0]
             .lines()
             .iter()
@@ -1106,7 +1106,7 @@ async fn text_box_trim_end_clones_per_page_fragment() {
         .await
         .unwrap();
 
-    let page_texts = |document: &quire::Document| {
+    let page_texts = |document: &spindrift::Document| {
         document
             .pages
             .iter()
@@ -1154,7 +1154,7 @@ async fn text_box_trim_start_clones_paint_origin_per_page_fragment() {
         .await
         .unwrap();
 
-    let first_line_y = |document: &quire::Document, page_index: usize| {
+    let first_line_y = |document: &spindrift::Document, page_index: usize| {
         document.pages[page_index]
             .lines()
             .iter()
@@ -3057,7 +3057,7 @@ async fn document_canvas_top_inset_is_invariant_to_anonymous_grid_item_splitting
     .await
     .unwrap();
 
-    let line_positions = |document: &quire::Document| {
+    let line_positions = |document: &spindrift::Document| {
         document.pages[0]
             .lines()
             .iter()
@@ -9968,7 +9968,7 @@ async fn paginates_wpt_flex_reference_float_prefix_without_looping() {
 
 #[tokio::test]
 async fn local_wpt_flex_intrinsic_reference_floats_finish_if_available() {
-    let wpt_root = std::path::Path::new("../quire-wpt/third_party/wpt");
+    let wpt_root = std::path::Path::new("../spindrift-wpt/third_party/wpt");
     if !wpt_root.exists() {
         return;
     }
@@ -11930,7 +11930,7 @@ async fn order_with_row_reverse_matches_right_floated_reference() {
     .await
     .unwrap();
 
-    let line_positions = |document: &quire::Document| {
+    let line_positions = |document: &spindrift::Document| {
         ["First,", "Second,", "Third"]
             .into_iter()
             .map(|text| {
@@ -13922,7 +13922,7 @@ async fn block_outline_paints_after_child_content() {
     );
 }
 
-/// Quire's CSS-UI-permitted compatibility policy paints an ordinary in-flow
+/// Spindrift's CSS-UI-permitted compatibility policy paints an ordinary in-flow
 /// outline before an auto/zero-z positioned sibling, regardless of whether
 /// the in-flow formatting context is block, Grid, Flex, or a table.
 #[tokio::test]
@@ -14121,7 +14121,7 @@ async fn bfc_root_separates_adjoining_float_replay_when_it_cannot_fit() {
     );
 }
 
-fn colored_rect_width(document: &quire::Document, color: CssColor) -> f32 {
+fn colored_rect_width(document: &spindrift::Document, color: CssColor) -> f32 {
     document.pages[0]
         .rects()
         .iter()

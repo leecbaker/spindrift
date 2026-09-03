@@ -1266,7 +1266,7 @@ pub(crate) enum PaintBand {
     TableCollapsedBorder,
     Float,
     Inline,
-    /// Quire's compatibility outline phase for ordinary in-flow boxes.
+    /// Spindrift's compatibility outline phase for ordinary in-flow boxes.
     ///
     /// CSS UI deliberately leaves outline stacking implementation-defined.
     /// Keeping in-flow outlines before auto/zero-z positioned descendants
@@ -1954,7 +1954,7 @@ fn monolithic_block_start_is_in_slice(bounds: PaintClip, slice: PaintClip) -> bo
 ///
 /// CSS painting order is a tree of stacking contexts, not just a page-wide
 /// sequence. CSS 2.2 Appendix E defines the recursive stacking order, and CSS
-/// Positioned Layout defines positioned boxes with stack levels. Quire
+/// Positioned Layout defines positioned boxes with stack levels. Spindrift
 /// stores that recursive structure in captured fragments, then flattens it to
 /// PDF drawing operators because PDF content streams paint sequentially
 /// (ISO 32000-1:2008, §8.2).

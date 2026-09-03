@@ -206,7 +206,7 @@ pub(crate) struct StyledTextSpan<'a> {
     pub(crate) style: &'a ComputedStyle,
 }
 
-/// Block-axis extents around a text baseline in Quire layout units.
+/// Block-axis extents around a text baseline in Spindrift layout units.
 ///
 /// OpenType stores ascenders and descenders in font design units, while CSS
 /// inline layout consumes scaled lengths above and below a shared baseline.

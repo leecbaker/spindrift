@@ -1,6 +1,6 @@
 # CSS Overflow line-clamp parity
 
-Quire resolves legacy `-webkit-line-clamp` only after the cascade has selected
+Spindrift resolves legacy `-webkit-line-clamp` only after the cascade has selected
 the final display, orientation, and clamp declaration. A legacy clamp is
 active only for specified `-webkit-box` or `-webkit-inline-box` with
 `-webkit-box-orient: vertical`; its used layout display is a flow-root while
@@ -37,7 +37,7 @@ page-paint records share that continuation only within their logical source
 run, so visually adjacent independent CSS boxes retain their display-list
 identity and paint behavior.
 
-The following focused static WPTs pass with the current debug Quire binary:
+The following focused static WPTs pass with the current debug Spindrift binary:
 
 - `webkit-line-clamp-001.html`
 - `webkit-line-clamp-002.html`
@@ -65,15 +65,15 @@ trailing inline source after a block sibling; this makes
 The sweep remains below the 90% target because it still lacks replay of an
 earlier source endpoint after a later fixed-size or nested block proves not to
 fit. Script-driven mutation fixtures (017–023, 026, 048, and `dynamic-001`)
-are intentionally excluded: Quire does not implement JavaScript or CSSOM
+are intentionally excluded: Spindrift does not implement JavaScript or CSSOM
 mutation.
 
-Quire cascades `max-lines`, inherited `block-ellipsis`, and `continue`
+Spindrift cascades `max-lines`, inherited `block-ellipsis`, and `continue`
 independently. The line-clamp shorthands expand into those longhands, and a
 non-zero/exhausted layout budget prevents a zero available-line state. A
 positive `max-lines` value also supplies the cutoff for `continue: discard`.
 
-For a direct inline formatting context, Quire selects an automatic cutoff from
+For a direct inline formatting context, Spindrift selects an automatic cutoff from
 measured line-box block advances when a finite absolute, line-height-relative,
 or definite containing-block percentage used block-size constraint overflows.
 An absolute or line-height-relative constraint is also propagated as a typed

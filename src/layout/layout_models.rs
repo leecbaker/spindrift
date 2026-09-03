@@ -1003,7 +1003,7 @@ pub(in crate::layout) struct ListMarker {
 /// The physical line geometry used to place an outside list marker.
 ///
 /// CSS Lists intentionally leaves the exact outside-marker position
-/// undefined.  Quire follows interoperable line-box behavior: textual
+/// undefined.  Spindrift follows interoperable line-box behavior: textual
 /// markers align their alphabetic baseline with the first in-flow formatted
 /// line, while image markers use that line's block-start edge.
 /// <https://drafts.csswg.org/css-lists-3/#list-style-position-property>

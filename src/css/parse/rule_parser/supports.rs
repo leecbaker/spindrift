@@ -12,12 +12,12 @@ use super::*;
 /// rather than letting unsupported blocks leak into the cascade:
 /// <https://www.w3.org/TR/css-conditional-3/#at-supports>.
 pub(crate) fn supports_condition_applies(prelude: &str) -> bool {
-    supports_condition_applies_with_selector_parser(prelude, &QuireSelectorParser::default())
+    supports_condition_applies_with_selector_parser(prelude, &SpindriftSelectorParser::default())
 }
 
 pub(in crate::css) fn supports_condition_applies_with_selector_parser(
     prelude: &str,
-    selector_parser: &QuireSelectorParser,
+    selector_parser: &SpindriftSelectorParser,
 ) -> bool {
     parse_supports_condition(prelude, selector_parser).is_some_and(|condition| condition.applies())
 }
@@ -48,14 +48,14 @@ impl SupportsCondition {
 
 fn parse_supports_condition(
     prelude: &str,
-    selector_parser: &QuireSelectorParser,
+    selector_parser: &SpindriftSelectorParser,
 ) -> Option<SupportsCondition> {
     parse_supports_condition_component(prelude.trim(), selector_parser)
 }
 
 fn parse_supports_condition_component(
     value: &str,
-    selector_parser: &QuireSelectorParser,
+    selector_parser: &SpindriftSelectorParser,
 ) -> Option<SupportsCondition> {
     let value = value.trim();
     if value.is_empty() {
@@ -91,7 +91,7 @@ fn parse_supports_condition_component(
 
 fn parse_supports_in_parens(
     value: &str,
-    selector_parser: &QuireSelectorParser,
+    selector_parser: &SpindriftSelectorParser,
 ) -> Option<SupportsCondition> {
     let value = value.trim();
     if supports_condition_mixes_logical_keywords(value) {
@@ -123,7 +123,7 @@ fn parse_supports_in_parens(
 /// <https://www.w3.org/TR/css-conditional-3/#at-supports>
 fn parse_supports_logical_condition(
     value: &str,
-    selector_parser: &QuireSelectorParser,
+    selector_parser: &SpindriftSelectorParser,
 ) -> Option<SupportsCondition> {
     let and_parts = split_supports_logical_keyword(value, "and");
     let or_parts = split_supports_logical_keyword(value, "or");
@@ -220,7 +220,7 @@ enum SelectorFeature {
 /// <https://drafts.csswg.org/css-nesting-1/#nest-selector>
 fn parse_selector_feature(
     condition: &str,
-    selector_parser: &QuireSelectorParser,
+    selector_parser: &SpindriftSelectorParser,
 ) -> SelectorFeature {
     let mut input = ParserInput::new(condition);
     let mut parser = Parser::new(&mut input);
@@ -251,12 +251,12 @@ fn parse_selector_feature(
 
 /// Check selector support through the same pseudo-element routing boundary
 /// used for ordinary style rules. Nested generated marker selectors are not
-/// representable by the underlying Selectors parser alone, but Quire accepts
+/// representable by the underlying Selectors parser alone, but Spindrift accepts
 /// and routes them as `::before`/`::after` marker rules.
 /// <https://drafts.csswg.org/css-conditional-4/#typedef-supports-selector-fn>
 fn selector_is_supported_for_feature_query(
     selector: &str,
-    selector_parser: &QuireSelectorParser,
+    selector_parser: &SpindriftSelectorParser,
 ) -> bool {
     if parse_scope_selector(selector, selector_parser)
         .is_some_and(|selector| selector.slice().len() == 1)

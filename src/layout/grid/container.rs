@@ -11,7 +11,7 @@ use crate::layout::block::{DefiniteBlockBreakContext, should_prebreak_definite_b
 use crate::units::content_box_to_margin_box_length;
 
 /// Resolve the pre-layout scrollport reservation shared by Grid's intrinsic,
-/// final sizing, and overflow-clip phases. Quire's static PDF UA uses overlay
+/// final sizing, and overflow-clip phases. Spindrift's static PDF UA uses overlay
 /// scrollbars, so no native scrollbar chrome consumes Grid track space.
 /// <https://drafts.csswg.org/css-overflow-3/#scrollbars-layout>
 fn grid_scrollbar_reservation(_: &ComputedStyle) -> ScrollbarGutterReservation {

@@ -4,7 +4,7 @@
 
 The complete `css/selectors/has-style-sharing-*` and
 `has-style-sharing-pseudo-*` reftest families pass (15/15, 2026-07-29).
-Although the tests are named for browser style-sharing optimizations, Quire
+Although the tests are named for browser style-sharing optimizations, Spindrift
 cascades each element independently. Their relevant requirement is that every
 reconstructed selector element preserves its source-DOM child snapshot and
 that relational traversal extends the matched ancestor's path, rather than the
@@ -36,7 +36,7 @@ conversion are tracked in `SPEC_DIVERGENCES.md`.
 - Shadow/tree-scoped selectors and unmodeled UI/highlight pseudo-elements are
   not implemented.
 - XML namespace selector edge cases still need broader conformance auditing.
-- Dynamic form and display state remain limited by Quire's static rendering
+- Dynamic form and display state remain limited by Spindrift's static rendering
   model.
 
 ## Specifications

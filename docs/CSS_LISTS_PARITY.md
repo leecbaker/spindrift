@@ -1,8 +1,8 @@
 # CSS Lists and Counters Parity
 
-Quire currently passes **138 of 145 (95.2%)** runnable
+Spindrift currently passes **138 of 145 (95.2%)** runnable
 `css/css-lists/` WPT reftests. The current result bundle is
-`../quire-wpt/results/css-lists-counter-final-26/engine-results.json`.
+`../spindrift-wpt/results/css-lists-counter-final-26/engine-results.json`.
 
 ## Implemented counter model
 

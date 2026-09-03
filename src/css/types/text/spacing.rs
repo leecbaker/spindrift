@@ -28,7 +28,7 @@ pub(crate) enum TextSpacingTrim {
 }
 
 impl TextSpacingTrim {
-    /// Quire's deterministic user-agent policy for the spec-defined `auto`
+    /// Spindrift's deterministic user-agent policy for the spec-defined `auto`
     /// value. `normal` is conservative and preserves the initial-value
     /// behavior while avoiding platform-dependent PDF output.
     pub(crate) const fn resolved(self) -> Self {

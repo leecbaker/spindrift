@@ -94,7 +94,7 @@ pub(crate) struct Element {
 
 /// The static renderer's selected representation for an HTML `<object>`.
 ///
-/// A live browser can change this as a resource loads. Quire resolves the
+/// A live browser can change this as a resource loads. Spindrift resolves the
 /// available state once before paged layout, selecting fallback whenever it
 /// cannot represent the resource as a supported static image.
 /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
@@ -109,7 +109,7 @@ pub(crate) enum ObjectRendering {
 
 /// The static renderer's selected representation for an HTML `<img>`.
 ///
-/// A live browser can transition through loading and failure states. Quire
+/// A live browser can transition through loading and failure states. Spindrift
 /// performs one deterministic paged layout, so it selects the decoded image,
 /// its alternative text fallback, or an empty fallback once visual resources
 /// have been preloaded.
@@ -292,10 +292,10 @@ impl Node {
     }
 }
 
-/// Select the fixed-resolution source used by Quire for an HTML `<img>`.
+/// Select the fixed-resolution source used by Spindrift for an HTML `<img>`.
 ///
 /// The paged renderer has a fixed 1dppx output resolution. Density candidates
-/// follow Quire's fixed-resolution selection policy and preserve source order
+/// follow Spindrift's fixed-resolution selection policy and preserve source order
 /// for equal densities.
 /// <https://html.spec.whatwg.org/multipage/images.html#attr-img-srcset>
 /// <https://drafts.csswg.org/css-images-4/#image-set-resolution>
@@ -510,7 +510,7 @@ pub(crate) fn parse_with_syntax(source: &str, syntax: DocumentSyntax) -> crate::
 }
 
 fn parse_html(source: &str) -> Node {
-    // Quire is a static renderer and never runs document scripts. Select the
+    // Spindrift is a static renderer and never runs document scripts. Select the
     // corresponding HTML parser mode so `<noscript>` fallback markup is built
     // as DOM content instead of being retained as raw text.
     // https://html.spec.whatwg.org/multipage/scripting.html#the-noscript-element
@@ -532,7 +532,7 @@ fn parse_html(source: &str) -> Node {
 fn parse_xml(source: &str) -> crate::Result<Node> {
     // xml5ever currently stops building the document after an external DTD
     // declaration.  XHTML reftests commonly carry the XHTML 1.0 external DTD,
-    // although Quire deliberately does not fetch document-external entities.
+    // although Spindrift deliberately does not fetch document-external entities.
     // Drop that declaration before parsing so the XML tree (and its XHTML
     // namespace/case information) remains available to CSS and layout.
     let source = without_xml_doctype(source);

@@ -1454,7 +1454,7 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y =
             containing_block.top_y() - positioned_y.start.points() - positioned_margin_top;
         log::trace!(
-            target: "quire::layout::static_position",
+            target: "spindrift::layout::static_position",
             "checkpoint=resolved-box element={:?} css2_horizontal_direction={:?} text_indent={:.2} positioned=(x_start:{:.2},x_margin:{:.2},y_start:{:.2},y_margin:{:.2},content_width:{:.2},content_height:{:.2}) page_border_box=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
             element.id,
             containing_horizontal_direction,
@@ -1751,7 +1751,7 @@ impl<'a> LayoutBuilder<'a> {
         self.content_right = positioned_flow_origin.content_right;
         self.cursor_y = positioned_flow_origin.cursor_y;
         log::trace!(
-            target: "quire::layout::static_position",
+            target: "spindrift::layout::static_position",
             "checkpoint=positioned-flow-origin element={:?} content=(x:{:.2},top:{:.2},bottom:{:.2},width:{:.2},height:{:.2}) axes=({:?},{:?}) inline_start={:?} cursor_y={:.2}",
             element.id,
             self.content_left,
@@ -1796,7 +1796,7 @@ impl<'a> LayoutBuilder<'a> {
         );
         self.fragmentainer_override = previous_fragmentainer_override;
         log::trace!(
-            target: "quire::layout::static_position",
+            target: "spindrift::layout::static_position",
             "checkpoint=positioned-flow-outcome element={:?} block_outcome={:?}",
             element.id,
             self.last_block_layout_outcome,

@@ -533,7 +533,7 @@ impl<'a> LayoutBuilder<'a> {
         };
         let available_width = self.current_content_logical_inline_size().max(1.0);
         log::trace!(
-            target: "quire::layout::inline_static_verbose",
+            target: "spindrift::layout::inline_static_verbose",
             "checkpoint=placeholder element={:?} source=inline deferred_index={} prior_items={} available_logical_inline={:.2} static_axes=({:?},{:?}) page=(left:{:.2},top:{:.2},right:{:.2})",
             element.id,
             static_position_index,
@@ -598,7 +598,7 @@ impl<'a> LayoutBuilder<'a> {
         });
         let static_area = capture.rectangle.area;
         log::trace!(
-            target: "quire::layout::inline_static_verbose",
+            target: "spindrift::layout::inline_static_verbose",
             "checkpoint=capture element={:?} source=inline deferred_index={:?} output_items={} axes=({:?},{:?}) rect=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
             element.id,
             static_position_index,
@@ -949,7 +949,7 @@ impl<'a> LayoutBuilder<'a> {
                             );
                             if is_static_placeholder {
                                 log::trace!(
-                                    target: "quire::layout::inline_static_verbose",
+                                    target: "spindrift::layout::inline_static_verbose",
                                     "checkpoint=prepared-line element={:?} source=inline cursor_y={:.2} line=(width:{:.2},height:{:.2},baseline_offset:{:.2}) atom_axes=({:?},{:?}) block_axes=({:?},{:?}) atom_border=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) logical_inline_start=(x:{:.2},y:{:.2}) prepared_baseline_y={:.2}",
                                     element.id,
                                     self.cursor_y,

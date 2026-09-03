@@ -300,7 +300,7 @@ than text shaping alone.
 
 - Fragmented orthogonal available-size negotiation still needs a full audit
   across nested scroll containers and page/column continuations.
-- Fragmented orthogonal flows still inherit Quire's cursor-oriented pagination
+- Fragmented orthogonal flows still inherit Spindrift's cursor-oriented pagination
   limits; available block-size negotiation is not yet represented as durable
   fragment objects.
 - Orthogonal available-size coverage for grid, table-cell, absolutely

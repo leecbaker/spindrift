@@ -1,6 +1,6 @@
 # CSS Gaps Parity
 
-This document tracks Quire's CSS Gaps Level 1 support for gap decorations. The
+This document tracks Spindrift's CSS Gaps Level 1 support for gap decorations. The
 normative reference is CSS Gaps Level 1, with layout geometry supplied by CSS
 Flexible Box Layout, CSS Grid Layout, CSS Multi-column Layout, and CSS Box
 Alignment.

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use ::selectors::parser::SelectorList;
 
-use super::selector::QuireSelectorImpl;
+use super::selector::SpindriftSelectorImpl;
 use super::values::CSS_PX_TO_PT;
 pub(crate) use crate::units::{
     LayoutLength, PercentageBasis, SemanticLengthExt, layout_points, layout_pt,

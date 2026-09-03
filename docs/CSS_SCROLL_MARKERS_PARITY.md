@@ -1,6 +1,6 @@
 # CSS Scroll Markers parity
 
-This document tracks Quire's static implementation of the current CSS Overflow
+This document tracks Spindrift's static implementation of the current CSS Overflow
 Level 5 scroll-marker draft. The relevant source is
 <https://drafts.csswg.org/css-overflow-5/#scroll-markers>; the draft is not a
 stable Recommendation, so implementation is deliberately pinned to that

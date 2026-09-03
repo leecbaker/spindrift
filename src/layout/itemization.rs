@@ -171,7 +171,7 @@ fn formatting_box_is_contents_generated_pseudo(box_: &box_tree::FormattingBox<'_
 /// Build the style used when a flex/grid item lays out ordinary flow contents.
 ///
 /// Flex and grid items establish independent formatting contexts. For ordinary
-/// flow children, Quire models that by changing the item inner display to
+/// flow children, Spindrift models that by changing the item inner display to
 /// `flow-root`, which keeps descendant margins and floats contained by the item:
 /// <https://www.w3.org/TR/css-display-3/#independent-formatting-context>.
 pub(in crate::layout) fn independent_formatting_context_item_style(

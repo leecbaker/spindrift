@@ -8,7 +8,7 @@ before HTML `<br>` handling. Host-CSS `display` also crosses into the supported
 inline-SVG scene subset, and `math` parses as the required non-MathML `flow`
 fallback.
 
-Fresh `quire-wpt evaluate-test` runs pass these ten screenshot paths:
+Fresh `spindrift-wpt evaluate-test` runs pass these ten screenshot paths:
 
 - `display-contents-before-after-002.html`
 - `display-contents-before-after-003.html`

@@ -37,7 +37,7 @@ pub(crate) enum CssTextScalar {
 pub(crate) struct VisibleControlCharacter(pub(super) char);
 
 impl VisibleControlCharacter {
-    /// The portable visible symbol Quire shapes for a control character.
+    /// The portable visible symbol Spindrift shapes for a control character.
     ///
     /// U+25A0 BLACK SQUARE is an `So` / Common character, matching CSS Text's
     /// required text-processing class without relying on a font-specific

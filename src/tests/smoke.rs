@@ -1,6 +1,6 @@
 use base64::Engine as _;
 
-use crate as quire;
+use crate as spindrift;
 use crate::{BookmarkState, Css, CssColor, Document, Html, PdfOptions, RenderOptions};
 
 trait PdfBytesForTest {
@@ -175,7 +175,7 @@ async fn iframe_legacy_body_margins_match_equivalent_child_css() {
 }
 
 fn line_font<'a>(
-    document: &'a quire::Document,
+    document: &'a spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
 ) -> &'a crate::document::DocumentFont {
     let font_id = line
@@ -194,7 +194,7 @@ fn font_label_contains_any(font: &crate::document::DocumentFont, needles: &[&str
 }
 
 fn line_font_contains_any(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
     needles: &[&str],
 ) -> bool {
@@ -202,7 +202,7 @@ fn line_font_contains_any(
 }
 
 fn line_font_is_italic(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
 ) -> bool {
     let font = line_font(document, line);
@@ -210,14 +210,14 @@ fn line_font_is_italic(
 }
 
 fn line_font_is_bold(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
 ) -> bool {
     font_label_contains_any(line_font(document, line), &["bold", "black", "heavy"])
 }
 
 fn line_run_font_is_italic(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
     text: &str,
 ) -> bool {
@@ -233,7 +233,7 @@ fn line_run_font_is_italic(
 }
 
 fn line_run_font_is_bold(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
     text: &str,
 ) -> bool {
@@ -247,7 +247,7 @@ fn line_run_font_is_bold(
 }
 
 fn line_font_is_monospace(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
 ) -> bool {
     let font = line_font(document, line);
@@ -269,7 +269,7 @@ fn line_font_is_monospace(
     narrow == wide
 }
 
-fn horizontal_table_border_widths(document: &quire::Document) -> Vec<f32> {
+fn horizontal_table_border_widths(document: &spindrift::Document) -> Vec<f32> {
     document.pages[0]
         .rects()
         .iter()
@@ -281,7 +281,7 @@ fn horizontal_table_border_widths(document: &quire::Document) -> Vec<f32> {
         .collect()
 }
 
-fn vertical_table_border_heights(document: &quire::Document) -> Vec<f32> {
+fn vertical_table_border_heights(document: &spindrift::Document) -> Vec<f32> {
     document.pages[0]
         .rects()
         .iter()
@@ -292,7 +292,7 @@ fn vertical_table_border_heights(document: &quire::Document) -> Vec<f32> {
         .collect()
 }
 
-fn first_rect_paint_operation_index(page: &quire::Page, color: CssColor) -> usize {
+fn first_rect_paint_operation_index(page: &spindrift::Page, color: CssColor) -> usize {
     page.paint_operations()
         .iter()
         .position(|operation| {
@@ -305,7 +305,7 @@ fn first_rect_paint_operation_index(page: &quire::Page, color: CssColor) -> usiz
         .expect("rect with expected fill should be present in paint operations")
 }
 
-fn final_rect_fill_at(page: &quire::Page, x: f32, y: f32) -> Option<CssColor> {
+fn final_rect_fill_at(page: &spindrift::Page, x: f32, y: f32) -> Option<CssColor> {
     page.paint_operations()
         .iter()
         .filter_map(|operation| {
@@ -325,7 +325,7 @@ fn final_rect_fill_at(page: &quire::Page, x: f32, y: f32) -> Option<CssColor> {
 
 /// Return PDF syntax together with decoded textual streams for assertions.
 ///
-/// PDF streams may use `/FlateDecode` (ISO 32000-1:2008, 7.4.4). Quire emits
+/// PDF streams may use `/FlateDecode` (ISO 32000-1:2008, 7.4.4). Spindrift emits
 /// direct numeric `/Length` entries, so the test harness can decode its own
 /// streams without coupling operator assertions to uncompressed output.
 fn pdf_searchable_text(pdf: &[u8]) -> String {
@@ -417,7 +417,7 @@ fn rendered_line_advance(line: &crate::document::paint::text::RenderedLine) -> f
 }
 
 fn rendered_line_baseline_y_for_top(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
     top_y: f32,
 ) -> f32 {
@@ -434,7 +434,7 @@ fn rendered_line_baseline_y_for_top(
 }
 
 fn rendered_line_baseline_top(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
 ) -> f32 {
     let adjustment = line
@@ -450,7 +450,7 @@ fn rendered_line_baseline_top(
 }
 
 fn assert_line_baseline_at_top(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
     top_y: f32,
 ) {

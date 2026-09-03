@@ -53,7 +53,7 @@ pub(in crate::layout::flex) fn apply_main_axis_automatic_minimums(
 /// CSS Sizing floors the content box at zero, including stretch-fit sizing
 /// where a small target margin box can be smaller than the item's padding and
 /// border. Taffy may report a zero final border-box cross size for these cases,
-/// so Quire restores the minimum border-box size before painting/replay:
+/// so Spindrift restores the minimum border-box size before painting/replay:
 /// <https://drafts.csswg.org/css-sizing-4/#stretch-fit-sizing> and
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-stretch>.
 pub(in crate::layout::flex) fn apply_non_negative_flex_item_content_box_minimums(

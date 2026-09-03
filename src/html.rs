@@ -13,7 +13,7 @@ use crate::{
 
 /// Input markup syntax used for document parsing.
 ///
-/// Quire defaults to automatic syntax selection: HTML parsing unless the
+/// Spindrift defaults to automatic syntax selection: HTML parsing unless the
 /// source begins with an XML declaration or its URL names an XML/XHTML
 /// document. This follows HTML's distinction between `text/html` parsing and
 /// XML/XHTML parsing:
@@ -21,10 +21,10 @@ use crate::{
 /// and <https://www.w3.org/TR/xml/#NT-XMLDecl>.
 ///
 /// ```no_run
-/// use quire::{Html, InputSyntax, PdfOptions, RenderOptions};
+/// use spindrift::{Html, InputSyntax, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render_xhtml() -> quire::Result<()> {
+/// # async fn render_xhtml() -> spindrift::Result<()> {
 /// let html = Html::from_file("document.xhtml")
 ///     .await?
 ///     .with_input_syntax(InputSyntax::Xml);
@@ -53,10 +53,10 @@ pub enum InputSyntax {
 /// An HTML or XML source document and its rendering configuration.
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, RenderOptions};
+/// use spindrift::{Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let html = Html::from_file("document.html").await?;
 /// let mut output = File::create("document.pdf")?;
 /// html.write_pdf(
@@ -93,7 +93,7 @@ impl Html {
     /// Creates a document from markup source, inferring its input syntax.
     ///
     /// ```
-    /// let document = quire::Html::from_string("<p>Hello</p>");
+    /// let document = spindrift::Html::from_string("<p>Hello</p>");
     /// ```
     pub fn from_string(source: impl Into<String>) -> Self {
         Self {
@@ -113,7 +113,7 @@ impl Html {
     /// Creates an XML/XHTML document from markup source.
     ///
     /// ```
-    /// let document = quire::Html::from_xml_string("<page><p>Hello</p></page>");
+    /// let document = spindrift::Html::from_xml_string("<page><p>Hello</p></page>");
     /// ```
     pub fn from_xml_string(source: impl Into<String>) -> Self {
         Self::from_string(source).with_input_syntax(InputSyntax::Xml)
@@ -122,8 +122,8 @@ impl Html {
     /// Asynchronously loads a document from a local file, inferring its input syntax.
     ///
     /// ```no_run
-    /// # async fn load() -> quire::Result<()> {
-    /// let document = quire::Html::from_file("document.html").await?;
+    /// # async fn load() -> spindrift::Result<()> {
+    /// let document = spindrift::Html::from_file("document.html").await?;
     /// # let _ = document;
     /// # Ok(())
     /// # }
@@ -151,8 +151,8 @@ impl Html {
     /// Asynchronously loads an XML/XHTML document from a local file.
     ///
     /// ```no_run
-    /// # async fn load() -> quire::Result<()> {
-    /// let document = quire::Html::from_xml_file("document.xhtml").await?;
+    /// # async fn load() -> spindrift::Result<()> {
+    /// let document = spindrift::Html::from_xml_file("document.xhtml").await?;
     /// # let _ = document;
     /// # Ok(())
     /// # }
@@ -173,7 +173,7 @@ impl Html {
     /// ```no_run
     /// # async fn load() -> Result<(), Box<dyn std::error::Error>> {
     /// let url = "https://example.test/document.html".parse()?;
-    /// let document = quire::Html::from_url(url).await?;
+    /// let document = spindrift::Html::from_url(url).await?;
     /// # let _ = document;
     /// # Ok(())
     /// # }
@@ -187,9 +187,9 @@ impl Html {
     /// ```no_run
     /// # async fn load() -> Result<(), Box<dyn std::error::Error>> {
     /// let url = "https://example.test/document.html".parse()?;
-    /// let document = quire::Html::from_url_with_resource_policy(
+    /// let document = spindrift::Html::from_url_with_resource_policy(
     ///     url,
-    ///     quire::ResourcePolicy::default(),
+    ///     spindrift::ResourcePolicy::default(),
     /// ).await?;
     /// # let _ = document;
     /// # Ok(())
@@ -223,8 +223,8 @@ impl Html {
     /// Selects the parser syntax for this document.
     ///
     /// ```
-    /// let document = quire::Html::from_string("<page />")
-    ///     .with_input_syntax(quire::InputSyntax::Xml);
+    /// let document = spindrift::Html::from_string("<page />")
+    ///     .with_input_syntax(spindrift::InputSyntax::Xml);
     /// ```
     pub fn with_input_syntax(mut self, input_syntax: InputSyntax) -> Self {
         self.input_syntax = input_syntax;
@@ -242,8 +242,8 @@ impl Html {
     ///
     /// ```
     /// # fn configure() -> Result<(), Box<dyn std::error::Error>> {
-    /// let base_url = quire::Url::parse("https://example.test/guide/")?;
-    /// let document = quire::Html::from_string("<img src=\"cover.png\">")
+    /// let base_url = spindrift::Url::parse("https://example.test/guide/")?;
+    /// let document = spindrift::Html::from_string("<img src=\"cover.png\">")
     ///     .with_base_url(base_url);
     /// # let _ = document;
     /// # Ok(())
@@ -260,8 +260,8 @@ impl Html {
     /// Sets a local directory as the base and root for document-relative resources.
     ///
     /// ```no_run
-    /// # fn configure() -> quire::Result<()> {
-    /// let document = quire::Html::from_string("<img src=\"cover.png\">")
+    /// # fn configure() -> spindrift::Result<()> {
+    /// let document = spindrift::Html::from_string("<img src=\"cover.png\">")
     ///     .with_base_path("assets")?;
     /// # let _ = document;
     /// # Ok(())
@@ -280,8 +280,8 @@ impl Html {
     /// Adds an author stylesheet to apply when rendering this document.
     ///
     /// ```
-    /// let document = quire::Html::from_string("<p>Hello</p>")
-    ///     .with_stylesheet(quire::Css::from_string("p { color: navy }"));
+    /// let document = spindrift::Html::from_string("<p>Hello</p>")
+    ///     .with_stylesheet(spindrift::Css::from_string("p { color: navy }"));
     /// ```
     pub fn with_stylesheet(mut self, stylesheet: Css) -> Self {
         self.stylesheets.push(stylesheet);
@@ -291,8 +291,8 @@ impl Html {
     /// Sets the policy used for every render-time external resource.
     ///
     /// ```
-    /// let document = quire::Html::from_string("<p>Hello</p>")
-    ///     .with_resource_policy(quire::ResourcePolicy::default());
+    /// let document = spindrift::Html::from_string("<p>Hello</p>")
+    ///     .with_resource_policy(spindrift::ResourcePolicy::default());
     /// ```
     pub fn with_resource_policy(mut self, resource_policy: ResourcePolicy) -> Self {
         self.resource_policy = resource_policy;
@@ -302,9 +302,9 @@ impl Html {
     /// Asynchronously renders this document with the supplied options.
     ///
     /// ```no_run
-    /// # async fn render() -> quire::Result<()> {
-    /// let html = quire::Html::from_string("<p>Hello</p>");
-    /// let document = html.render(&quire::RenderOptions::default()).await?;
+    /// # async fn render() -> spindrift::Result<()> {
+    /// let html = spindrift::Html::from_string("<p>Hello</p>");
+    /// let document = html.render(&spindrift::RenderOptions::default()).await?;
     /// # let _ = document;
     /// # Ok(())
     /// # }
@@ -513,13 +513,13 @@ impl Html {
     /// `writer`.
     ///
     /// ```no_run
-    /// # async fn render(output: &mut Vec<u8>) -> quire::Result<()> {
-    /// let html = quire::Html::from_string("<p>Hello</p>");
+    /// # async fn render(output: &mut Vec<u8>) -> spindrift::Result<()> {
+    /// let html = spindrift::Html::from_string("<p>Hello</p>");
     /// html
     ///     .write_pdf(
     ///         output,
-    ///         &quire::RenderOptions::default(),
-    ///         &quire::PdfOptions::default(),
+    ///         &spindrift::RenderOptions::default(),
+    ///         &spindrift::PdfOptions::default(),
     ///     )
     ///     .await?;
     /// # Ok(())
@@ -540,7 +540,7 @@ impl Html {
     /// Returns the base URL used to resolve document-relative resources.
     ///
     /// ```
-    /// let document = quire::Html::from_string("<p>Hello</p>");
+    /// let document = spindrift::Html::from_string("<p>Hello</p>");
     /// assert!(document.base_url().is_none());
     /// ```
     pub fn base_url(&self) -> Option<&Url> {
@@ -913,7 +913,7 @@ fn picture_source_candidate(
 /// Resolve the static representation selected for HTML `<object>` and `<img>`.
 ///
 /// In a live browser this selection can change while the resource fetch is in
-/// flight. Paged output has one deterministic layout pass, so Quire selects
+/// flight. Paged output has one deterministic layout pass, so Spindrift selects
 /// the external representation only when a preloaded resource can be decoded
 /// as an image that this renderer can paint; every other outcome exposes the
 /// element's fallback subtree to the CSS formatting model.
@@ -979,7 +979,7 @@ fn has_html_img_rendering_semantics(element: &dom::Element) -> bool {
                 && element.namespace_url.is_empty()))
 }
 
-/// Return whether the object can use Quire's existing static replaced-image
+/// Return whether the object can use Spindrift's existing static replaced-image
 /// renderer. A declared unsupported MIME type selects fallback before resource
 /// decoding, matching HTML's permitted early fallback for unsupported types.
 /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>

@@ -2,7 +2,7 @@
 
 ## `word-break: auto-phrase`
 
-Quire represents `auto-phrase` as its own inherited `word-break` value. Thai
+Spindrift represents `auto-phrase` as its own inherited `word-break` value. Thai
 analysis uses `kham-core` token byte spans plus its named-entity merger, which
 also tailors normal Thai complex-context wrapping so named entities remain one
 word unit. Japanese retains particle tailoring. Phrase boundaries are source
@@ -25,7 +25,7 @@ language-specific phrase analyzer. Residual language coverage is tracked in
 
 ## `word-break: manual`
 
-Quire parses `manual` as a distinct computed value. The shared break resolver
+Spindrift parses `manual` as a distinct computed value. The shared break resolver
 suppresses only automatic UAX #14 `SA` (complex-context) opportunities, while
 retaining authored spaces, U+200B, and forced breaks. The identical predicate
 is used during inline measurement and min-content sizing, so intrinsic widths
@@ -35,7 +35,7 @@ line layout excludes:
 
 ## `text-autospace`
 
-Quire represents autospace as a non-selectable inline edge. Boundary discovery
+Spindrift represents autospace as a non-selectable inline edge. Boundary discovery
 follows adjacent base characters, so combining marks and default-ignorable
 controls remain with their base text. Inline-element edges are transparent only
 when their originating edge has no margin, border, or padding; a nonzero
@@ -56,9 +56,9 @@ complete selected-line line-break ownership for autospace edges:
 
 ## `text-spacing-trim` and `text-spacing`
 
-Quire represents `text-spacing-trim` as an inherited computed value and
+Spindrift represents `text-spacing-trim` as an inherited computed value and
 parses the `text-spacing` shorthand atomically with `text-autospace`. `auto`
-uses Quire's deterministic `normal` policy. Candidate lines are materialized
+uses Spindrift's deterministic `normal` policy. Candidate lines are materialized
 before fitting: eligible CJK opening, closing, middle-dot, colon/dot, and
 ideographic-space adjacency effects select `halt` in horizontal text or
 `vhal` in vertical text. The same selected materialization supplies the
@@ -80,7 +80,7 @@ Japanese/simplified/traditional Chinese distinctions:
 
 ## `text-wrap`
 
-Quire parses inherited `text-wrap`, `text-wrap-mode`, and `text-wrap-style`
+Spindrift parses inherited `text-wrap`, `text-wrap-mode`, and `text-wrap-style`
 values needed by the local white-space tests. `text-wrap-mode: nowrap` feeds
 the shared inline opportunity graph, and `text-wrap: wrap` can override the
 mode introduced by legacy `white-space: pre` or `nowrap`.
@@ -91,7 +91,7 @@ line count and searches legal break sequences using the actual remaining
 inline space of every line, including per-line float exclusions and indents.
 Each candidate retains its selected source endpoints through source-order
 float placement. When a later inline float changes the candidate's physical
-row, Quire restores the pre-float layout state, replays the float at the
+row, Spindrift restores the pre-float layout state, replays the float at the
 selected source-row boundary, and preserves the winning plan rather than
 falling back to a greedy end. It preserves ordinary selection on a tie and
 does not change
@@ -120,7 +120,7 @@ clamp-before-balance ordering:
 
 ## `wrap-inside`
 
-Quire supports the non-inherited `wrap-inside: auto | avoid` property on
+Spindrift supports the non-inherited `wrap-inside: auto | avoid` property on
 inline boxes. The shared inline opportunity graph retains lexical inline-box
 edges, so a marked box contains text, nested inline descendants, generated
 inline content, and atomic inline children without incorrectly inheriting the
@@ -131,7 +131,7 @@ avoided unit cannot fit on an otherwise empty line, the normal candidate is
 used rather than overflowing it.
 
 `wrap-before` and `wrap-after` remain unimplemented. There is currently no
-upstream Web Platform Test coverage for `wrap-inside`; Quire's local parser,
+upstream Web Platform Test coverage for `wrap-inside`; Spindrift's local parser,
 graph, and Ahem-backed layout regressions cover the supported behavior:
 <https://www.w3.org/TR/css-text-4/#wrap-inside-property>.
 

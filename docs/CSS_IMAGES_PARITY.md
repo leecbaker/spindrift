@@ -42,7 +42,7 @@ part of this parity measure rather than a separate raster-only baseline.
   viewport fallback. Their viewport coverage remains SVG scene geometry until
   painting, rather than being replaced with a CSS solid rectangle; this
   preserves source-coordinate extent, clipping, and edge coverage. The
-  clipped concrete-object intersection is converted once from Quire's
+  clipped concrete-object intersection is converted once from Spindrift's
   bottom-left paint coordinates to SVG's top-left source viewport, preserving
   the same `object-position` source selection as raster images. Explicit root
   SVG `background-color` presentation attributes and inline declarations are

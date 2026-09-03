@@ -5,7 +5,7 @@ use super::*;
 /// CSS Align defines `stretch` as falling back to `flex-start`, not
 /// `safe flex-start`, so an overflowing wrapped line remains packed against
 /// the flex cross-start side. Taffy's generic distribution fallback differs,
-/// so Quire corrects only the overflow case after recovering flex line
+/// so Spindrift corrects only the overflow case after recovering flex line
 /// metadata:
 /// <https://drafts.csswg.org/css-align/#valdef-align-content-stretch> and
 /// <https://www.w3.org/TR/css-flexbox-1/#align-content-property>.
@@ -303,7 +303,7 @@ pub(in crate::layout::flex) fn resolve_flex_cross_alignments(
 /// Resolve every flex cross-axis placement exactly once.
 ///
 /// Taffy's measure callback has no baseline channel, so its output is used for
-/// flex sizing and line construction only.  Quire then resolves CSS Flexbox
+/// flex sizing and line construction only.  Spindrift then resolves CSS Flexbox
 /// baseline-sharing eligibility, fallback, and measured/synthesized baselines
 /// together from final item geometry.  Keeping these phases together avoids
 /// row, column, and fallback passes disagreeing about the same item:

@@ -1,8 +1,8 @@
-# Quire - render HTML as PDF
+# Spindrift - render HTML as PDF
 
 This is a rust implementation of an HTML layout and rendering tool, aiming for feature parity with `weasyprint`. We should shoot for full compliance with relevant specs, and where there is ambiguity, look to weasyprint for guidance.
 
-This project is called `quire`.
+This project is called `spindrift`.
 
 ## Goals
 
@@ -54,11 +54,11 @@ Note that we aim to be much more spec compliant and performant than weasyprint. 
 
 When fixing a WPT test, or any other individual case, make sure that the fix is the best architectural fix, and fixes the root cause. We want to keep the approach and architecture as pure as possible in a way that makes future changes as easy as possible, and structured to best manage the complexity of rendering HTML.
 
-Tests can be found at `~/projects/quire-wpt/third_party/wpt`.
+Tests can be found at `~/projects/spindrift-wpt/third_party/wpt`.
 
-The latest results for each web platform test are in `~/projects/quire-wpt/results/engine-cache/`. Use those to figure out pass rate for a group or to find tests to work on.
+The latest results for each web platform test are in `~/projects/spindrift-wpt/results/engine-cache/`. Use those to figure out pass rate for a group or to find tests to work on.
 
-Use `quire-wpt evaluate-test <path>` to render and evaluate one WPT test by its exact path across every configured engine, producing the normal PDFs, raster artifacts, diffs, and report. It is exact selection rather than a prefix filter; add `--include-scripts` only when evaluating a script-driven test. `quire-wpt` can be run with cargo inside `~/projects/quire-wpt/`. Make sure to compile the release binary yourself before running.
+Use `spindrift-wpt evaluate-test <path>` to render and evaluate one WPT test by its exact path across every configured engine, producing the normal PDFs, raster artifacts, diffs, and report. It is exact selection rather than a prefix filter; add `--include-scripts` only when evaluating a script-driven test. `spindrift-wpt` can be run with cargo inside `~/projects/spindrift-wpt/`. Make sure to compile the release binary yourself before running.
 
 ### Fixing Web Platform Tests
 
@@ -86,7 +86,7 @@ Prefer to use the type system to encode detail, so that you can use the type sys
 
 ### CSS Sizing Quantities
 
-Quire should model CSS layout sizes with two separate concerns:
+Spindrift should model CSS layout sizes with two separate concerns:
 
 1. The box-model space of the numeric value.
 2. Whether the value is definite for CSS percentage resolution.

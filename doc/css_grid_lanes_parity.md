@@ -70,7 +70,7 @@ alignment subject. The same range's end bounds self-alignment of the final
 item in a lane; a definite container size is the alignment container and does
 not enlarge either range.
 
-Quire also uses a documented compatibility paint policy for overlapping
+Spindrift also uses a documented compatibility paint policy for overlapping
 outlines: an ordinary normal-flow Grid outline paints before auto/zero-z
 positioned descendants, while an outline owned by a positioned or effect
 stacking context remains in that context's final local outline phase. CSS UI

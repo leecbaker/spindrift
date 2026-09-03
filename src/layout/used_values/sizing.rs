@@ -26,7 +26,7 @@ pub(in crate::layout) fn constrain(mut value: f32, min: Option<f32>, max: Option
 /// Resolves CSS Sizing Level 4 stretch-fit sizing to a content-box length.
 ///
 /// `stretch` attempts to make the margin box fill the available space. The
-/// result is a CSS content-box length in Quire's PDF-point layout scalar, with
+/// result is a CSS content-box length in Spindrift's PDF-point layout scalar, with
 /// padding and border represented as an explicit semantic non-content length:
 /// <https://drafts.csswg.org/css-sizing-4/#stretch-fit-sizing> and
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
@@ -514,7 +514,7 @@ pub(in crate::layout) fn non_replaced_aspect_ratio_content_width(
 /// CSS Box Sizing defines conversion between border-box and content-box sizes:
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
 ///
-/// The returned value is a CSS content-box length in Quire's PDF-point layout
+/// The returned value is a CSS content-box length in Spindrift's PDF-point layout
 /// scalar. Callers should keep this typed until they cross a layout/paint or
 /// external adapter boundary.
 pub(in crate::layout) fn used_content_box_size<Source>(

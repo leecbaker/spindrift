@@ -391,7 +391,7 @@ pub(crate) enum RubyAlign {
 /// Computed policy for annotation overlap beyond a ruby base container.
 ///
 /// The legacy CSS Ruby value `none` is parsed as [`Self::Spaces`], as required
-/// by CSS Ruby Level 1. `Auto` remains distinct because it selects Quire's
+/// by CSS Ruby Level 1. `Auto` remains distinct because it selects Spindrift's
 /// documented user-agent overhang policy rather than the author-requested
 /// space-only rule.
 /// <https://drafts.csswg.org/css-ruby-1/#ruby-overhang>
@@ -1430,7 +1430,7 @@ pub(crate) enum ComputedColorScheme {
     Supported(ColorSchemeSupport),
 }
 
-/// A stylesheet `@property` registration that Quire can compute today.
+/// A stylesheet `@property` registration that Spindrift can compute today.
 /// Registrations remain document-scoped; computed styles carry an `Arc` to
 /// their immutable lookup only so custom-property computation has no ambient
 /// mutable state.
@@ -1573,7 +1573,7 @@ impl ComputedColorScheme {
     }
 }
 
-/// Computed values needed for Quire's single static CSS Animation snapshot.
+/// Computed values needed for Spindrift's single static CSS Animation snapshot.
 ///
 /// This intentionally models only the longhands consumed by the snapshot
 /// implementation. CSS Animations' broader multi-animation and timeline
@@ -1638,7 +1638,7 @@ pub(crate) struct ComputedStyle {
     pub used_color_scheme: UsedColorScheme,
     /// The document page scheme inherited by `color-scheme: normal`.
     pub page_color_scheme: UsedColorScheme,
-    /// The subset of CSS Animation computed values that Quire needs to
+    /// The subset of CSS Animation computed values that Spindrift needs to
     /// synthesize its static keyframe snapshot. These values are non-inherited
     /// by default, but remain on the computed style so explicit `inherit` can
     /// copy the parent's animation state.

@@ -1,12 +1,12 @@
 # WeasyPrint Interface Parity
 
 This document compares the public command-line and library interfaces of
-WeasyPrint with Quire's current public API. It is an API/UX compatibility
+WeasyPrint with Spindrift's current public API. It is an API/UX compatibility
 tracker, not a claim that equivalent options produce equivalent layout or PDF
 output. Rendering and PDF conformance gaps belong in
 [`SPEC_DIVERGENCES.md`](../SPEC_DIVERGENCES.md).
 
-Quire is intentionally Rust-native. Matching WeasyPrint's useful operations is
+Spindrift is intentionally Rust-native. Matching WeasyPrint's useful operations is
 valuable, but matching Python call shapes, dynamically typed keyword arguments,
 or pydyf internals is not a goal.
 
@@ -22,19 +22,19 @@ stable 69.0.
 “Available” means an equivalent public operation is usable now. “Partial”
 means the public operation exists but has a material behavioral or capability
 difference. “Missing” means there is no public equivalent. “Deliberately
-different” means Quire provides a more appropriate Rust boundary instead of
+different” means Spindrift provides a more appropriate Rust boundary instead of
 emulating a Python convenience.
 
-## Quire API Shape
+## Spindrift API Shape
 
-Quire separates source loading, resource policy, render configuration, and PDF
+Spindrift separates source loading, resource policy, render configuration, and PDF
 serialization. In contrast, WeasyPrint passes most of these as keyword
 arguments to `HTML.render()` and `HTML.write_pdf()`.
 
 ```rust,no_run
-use quire::{Css, FetchErrorPolicy, Html, HttpRequestTimeout, PdfOptions, RenderOptions, ResourcePolicy};
+use spindrift::{Css, FetchErrorPolicy, Html, HttpRequestTimeout, PdfOptions, RenderOptions, ResourcePolicy};
 
-# async fn render() -> quire::Result<Vec<u8>> {
+# async fn render() -> spindrift::Result<Vec<u8>> {
 let resource_policy = ResourcePolicy {
     follow_http_redirects: false,
     http_timeout: HttpRequestTimeout::try_from(std::time::Duration::from_secs(5))
@@ -74,34 +74,34 @@ document.write_pdf(&mut pdf, &PdfOptions::default())?;
 
 ## CLI Parity
 
-WeasyPrint uses `weasyprint [options] <input> <output>`. Quire's binary and
-clap command name are `quire`.
+WeasyPrint uses `weasyprint [options] <input> <output>`. Spindrift's binary and
+clap command name are `spindrift`.
 
 ### Inputs, Outputs, and Diagnostics
 
-| WeasyPrint surface | Quire equivalent | Status | Difference / remaining work |
+| WeasyPrint surface | Spindrift equivalent | Status | Difference / remaining work |
 | --- | --- | --- | --- |
 | `<input>` filename, URL, or `-` for stdin | Local path, `file:`, `http:`, or `https:` URL | Partial | Add `-` byte input. The CLI does not accept `data:` even though the library URL constructors do. Literal HTML remains library-only. |
 | `<output>` filename or `-` for stdout | Canonicalized filesystem path | Partial | Add `-` and write PDF bytes to stdout while keeping diagnostics on stderr. |
 | `--version` | clap-generated version | Available | Both report a version and exit. |
-| `-i`, `--info` | `-i`, `--info` | Available | Reports the runtime OS type, version, and architecture plus Quire's version. Unlike WeasyPrint, it omits Rust dependency versions because Quire compiles its rendering stack into the binary. |
+| `-i`, `--info` | `-i`, `--info` | Available | Reports the runtime OS type, version, and architecture plus Spindrift's version. Unlike WeasyPrint, it omits Rust dependency versions because Spindrift compiles its rendering stack into the binary. |
 | `-v`, `--verbose`; `-d`, `--debug`; `-q`, `--quiet` | Mutually exclusive flags using `env_logger` | Available | The flags map to `info`, `debug`, and `off`; without one, `RUST_LOG` remains available. |
 
 ### Rendering and PDF Options
 
-| WeasyPrint option | Quire equivalent | Status | Difference / remaining work |
+| WeasyPrint option | Spindrift equivalent | Status | Difference / remaining work |
 | --- | --- | --- | --- |
 | `-s`, `--stylesheet` (repeatable user stylesheet) | `-s`, `--stylesheet` (repeatable) | Partial | CLI stylesheets are currently loaded as author-origin `Css`. Call `Css::with_user_origin()` in the CLI to match WeasyPrint cascade precedence. |
 | `-a`, `--attachment`; `--attachment-relationship` | None | Missing | Add a typed attachment input and embedded-file serialization, including ISO 32000 associated-file relationships. |
 | `--pdf-identifier` | None | Missing | Add an explicit trailer `/ID` policy and document deterministic/default behaviour. |
-| `--pdf-variant` | `--pdf-profile`, with `--pdf-variant` and `--pdf-type` aliases | Partial | Quire accepts `pdf`, PDF/A-1b, -2b, -3b, -2u, and -3u. These choose writer behaviour and identification metadata, but do not yet establish PDF/A conformance. Do not accept WeasyPrint's additional A/4, PDF/UA, PDF/X, or `debug` values until their required structures and validation exist. |
+| `--pdf-variant` | `--pdf-profile`, with `--pdf-variant` and `--pdf-type` aliases | Partial | Spindrift accepts `pdf`, PDF/A-1b, -2b, -3b, -2u, and -3u. These choose writer behaviour and identification metadata, but do not yet establish PDF/A conformance. Do not accept WeasyPrint's additional A/4, PDF/UA, PDF/X, or `debug` values until their required structures and validation exist. |
 | `--pdf-version` | Profile-selected PDF version | Partial | `PdfProfile` selects 1.4 or 1.7. Expose an explicit version only with validation of profile/version combinations. |
 | `--pdf-forms` | None | Missing | Preserve form semantics through layout and emit AcroForm fields and appearances. |
 | `--pdf-tags` | None | Missing | Add the tagged-PDF structure tree, roles, annotation linkage, and validation required for PDF/UA. |
 | `--uncompressed-pdf` | `--uncompressed-pdf`; `PdfOptions::compression` | Available | `PdfCompression::Uncompressed` omits `/FlateDecode` from generated streams. |
 | `--xmp-metadata`; `--custom-metadata` | None | Missing | Add XMP fragment handling and complete HTML metadata extraction with merge/validation rules. |
 | `--output-intent` | None | Missing | Add ICC/profile resolution and PDF output-intent serialization. |
-| `-p`, `--presentational-hints` | Always enabled for HTML documents | Deliberately different | Quire follows HTML's rendering model; XML documents do not receive HTML hint mappings. |
+| `-p`, `--presentational-hints` | Always enabled for HTML documents | Deliberately different | Spindrift follows HTML's rendering model; XML documents do not receive HTML hint mappings. |
 | `--optimize-images`; `--jpeg-quality`; `--dpi` | None | Missing | Add opt-in image optimization, re-encoding, and downsampling without changing CSS intrinsic geometry or violating conformance targets. |
 | `--full-fonts` | `--full-fonts`; `PdfOptions::font_embedding` | Available | `FontEmbeddingMode::Subset` is default; `Full` keeps complete programs where PDF embedding permits it. |
 | `--hinting` | None | Missing | Model hint preservation as an explicit font-subsetting policy. |
@@ -109,19 +109,19 @@ clap command name are `quire`.
 
 ### HTML and Resource Fetching
 
-| WeasyPrint option | Quire equivalent | Status | Difference / remaining work |
+| WeasyPrint option | Spindrift equivalent | Status | Difference / remaining work |
 | --- | --- | --- | --- |
 | `-e`, `--encoding` | UTF-8 input only | Missing | Add explicit input decoding and HTTP charset handling for HTML and CSS. |
 | `-m`, `--media-type` | `--media-type print\|screen` | Partial | The crate has typed `MediaType`; the CLI only exposes `print` and `screen`. Widen it if arbitrary media types are intended to be supported. |
-| `-u`, `--base-url` | `-u`, `--base-url` | Available | Quire accepts a URL or local path. Add and test the stdin default when stdin support exists. |
-| `-t`, `--timeout` | `-t`, `--timeout`; `ResourcePolicy::http_timeout` | Available | Quire uses a typed non-zero `HttpRequestTimeout` and defaults to 10 seconds. |
+| `-u`, `--base-url` | `-u`, `--base-url` | Available | Spindrift accepts a URL or local path. Add and test the stdin default when stdin support exists. |
+| `-t`, `--timeout` | `-t`, `--timeout`; `ResourcePolicy::http_timeout` | Available | Spindrift uses a typed non-zero `HttpRequestTimeout` and defaults to 10 seconds. |
 | `--allowed-protocols` | Fixed `data`, `file`, `http`, and `https` set in the library | Partial | Make the allowlist public and configurable while retaining a safe default. |
 | `--no-http-redirects` | `--no-http-redirects`; `ResourcePolicy::follow_http_redirects` | Available | The final response URL becomes the base URL for URL-loaded HTML and CSS. |
 | `--fail-on-http-errors` | Strict primary/explicit sources by default; `--allow-fetch-errors` / `FetchErrorPolicy::Allow` recover from optional stylesheet/font failures | Deliberately different | Failed visual-asset preloads remain unavailable replaced elements so layout can proceed; this is not a blanket “ignore all failures” mode. |
 
-### Quire-only CLI Features
+### Spindrift-only CLI Features
 
-| Quire option | Purpose |
+| Spindrift option | Purpose |
 | --- | --- |
 | `--target-fragment` | Supplies the static rendering target for `:target` and `:target-within`. |
 | `--forced-colors none\|light\|dark` | Sets the CSS forced-colours environment. |
@@ -131,7 +131,7 @@ clap command name are `quire`.
 
 ### Source, Stylesheet, and Resource API
 
-| WeasyPrint public API | Quire equivalent | Status | Difference / remaining work |
+| WeasyPrint public API | Spindrift equivalent | Status | Difference / remaining work |
 | --- | --- | --- | --- |
 | `HTML(filename=...)` | `Html::from_file(path).await` | Available | The source path establishes the base URL. |
 | `HTML(url=...)` | `Html::from_url(url).await`; `from_url_with_resource_policy` | Partial | Supports `data`, `file`, `http`, and `https`; expose the remaining fetch controls through a public custom fetcher/policy. |
@@ -140,8 +140,8 @@ clap command name are `quire`.
 | positional input guessing | Separate constructors | Deliberately different | Do not add ambiguous guessing to the Rust API. |
 | `HTML(encoding=...)` | None | Missing | Share a decoding policy with CSS and fetched resource responses. |
 | `HTML(base_url=...)` | `Html::with_base_url`; `with_base_path` | Available | The explicit methods make URL and local-directory bases distinct. |
-| `HTML(url_fetcher=...)` | `ResourcePolicy` | Partial | Quire controls redirects and error recovery, but has no public custom async fetcher or response type. |
-| `HTML(media_type=...)` | `RenderOptions::media_type` | Partial | Quire's typed public media choices are currently `print` and `screen`; WeasyPrint accepts a string. |
+| `HTML(url_fetcher=...)` | `ResourcePolicy` | Partial | Spindrift controls redirects and error recovery, but has no public custom async fetcher or response type. |
+| `HTML(media_type=...)` | `RenderOptions::media_type` | Partial | Spindrift's typed public media choices are currently `print` and `screen`; WeasyPrint accepts a string. |
 | `CSS(filename/url/string/file_obj, font_config=...)` | `Css::from_file`, `from_url`, `from_url_with_resource_policy`, `from_string` | Partial | URL constructors support the same four built-in schemes. Add reader/bytes, decoding, a public URL base setter, and reusable font context if those boundaries are needed. |
 | user stylesheet origin | `Css::with_user_origin()` | Available | The library supports it; the CLI must apply it to `--stylesheet`. |
 | `Attachment(...)` | None | Missing | Introduce a public attachment value with source, name, description, timestamps, and relationship. |
@@ -151,7 +151,7 @@ clap command name are `quire`.
 
 ### Rendering and Serialization API
 
-| WeasyPrint public API | Quire equivalent | Status | Difference / remaining work |
+| WeasyPrint public API | Spindrift equivalent | Status | Difference / remaining work |
 | --- | --- | --- | --- |
 | `HTML.render(font_config=..., counter_style=..., color_profiles=..., **options)` | `Html::render(&RenderOptions).await` | Partial | Render options cover several CSS environments, but no public font configuration, counter-style registry, colour-profile context, stylesheet list, or cache input exists. |
 | `HTML.write_pdf(target=None, zoom=1, finisher=..., **options)` | `Html::write_pdf(&mut impl Write, &RenderOptions, &PdfOptions).await` | Partial | Split render and PDF policy is deliberate. A writer target supports files, buffers, and adapters; scaling and a safe post-processing extension point remain. |
@@ -163,12 +163,12 @@ clap command name are `quire`.
 
 ### Rendered Document Inspection
 
-| WeasyPrint public API | Quire equivalent | Status | Difference / remaining work |
+| WeasyPrint public API | Spindrift equivalent | Status | Difference / remaining work |
 | --- | --- | --- | --- |
-| `Document.pages` and all `Page` inspection data | None | Deliberately different | Quire keeps page geometry, page-local bookmarks, links, anchors, bleed, forms, and paint state renderer-private. Add a public page model only if a stable semantic use case requires one. |
-| `Document.metadata` | `Document::metadata()` | Partial | Quire exposes title, one author, and creator. See [Document Metadata Parity](#document-metadata-parity) for the field-by-field comparison and target surface. |
+| `Document.pages` and all `Page` inspection data | None | Deliberately different | Spindrift keeps page geometry, page-local bookmarks, links, anchors, bleed, forms, and paint state renderer-private. Add a public page model only if a stable semantic use case requires one. |
+| `Document.metadata` | `Document::metadata()` | Partial | Spindrift exposes title, one author, and creator. See [Document Metadata Parity](#document-metadata-parity) for the field-by-field comparison and target surface. |
 | `Document.fonts` | Internal font planning/embedding records | Deliberately different | Font records are renderer implementation details, not a stable public model. |
-| `Document.copy(pages=...)` | None | Deliberately different | Quire has no public page model, so it does not expose page selection or concatenation. Reconsider only with a stable semantic document-composition API. |
+| `Document.copy(pages=...)` | None | Deliberately different | Spindrift has no public page model, so it does not expose page selection or concatenation. Reconsider only with a stable semantic document-composition API. |
 | `Document.make_bookmark_tree(...)` | Flat `Document::bookmarks()` | Partial | Add a typed tree and an explicit coordinate-space conversion rather than requiring callers to reconstruct hierarchy. |
 | `Document.write_pdf(...)` | `write_pdf(&mut impl Write, &PdfOptions)` | Available | Callers own output allocation and destination selection. |
 | detailed paint operations | Internal paint tree and PDF writer records | Deliberately different | Keep graphics, text, images, and fonts private; the public model is semantic inspection. |
@@ -177,10 +177,10 @@ clap command name are `quire`.
 
 WeasyPrint exposes document-wide metadata through `Document.metadata` and
 uses it for PDF information and XMP. The [WeasyPrint API reference](https://doc.courtbouillon.org/weasyprint/stable/api_reference.html#weasyprint.document.DocumentMetadata)
-lists the current public attributes and their HTML sources. Quire should keep
+lists the current public attributes and their HTML sources. Spindrift should keep
 this data document-level and independent from page/paint inspection.
 
-| WeasyPrint public metadata | Quire today | Parity-oriented Quire surface |
+| WeasyPrint public metadata | Spindrift today | Parity-oriented Spindrift surface |
 | --- | --- | --- |
 | `title`: first `<title>`; PDF `/Title` | `DocumentMetadata::title() -> Option<&str>`; extracts the first `<title>` and writes `/Title` plus `dc:title` XMP | Retain `title()`. |
 | `authors`: every `<meta name=author>` in source order; PDF `/Author` | `author() -> Option<&str>`; extracts only the first author and writes one `/Author` value plus a one-item `dc:creator` sequence | Replace the singular stored value with `authors() -> &[String]`. Preserve source order; match WeasyPrint by joining authors with `", "` for the single PDF `/Author` string, while emitting one ordered `rdf:li` per author in the XMP `dc:creator` sequence. |
@@ -191,9 +191,9 @@ this data document-level and independent from page/paint inspection.
 | `lang`: `<html lang>` as a BCP 47 tag | `DocumentMetadata::language() -> Option<&str>`; extracts a non-empty root `lang` value, writes the PDF catalog `/Lang`, and emits one `dc:language` XMP value | Partial: preserve the source value today; validate BCP 47 before asserting full conformance. |
 | `attachments`: `<link rel=attachment>` values and explicit attachment options | No public attachment model or PDF embedded-file output | Add `attachments() -> &[Attachment]` and a typed `Attachment` input shared by HTML extraction and `PdfOptions`; include name, description, dates, MIME type, and associated-file relationship. |
 | `custom`: other named HTML meta values | Not extracted or exposed | Add a deterministic custom-metadata collection. Define case handling, duplicate behavior, and whether unsupported values are rejected or retained before mapping to PDF/XMP extension properties. |
-| `xmp_metadata`: caller-provided XML packet fragments | Quire generates a private XMP packet from title, author, creator, producer, and PDF/A identification, but callers cannot inspect or add to it | Add explicit XMP input/merge rules at the PDF-serialization boundary. Preserve Quire-owned conformance and mirrored information fields as authoritative. |
+| `xmp_metadata`: caller-provided XML packet fragments | Spindrift generates a private XMP packet from title, author, creator, producer, and PDF/A identification, but callers cannot inspect or add to it | Add explicit XMP input/merge rules at the PDF-serialization boundary. Preserve Spindrift-owned conformance and mirrored information fields as authoritative. |
 | `generate_rdf_metadata()` and `include_in_pdf()` helpers | No public equivalent; the writer emits information and XMP internally | Do not expose a mutable PDF-writer handle for call-shape parity. If applications need preflight, expose an immutable metadata/XMP generation API with validation rather than an `include_in_pdf` escape hatch. |
-| Writer producer (not a WeasyPrint `DocumentMetadata` attribute) | `PdfOptions::producer`, written to PDF `/Producer` and `pdf:Producer` XMP | Retain this Quire extension. Keep it separate from source `generator`: the former identifies the PDF writer, while the latter describes source-generating software. |
+| Writer producer (not a WeasyPrint `DocumentMetadata` attribute) | `PdfOptions::producer`, written to PDF `/Producer` and `pdf:Producer` XMP | Retain this Spindrift extension. Keep it separate from source `generator`: the former identifies the PDF writer, while the latter describes source-generating software. |
 
 The target data model should make repeated and typed values explicit rather
 than reproducing WeasyPrint's mutable Python attributes. In particular,
@@ -220,7 +220,7 @@ record so PDF/A mirrored fields cannot drift.
    output intents, PDF/UA, and PDF/X require their supporting document model,
    writer structures, and validation evidence—not just flags.
 6. **Broaden profiles last.** Accept an additional WeasyPrint profile only when
-   Quire emits all required header, metadata, structure, font/image, and
+   Spindrift emits all required header, metadata, structure, font/image, and
    validation behaviour.
 
 ## Maintaining This Tracker

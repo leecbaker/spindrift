@@ -389,7 +389,7 @@ fn contains_pdf_token(line: &[u8], token: &[u8]) -> bool {
 /// materialization and color conversion; CSS image layout is unchanged.
 pub(super) const PROMOTE_SOLID_RASTER_IMAGES_TO_VECTOR_FILLS: bool = true;
 
-/// Converts Quire paint blend modes to the PDF `/BM` blend-mode values.
+/// Converts Spindrift paint blend modes to the PDF `/BM` blend-mode values.
 ///
 /// PDF 1.4 transparency defines `/BM` in an ExtGState dictionary: ISO
 /// 32000-1:2008, 11.3.5 "Blend Mode".

@@ -103,7 +103,7 @@ pub(in crate::layout::table) fn table_atomic_stacking_policy(
 /// normal-flow outline phase.
 ///
 /// A static table is an atomic table-paint unit, but not an atomic *stacking*
-/// context. Its row-group outlines therefore follow Quire's normal-flow
+/// context. Its row-group outlines therefore follow Spindrift's normal-flow
 /// compatibility phase. Positioned and effect-owning tables retain a final
 /// local outline phase instead.
 pub(in crate::layout::table) fn table_outlines_use_in_flow_phase(

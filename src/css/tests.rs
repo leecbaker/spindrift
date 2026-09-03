@@ -17330,7 +17330,7 @@ async fn supports_rule_recognizes_css_text_decoration_level_three_values() {
 #[tokio::test]
 async fn supports_rule_ignores_unsupported_declaration_conditions() {
     let stylesheet = parse_stylesheet(&Css::from_string(
-        "@supports (unsupported-quire-feature: true) { p { color: blue } } p { color: red }",
+        "@supports (unsupported-spindrift-feature: true) { p { color: blue } } p { color: red }",
     ));
     let style = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::new()),
@@ -17552,7 +17552,7 @@ async fn supports_rule_evaluates_selector_conditions_with_selector_parser() {
          @supports selector(p:has(> span)) { p { border-top-color: lime } }\
          @supports selector(p:hover) { p { border-right-color: blue } }\
          @supports selector(p::first-line) { p { border-bottom-color: red } }\
-         @supports selector(p::unsupported-quire-pseudo) { p { background-color: red } }",
+         @supports selector(p::unsupported-spindrift-pseudo) { p { background-color: red } }",
     ));
     let style = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::new()),
@@ -17621,7 +17621,7 @@ async fn supports_rule_preserves_nested_layer_order() {
 #[tokio::test]
 async fn import_supports_declaration_condition_loads_the_import() {
     let dir = std::env::temp_dir().join(format!(
-        "quire-import-supports-declaration-{}",
+        "spindrift-import-supports-declaration-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -17659,7 +17659,7 @@ async fn import_supports_declaration_condition_loads_the_import() {
 #[tokio::test]
 async fn import_supports_unknown_declaration_condition_skips_the_import() {
     let dir = std::env::temp_dir().join(format!(
-        "quire-import-supports-unknown-declaration-{}",
+        "spindrift-import-supports-unknown-declaration-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -17697,7 +17697,7 @@ async fn import_supports_unknown_declaration_condition_skips_the_import() {
 #[tokio::test]
 async fn import_supports_logical_condition_uses_the_shared_evaluator() {
     let dir = std::env::temp_dir().join(format!(
-        "quire-import-supports-logical-{}",
+        "spindrift-import-supports-logical-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -17734,7 +17734,10 @@ async fn import_supports_logical_condition_uses_the_shared_evaluator() {
 
 #[tokio::test]
 async fn import_layer_places_imported_rules_in_named_layer() {
-    let dir = std::env::temp_dir().join(format!("quire-import-layer-named-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-import-layer-named-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let imported_path = dir.join("imported.css");
     let main_path = dir.join("main.css");
@@ -17770,7 +17773,7 @@ async fn import_layer_places_imported_rules_in_named_layer() {
 #[tokio::test]
 async fn import_media_not_print_keeps_import_out_of_cascade() {
     let dir = std::env::temp_dir().join(format!(
-        "quire-import-media-not-print-{}",
+        "spindrift-import-media-not-print-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -17806,7 +17809,7 @@ async fn import_media_not_print_keeps_import_out_of_cascade() {
 #[tokio::test]
 async fn import_media_not_screen_loads_import_in_print_context() {
     let dir = std::env::temp_dir().join(format!(
-        "quire-import-media-not-screen-{}",
+        "spindrift-import-media-not-screen-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -17842,7 +17845,7 @@ async fn import_media_not_screen_loads_import_in_print_context() {
 #[tokio::test]
 async fn anonymous_import_layer_important_beats_unlayered_important() {
     let dir = std::env::temp_dir().join(format!(
-        "quire-import-layer-anonymous-{}",
+        "spindrift-import-layer-anonymous-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -18441,7 +18444,10 @@ async fn page_margin_longhand_override_survives_cascade_output() {
 
 #[tokio::test]
 async fn import_layer_applies_to_imported_page_context() {
-    let dir = std::env::temp_dir().join(format!("quire-import-layer-page-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-import-layer-page-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let imported_path = dir.join("imported.css");
     let main_path = dir.join("main.css");

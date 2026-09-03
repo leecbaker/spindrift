@@ -53,7 +53,7 @@ impl PageBreak {
     /// Return whether this value forces a page fragmentainer break.
     ///
     /// CSS Break has forced break values for multiple fragmentation contexts.
-    /// Quire's paged-media callers use this page-specific predicate so
+    /// Spindrift's paged-media callers use this page-specific predicate so
     /// `break-before: column` does not accidentally become a page break:
     /// <https://www.w3.org/TR/css-break-3/#forced-breaks>.
     pub(crate) fn is_forced(self) -> bool {

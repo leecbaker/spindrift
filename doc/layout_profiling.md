@@ -9,10 +9,10 @@ Build and render a document with the feature enabled:
 
 ```sh
 cargo build --release --features layout-profile
-RUST_LOG=quire::layout_profile=info target/release/quire input.html output.pdf
+RUST_LOG=spindrift::layout_profile=info target/release/spindrift input.html output.pdf
 ```
 
-The logger emits exactly one structured `quire::layout_profile` record for each
+The logger emits exactly one structured `spindrift::layout_profile` record for each
 document layout. Measurements are thread-local so concurrent renders do not
 mix totals. A layout snapshot never includes the profile state: speculative
 float probes and Grid replays remain visible in the completed document's

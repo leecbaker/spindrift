@@ -1,6 +1,6 @@
 use super::*;
 
-fn assert_green_100px_square(document: &quire::Document) {
+fn assert_green_100px_square(document: &spindrift::Document) {
     let green = document.pages[0]
         .rects()
         .iter()
@@ -24,7 +24,7 @@ fn rect_covers(
 }
 
 fn largest_filled_rect(
-    page: &quire::Page,
+    page: &spindrift::Page,
     color: CssColor,
 ) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()
@@ -36,7 +36,7 @@ fn largest_filled_rect(
         .unwrap_or_else(|| panic!("expected {color:?} rectangle among {:?}", page.rects()))
 }
 
-fn filled_rect_bounds(page: &quire::Page, color: CssColor) -> (f32, f32, f32, f32) {
+fn filled_rect_bounds(page: &spindrift::Page, color: CssColor) -> (f32, f32, f32, f32) {
     let rects = page
         .rects()
         .iter()
@@ -149,7 +149,7 @@ fn path_fill_at(
         .and_then(|path| path.fill)
 }
 
-fn table_wrapper_border_rect_indices(page: &quire::Page) -> Vec<usize> {
+fn table_wrapper_border_rect_indices(page: &spindrift::Page) -> Vec<usize> {
     page.rects()
         .iter()
         .enumerate()
@@ -162,7 +162,7 @@ fn table_wrapper_border_rect_indices(page: &quire::Page) -> Vec<usize> {
         .collect()
 }
 
-fn table_wrapper_border_paint_operation_indices(page: &quire::Page) -> Vec<usize> {
+fn table_wrapper_border_paint_operation_indices(page: &spindrift::Page) -> Vec<usize> {
     page.paint_operations()
         .iter()
         .enumerate()
@@ -3326,7 +3326,7 @@ async fn wpt_root_table_ignores_authored_head_caption() {
             .to_string(),
     )
     .await;
-    let black_square = |document: &quire::Document| {
+    let black_square = |document: &spindrift::Document| {
         document.pages[0]
             .rects()
             .iter()
@@ -3338,7 +3338,7 @@ async fn wpt_root_table_ignores_authored_head_caption() {
             .map(|rect| (rect.x(), rect.y()))
             .unwrap_or_else(|| panic!("expected the 20px black table cell"))
     };
-    let line = |document: &quire::Document| {
+    let line = |document: &spindrift::Document| {
         document.pages[0]
             .lines()
             .iter()
@@ -6439,7 +6439,7 @@ async fn auto_table_columns_use_intrinsic_content_widths() {
     assert!((widths.iter().sum::<f32>() - 300.0).abs() < 0.01);
 }
 
-fn painted_table_rect_width(document: &quire::Document, color: CssColor) -> f32 {
+fn painted_table_rect_width(document: &spindrift::Document, color: CssColor) -> f32 {
     document.pages[0]
         .rects()
         .iter()

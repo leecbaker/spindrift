@@ -283,7 +283,7 @@ fn paint_transform_3d_function_matrix(
     }
 }
 
-/// Project a CSS-pixel, y-down 3D matrix into Quire's point, y-up paint
+/// Project a CSS-pixel, y-down 3D matrix into Spindrift's point, y-up paint
 /// coordinate system. This is `S · M · S⁻¹` for
 /// `S = diag(CSS_PX_TO_PT, -CSS_PX_TO_PT, CSS_PX_TO_PT, 1)`.
 fn css_matrix_3d_to_paint(matrix: css::CssTransform3D) -> PaintTransform3D {

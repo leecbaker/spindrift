@@ -1,6 +1,6 @@
-# Quire PDF renderer
+# Spindrift PDF renderer
 
-`quire` is a from-scratch Rust HTML/CSS to PDF renderer inspired by
+`spindrift` is a from-scratch Rust HTML/CSS to PDF renderer inspired by
 WeasyPrint. It exposes a crate API and a CLI, parses HTML with `html5ever`,
 parses explicit/XML-declared XML input with `xml5ever`, parses CSS syntax with
 `cssparser`, matches selectors with Servo's `selectors` crate, performs
@@ -12,7 +12,7 @@ embedded system fonts, and Type 0 Unicode text resources.
 Convert an HTML file to a PDF file:
 
 ```sh
-quire document.html document.pdf
+spindrift document.html document.pdf
 ```
 
 ## CLI
@@ -26,7 +26,7 @@ cargo run -- example.html example.pdf
 Once installed as a binary:
 
 ```sh
-quire example.html example.pdf
+spindrift example.html example.pdf
 ```
 
 Enable debug logs, including PDF generation timing, with:
@@ -38,7 +38,7 @@ cargo run -- --debug example.html example.pdf
 Print host information useful in bug reports without rendering a document:
 
 ```sh
-quire --info
+spindrift --info
 ```
 
 Use `--full-fonts` to embed complete font programs when PDF embedding permits
@@ -48,7 +48,7 @@ it, matching WeasyPrint's opt-out of font subsetting:
 cargo run -- --full-fonts input.html /tmp/full-fonts.pdf
 ```
 
-Use `--pdf-profile` to select Quire's PDF writer policy. The default is
+Use `--pdf-profile` to select Spindrift's PDF writer policy. The default is
 `pdf`; pass `--pdf-profile pdf/a-1b` to opt into the current PDF/A-oriented
 writer behavior. Supported values are `pdf` and `pdf/a-1b`. These profiles select the implemented header,
 metadata, and font-planning behavior, but do not yet guarantee PDF/A
@@ -62,7 +62,7 @@ it substantially increases output size:
 cargo run -- --uncompressed-pdf input.html /tmp/debug.pdf
 ```
 
-Quire follows HTTP redirects by default and treats every external resource
+Spindrift follows HTTP redirects by default and treats every external resource
 failure as fatal. Use `--no-http-redirects` to reject HTTP redirects, or
 `--allow-fetch-errors` to skip failed optional subresources and continue:
 
@@ -91,25 +91,25 @@ Set document page geometry in CSS rather than command-line or crate options:
 Generate shell completions with:
 
 ```sh
-cargo run -- --generate-completion bash > quire.bash
+cargo run -- --generate-completion bash > spindrift.bash
 ```
 
 ## Library
 
 ```rust
-use quire::{Html, PdfOptions, RenderOptions};
+use spindrift::{Html, PdfOptions, RenderOptions};
 
 let mut pdf = Vec::new();
 Html::from_string("<p>Hello, world</p>")
     .write_pdf(&mut pdf, &RenderOptions::default(), &PdfOptions::default())
     .await?;
-# Ok::<(), quire::Error>(())
+# Ok::<(), spindrift::Error>(())
 ```
 
 Rendering an HTML file from Rust uses the same library path:
 
 ```rust
-use quire::{Html, PdfOptions, RenderOptions};
+use spindrift::{Html, PdfOptions, RenderOptions};
 use std::fs::File;
 
 let mut output = File::create("/tmp/example.pdf")?;
@@ -121,7 +121,7 @@ Html::from_file("example.html")
         &PdfOptions::default(),
     )
     .await?;
-# Ok::<(), quire::Error>(())
+# Ok::<(), spindrift::Error>(())
 ```
 
 ## Benchmarking
@@ -131,7 +131,7 @@ Html::from_file("example.html")
 When profiling using instruments, you may need to add an entitlement to allow Instruments to inspect the process:
 
 ```bash
-codesign --force  --sign - --timestamp=none --entitlements debug.entitlements target/release/quire
+codesign --force  --sign - --timestamp=none --entitlements debug.entitlements target/release/spindrift
 ```
 
 ```xml
@@ -148,4 +148,4 @@ codesign --force  --sign - --timestamp=none --entitlements debug.entitlements ta
 
 ## Web Platform Tests
 
-There is an external runner for web platform tests in `../quire-wpt`; there is a checkout of the tests there at `../quire-wpt/third_party/wpt`.
+There is an external runner for web platform tests in `../spindrift-wpt`; there is a checkout of the tests there at `../spindrift-wpt/third_party/wpt`.

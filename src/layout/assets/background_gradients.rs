@@ -547,7 +547,7 @@ fn radial_gradient_paint_domain_scale(
 }
 
 /// Whether repeating this generated image through a PDF tiling pattern
-/// preserves Quire's image-emission semantics.
+/// preserves Spindrift's image-emission semantics.
 ///
 /// A gradient with identical stop colors is spatially constant after CSS
 /// Images color-stop fixup, regardless of its direction, hint, or stop

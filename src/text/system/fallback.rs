@@ -78,7 +78,7 @@ impl FontSystem {
 
     /// Resolve the family source supplied to Parley for a CSS style.
     ///
-    /// Every resolved family is replaced with Quire's concrete selection.
+    /// Every resolved family is replaced with Spindrift's concrete selection.
     /// Passing a raw named stack or generic keyword to Parley would invoke a
     /// second platform matcher, which can select a different font program
     /// from the one used for CSS matching, metrics, and PDF planning.

@@ -1,6 +1,6 @@
 use super::*;
 
-fn assert_no_red_or_hotpink_rects(document: &quire::Document) {
+fn assert_no_red_or_hotpink_rects(document: &spindrift::Document) {
     let red = CssColor::new(255, 0, 0);
     let hotpink = CssColor::new(255, 105, 180);
     let painted = document
@@ -15,7 +15,7 @@ fn assert_no_red_or_hotpink_rects(document: &quire::Document) {
     );
 }
 
-fn page_has_line(page: &quire::Page, text: &str) -> bool {
+fn page_has_line(page: &spindrift::Page, text: &str) -> bool {
     page.lines().iter().any(|line| line.text == text)
 }
 
@@ -1350,7 +1350,7 @@ async fn inline_block_abspos_static_position_uses_margin_box_top() {
 async fn render_inline_abspos_static_position_text_box_trim_case(
     target_extra: &str,
     body: &str,
-) -> quire::Document {
+) -> spindrift::Document {
     Html::from_string(format!(
         "<!DOCTYPE html>\
          <style>\
@@ -1374,7 +1374,7 @@ async fn inline_abspos_static_position_uses_trimmed_text_box_paint_origin() {
         render_inline_abspos_static_position_text_box_trim_case("text-box-trim: trim-start;", body)
             .await;
 
-    let abs_line_y = |document: &quire::Document| {
+    let abs_line_y = |document: &spindrift::Document| {
         document.pages[0]
             .lines()
             .iter()
@@ -1398,7 +1398,7 @@ async fn inline_abspos_static_position_advances_by_trimmed_text_box_line_height(
         render_inline_abspos_static_position_text_box_trim_case("text-box-trim: trim-start;", body)
             .await;
 
-    let abs_line_y = |document: &quire::Document| {
+    let abs_line_y = |document: &spindrift::Document| {
         document.pages[0]
             .lines()
             .iter()
@@ -1434,7 +1434,7 @@ async fn block_abspos_static_position_after_inline_uses_trimmed_text_box_line_he
         .await
         .unwrap();
 
-    let abs_rect_y = |document: &quire::Document| {
+    let abs_rect_y = |document: &spindrift::Document| {
         document.pages[0]
             .rects()
             .iter()
@@ -1507,7 +1507,7 @@ async fn anonymous_block_after_flow_matches_inline_abspos_reference_with_default
     .unwrap();
 
     fn line<'a>(
-        document: &'a quire::Document,
+        document: &'a spindrift::Document,
         text: &str,
     ) -> &'a crate::document::paint::text::RenderedLine {
         document.pages[0]
@@ -2134,7 +2134,7 @@ async fn positioned_descendant_of_phantom_inline_line_replays_without_flow_effec
         .await
         .unwrap();
     let green = CssColor::new(0, 128, 0);
-    let positioned_rect = |document: &quire::Document| {
+    let positioned_rect = |document: &spindrift::Document| {
         let rects = document.pages[0]
             .rects()
             .iter()
@@ -2147,7 +2147,7 @@ async fn positioned_descendant_of_phantom_inline_line_replays_without_flow_effec
         );
         rects[0].clone()
     };
-    let after_y = |document: &quire::Document| {
+    let after_y = |document: &spindrift::Document| {
         document.pages[0]
             .lines()
             .iter()
@@ -2992,7 +2992,7 @@ async fn block_in_inline_text_align_does_not_move_split_block_child() {
 
 #[tokio::test]
 async fn wpt_block_in_inline_align_matches_reference_if_available() {
-    let wpt_root = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt");
+    let wpt_root = std::path::Path::new("/Users/lee/oss/spindrift-wpt/third_party/wpt");
     if !wpt_root.exists() {
         return;
     }
@@ -3741,7 +3741,7 @@ async fn following_flow_after_nested_absolute_overflow_stays_in_source_flow() {
 
 #[tokio::test]
 async fn forced_break_before_defeats_previous_break_after_avoid_without_leading_blank() {
-    let wpt_root = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt");
+    let wpt_root = std::path::Path::new("/Users/lee/oss/spindrift-wpt/third_party/wpt");
     if !wpt_root.exists() {
         return;
     }
@@ -3792,7 +3792,7 @@ async fn forced_breaks_retain_flow_only_min_height_pages() {
 
 #[tokio::test]
 async fn wpt_basic_pagination_page_counts_match_expected_pages() {
-    let wpt_root = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt");
+    let wpt_root = std::path::Path::new("/Users/lee/oss/spindrift-wpt/third_party/wpt");
     if !wpt_root.exists() {
         return;
     }
@@ -5589,7 +5589,7 @@ async fn nested_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
         "avoid retry must retain the default body canvas inset: {page_lines:?}"
     );
     let blue = CssColor::new(0, 0, 255);
-    let blue_origins = |page: &quire::Page| {
+    let blue_origins = |page: &spindrift::Page| {
         page.rects()
             .iter()
             .filter(|rect| {
@@ -6639,7 +6639,7 @@ async fn positioned_collapsed_table_paints_cell_text_above_late_border_rects() {
     assert!(!covering_rect_after_text);
 }
 
-fn painted_red_blue_rect_fills(page: &quire::Page) -> Vec<CssColor> {
+fn painted_red_blue_rect_fills(page: &spindrift::Page) -> Vec<CssColor> {
     let red = CssColor::new(255, 0, 0);
     let blue = CssColor::new(0, 0, 255);
     painted_rect_fills(page, &[red, blue])
@@ -6664,7 +6664,7 @@ async fn stacking_trigger_paint_order(parent_declaration: &str) -> Vec<CssColor>
 }
 
 fn filled_rect(
-    page: &quire::Page,
+    page: &spindrift::Page,
     color: CssColor,
 ) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()
@@ -6674,7 +6674,7 @@ fn filled_rect(
 }
 
 fn emitted_rects_with_fills<'a>(
-    page: &'a quire::Page,
+    page: &'a spindrift::Page,
     colors: &[CssColor],
 ) -> Vec<(usize, &'a crate::document::paint::shapes::RenderedRect)> {
     page.paint_operations()
@@ -6765,7 +6765,7 @@ fn same_pdf_rect(left: (f32, f32, f32, f32), right: (f32, f32, f32, f32)) -> boo
 }
 
 fn assert_final_rect_fill(
-    page: &quire::Page,
+    page: &spindrift::Page,
     rect: &crate::document::paint::shapes::RenderedRect,
     expected: CssColor,
 ) {
@@ -6782,7 +6782,7 @@ fn assert_final_rect_fill(
     }
 }
 
-fn painted_rect_fills(page: &quire::Page, colors: &[CssColor]) -> Vec<CssColor> {
+fn painted_rect_fills(page: &spindrift::Page, colors: &[CssColor]) -> Vec<CssColor> {
     page.operations()
         .iter()
         .filter_map(|operation| match operation {
@@ -6795,7 +6795,7 @@ fn painted_rect_fills(page: &quire::Page, colors: &[CssColor]) -> Vec<CssColor> 
         .collect()
 }
 
-fn painted_blue_rect_count(page: &quire::Page) -> usize {
+fn painted_blue_rect_count(page: &spindrift::Page) -> usize {
     let blue = CssColor::new(0, 0, 255);
     page.operations()
         .iter()

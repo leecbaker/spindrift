@@ -403,7 +403,7 @@ impl<'a> LayoutBuilder<'a> {
     /// Estimate a grid container's min-content and max-content inline widths.
     ///
     /// CSS Grid defines container intrinsic sizes from track sizing with grid
-    /// item intrinsic contributions. This is a first Quire-native entrypoint
+    /// item intrinsic contributions. This is a first Spindrift-native entrypoint
     /// for parent sizing and shrink-to-fit paths; it handles fixed and basic
     /// intrinsic explicit column tracks while keeping more complex spanning and
     /// flexible-track cases documented as remaining divergences:
@@ -669,7 +669,7 @@ impl<'a> LayoutBuilder<'a> {
     /// Estimate one grid item's content-box intrinsic contribution.
     ///
     /// CSS Grid track sizing depends on grid item min-content and max-content
-    /// contributions. This helper deliberately reuses Quire's existing inline,
+    /// contributions. This helper deliberately reuses Spindrift's existing inline,
     /// block, flex, table, and replaced-element estimators so grid content
     /// sizing stays aligned with other formatting contexts:
     /// <https://www.w3.org/TR/css-grid-1/#intrinsic-sizes> and
@@ -1395,7 +1395,7 @@ impl IntrinsicColumnExtent {
 /// placement, positive numeric column lines, positive named column lines, and
 /// named spans that search past the end of the explicit grid. Negative and
 /// more complex implicit-line cases still fall back to the conservative aggregate
-/// intrinsic contribution until Quire has a fuller implicit-grid placement
+/// intrinsic contribution until Spindrift has a fuller implicit-grid placement
 /// model:
 /// <https://www.w3.org/TR/css-grid-1/#explicit-grids> and
 /// <https://www.w3.org/TR/css-grid-1/#auto-placement-algo>.
@@ -2909,9 +2909,9 @@ pub(super) fn measure_grid_item(
     )
 }
 
-/// Adapt Quire's Grid intrinsic estimate to Taffy 0.14's leaf callback.
+/// Adapt Spindrift's Grid intrinsic estimate to Taffy 0.14's leaf callback.
 /// Taffy consumes only horizontal first/last baselines, so an estimate whose
-/// axes were projected for vertical writing remains under Quire's baseline
+/// axes were projected for vertical writing remains under Spindrift's baseline
 /// reconciliation instead.
 pub(super) fn taffy_grid_measurement(
     input: taffy::tree::LayoutInput,

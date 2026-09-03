@@ -4,7 +4,7 @@ use super::*;
 use crate::css::MediaType;
 use crate::css::component_values::{split_css_top_level_delimiter, split_css_top_level_keyword};
 
-/// The result of evaluating one media query in Quire's print environment.
+/// The result of evaluating one media query in Spindrift's print environment.
 ///
 /// Media Queries distinguishes an invalid query from a valid query that does
 /// not match. In particular, `not` may negate the latter but must not make an
@@ -245,7 +245,7 @@ fn media_feature_evaluation(
     let Some((name, value)) = feature.split_once(':') else {
         return match feature.to_ascii_lowercase().as_str() {
             "color" | "height" | "width" => MediaQueryEvaluation::Matches,
-            // Quire does not execute scripts, so the discrete `scripting`
+            // Spindrift does not execute scripts, so the discrete `scripting`
             // feature has its false `none` value in a boolean context.
             // https://drafts.csswg.org/mediaqueries-5/#scripting
             "scripting" => MediaQueryEvaluation::DoesNotMatch,

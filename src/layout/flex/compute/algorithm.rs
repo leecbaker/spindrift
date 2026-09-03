@@ -386,7 +386,7 @@ impl<'a> LayoutBuilder<'a> {
                 !child_style.box_values.min_width.is_auto()
                     || !child_style.box_values.max_width.is_auto()
             };
-            // Quire resolves an authored non-replaced ratio in its flex
+            // Spindrift resolves an authored non-replaced ratio in its flex
             // adapters so its box-sizing semantics and transferred size
             // suggestions remain intact. Leave natural replaced ratios with
             // Taffy, which still needs them to derive the ordinary intrinsic
@@ -553,7 +553,7 @@ impl<'a> LayoutBuilder<'a> {
             if has_authored_non_replaced_ratio {
                 // The leaf measure callback otherwise reintroduces the
                 // authored ratio when Taffy supplies a known cross size.
-                // Quire owns this ratio's flex sizing so it can preserve CSS
+                // Spindrift owns this ratio's flex sizing so it can preserve CSS
                 // Sizing's box-model and transferred-size semantics.
                 taffy_measure_estimate.preferred_aspect_ratio = None;
             }
@@ -845,7 +845,7 @@ impl<'a> LayoutBuilder<'a> {
         // algorithm, even when its display is Flex.  A zero-contribution
         // probe keeps an otherwise-empty Flex container on the Flex path so
         // its authored size and CSS Align static-position rectangle remain
-        // available to Quire.  It is never exposed as an item or a line.
+        // available to Spindrift.  It is never exposed as an item or a line.
         let mut layout_nodes = nodes.clone();
         if layout_nodes.is_empty() {
             let zero = taffy_layout::Dimension::length(0.0);
@@ -1081,7 +1081,7 @@ impl<'a> LayoutBuilder<'a> {
             },
         );
         // Taffy provides the flexible lengths, but CSS Align distribution
-        // fallbacks depend on Quire's resolved free space, including negative
+        // fallbacks depend on Spindrift's resolved free space, including negative
         // overflow. Repack a row only when one of those distribution keywords
         // can select a different final placement; ordinary row placement
         // remains Taffy's allocation, which preserves its already-resolved
@@ -1582,7 +1582,7 @@ impl<'a> LayoutBuilder<'a> {
 /// A wrapping container whose main size is indefinite collects every item
 /// into a single line. Taffy's max-content root probe otherwise treats an
 /// automatic column height as a finite wrapping slot and can materialize a
-/// second physical column before Quire has determined the used main size.
+/// second physical column before Spindrift has determined the used main size.
 /// The same rule applies to `wrap-reverse`; reversal has no effect when only
 /// one line exists.
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-line-break>

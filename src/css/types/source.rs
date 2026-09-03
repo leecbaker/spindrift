@@ -14,10 +14,10 @@ use super::*;
 /// A stylesheet source and its resource-loading context.
 ///
 /// ```no_run
-/// use quire::{Css, Html, PdfOptions, RenderOptions};
+/// use spindrift::{Css, Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let stylesheet = Css::from_file("print.css").await?.with_user_origin();
 /// let html = Html::from_file("report.html")
 ///     .await?
@@ -47,7 +47,7 @@ impl Css {
     /// Creates an author-origin stylesheet from CSS source text.
     ///
     /// ```
-    /// use quire::Css;
+    /// use spindrift::Css;
     ///
     /// let stylesheet = Css::from_string("article { margin: 1in }");
     /// ```
@@ -69,8 +69,8 @@ impl Css {
     /// Asynchronously loads an author-origin stylesheet from a local file.
     ///
     /// ```no_run
-    /// # async fn load() -> quire::Result<()> {
-    /// let stylesheet = quire::Css::from_file("styles.css").await?;
+    /// # async fn load() -> spindrift::Result<()> {
+    /// let stylesheet = spindrift::Css::from_file("styles.css").await?;
     /// # let _ = stylesheet;
     /// # Ok(())
     /// # }
@@ -99,7 +99,7 @@ impl Css {
     /// ```no_run
     /// # async fn load() -> Result<(), Box<dyn std::error::Error>> {
     /// let url = "https://example.test/styles.css".parse()?;
-    /// let stylesheet = quire::Css::from_url(url).await?;
+    /// let stylesheet = spindrift::Css::from_url(url).await?;
     /// # let _ = stylesheet;
     /// # Ok(())
     /// # }
@@ -113,11 +113,11 @@ impl Css {
     /// ```no_run
     /// # async fn load() -> Result<(), Box<dyn std::error::Error>> {
     /// let url = "https://example.test/styles.css".parse()?;
-    /// let policy = quire::ResourcePolicy {
+    /// let policy = spindrift::ResourcePolicy {
     ///     follow_http_redirects: false,
     ///     ..Default::default()
     /// };
-    /// let stylesheet = quire::Css::from_url_with_resource_policy(url, policy).await?;
+    /// let stylesheet = spindrift::Css::from_url_with_resource_policy(url, policy).await?;
     /// # let _ = stylesheet;
     /// # Ok(())
     /// # }
@@ -210,7 +210,7 @@ impl Css {
     /// <https://www.w3.org/TR/css-cascade-5/#cascade-origin>.
     ///
     /// ```
-    /// let stylesheet = quire::Css::from_string("p { color: navy }").with_user_origin();
+    /// let stylesheet = spindrift::Css::from_string("p { color: navy }").with_user_origin();
     /// ```
     pub fn with_user_origin(mut self) -> Self {
         self.origin = StylesheetOrigin::User;
@@ -229,7 +229,7 @@ impl Css {
 
     /// Marks this stylesheet as a user-agent-origin stylesheet.
     ///
-    /// This is primarily useful for tests and custom embedding; Quire's
+    /// This is primarily useful for tests and custom embedding; Spindrift's
     /// built-in HTML defaults are already loaded as UA-origin rules:
     /// <https://www.w3.org/TR/css-cascade-5/#cascade-origin>.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -241,8 +241,8 @@ impl Css {
     /// Sets the policy used to load this stylesheet's `@import` resources.
     ///
     /// ```
-    /// let stylesheet = quire::Css::from_string("@import url(theme.css);")
-    ///     .with_resource_policy(quire::ResourcePolicy::default());
+    /// let stylesheet = spindrift::Css::from_string("@import url(theme.css);")
+    ///     .with_resource_policy(spindrift::ResourcePolicy::default());
     /// ```
     pub fn with_resource_policy(mut self, resource_policy: crate::ResourcePolicy) -> Self {
         self.resource_policy = resource_policy;
@@ -276,8 +276,8 @@ impl Css {
     /// <https://www.w3.org/TR/css-values-4/#urls>.
     ///
     /// ```no_run
-    /// # fn configure() -> quire::Result<()> {
-    /// let stylesheet = quire::Css::from_string("img { content: url(icon.svg) }")
+    /// # fn configure() -> spindrift::Result<()> {
+    /// let stylesheet = spindrift::Css::from_string("img { content: url(icon.svg) }")
     ///     .with_base_path("assets")?;
     /// # let _ = stylesheet;
     /// # Ok(())

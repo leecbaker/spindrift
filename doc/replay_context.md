@@ -1,6 +1,6 @@
 # Replay context contract
 
-Layout in Quire has speculative selection phases and later paint/fragmentation
+Layout in Spindrift has speculative selection phases and later paint/fragmentation
 replay phases.  A replay must not infer semantic input from whichever mutable
 `LayoutBuilder` state happens to be active at that later point.
 

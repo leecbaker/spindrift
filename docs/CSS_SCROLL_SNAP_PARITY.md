@@ -5,7 +5,7 @@
 The local non-script `css/css-scroll-snap/` WPT selection executes 14 visual
 reftest/crashtest candidates. The current implementation passes 12 / 14.
 
-Quire now computes CSS Scroll Snap Level 1 container, area, and offset
+Spindrift now computes CSS Scroll Snap Level 1 container, area, and offset
 properties (`scroll-snap-*`, `scroll-padding-*`, and `scroll-margin-*`) and
 has a static snapport/candidate-selection model, captured scroll-content paint
 translation and clipping, static iframe browsing contexts, and fragment-target
@@ -25,4 +25,4 @@ their child used values and natural sizes once, without a compositing transform.
   `scroll-snap-initial-layout-000.html` and
   `scroll-snap-writing-mode-000.html`.
 - Live DOM scrolling, JavaScript, scroll-snap events, and the script-bearing
-  WPT cases remain outside Quire's static PDF renderer scope.
+  WPT cases remain outside Spindrift's static PDF renderer scope.

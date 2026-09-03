@@ -2,7 +2,7 @@
 
 Last updated: 2026-08-13
 
-This document tracks Quire's CSS Grid implementation. It is a living
+This document tracks Spindrift's CSS Grid implementation. It is a living
 tracking document: update it whenever grid behavior is added, narrowed,
 deferred, or found to diverge from the specs. The normative references are
 CSS Grid Layout Level 1, CSS Grid Layout Level 2, CSS Box Alignment Level 3,
@@ -52,7 +52,7 @@ failures are concentrated in Level 3 Grid Lanes track sizing, subgrids,
 baseline alignment, positioned descendants, and the corresponding fragmented
 or writing-mode behavior.
 
-- Quire has grid-specific geometry scaffolding in `src/layout/grid.rs`,
+- Spindrift has grid-specific geometry scaffolding in `src/layout/grid.rs`,
   including typed grid coordinates and projection into page-top paint space.
 - Standard Grid Level 1 containers and normal-flow items consume effective
   zoom at a distinct used-style boundary. Fixed track breadths, implicit
@@ -71,7 +71,7 @@ or writing-mode behavior.
 - Taffy 0.13.0 is the core Grid engine. Its template-area representation
   preserves authored row/column dimensions even when cells are unnamed, and it
   resolves horizontal-tb `self-start`/`self-end` against each item's direction.
-  Quire retains vertical-writing, baseline, fragmentation, and physical-side
+  Spindrift retains vertical-writing, baseline, fragmentation, and physical-side
   corrections outside that public model.
 - CSS display parsing now accepts `grid`, `inline-grid`, `block grid`,
   `inline grid`, and `run-in grid`. Grid boxes are recognized as independent
@@ -105,7 +105,7 @@ or writing-mode behavior.
   tokens.
 - Layout dispatch has a dedicated grid entrypoint. The first same-page path
   collects normal-flow grid items, runs a Taffy-backed Grid Level 1 layout,
-  and replays each item through Quire's existing block, inline, table, flex,
+  and replays each item through Spindrift's existing block, inline, table, flex,
   replaced, paint, and side-effect machinery. Grid container
   roots accept explicit parent-owned principal-box paint during flex replay;
   this suppresses only the grid root's decoration and gap rules, never its
@@ -242,7 +242,7 @@ or writing-mode behavior.
   numeric/named `auto-fit` repeated tracks after empty-track collapse. Grid
   leaf nodes now answer Taffy's min-content, max-content, and preferred-size
   measure queries with
-  Quire-measured intrinsic contributions for basic text, block, flex, table,
+  Spindrift-measured intrinsic contributions for basic text, block, flex, table,
   and replaced-element content.
   Parent sizing paths can also query a first grid container intrinsic-width
   estimate for fixed and simple intrinsic explicit column tracks. Simple
@@ -300,7 +300,7 @@ or writing-mode behavior.
   `align-content`, `justify-content`, `align-items`, `justify-items`,
   `align-self`, and `justify-self`. Same-page `align-content: space-evenly`
   and `justify-content: space-evenly` distribute fixed row and column tracks
-  through Taffy. Quire applies a same-page post-layout pass for simple
+  through Taffy. Spindrift applies a same-page post-layout pass for simple
   horizontal first- and last-baseline self-alignment between measured text
   items in the same row and for horizontal `justify-self`/`justify-items`
   `self-start`/`self-end` placement so LTR/RTL items align the subject edge
@@ -337,10 +337,10 @@ or writing-mode behavior.
   lives in `src/layout/grid/static_position.rs`. Fragmentation planning still
   needs further separation as that area matures.
 - Keep Taffy isolated behind the grid adapter. CSS computed values and final
-  layout records should stay Quire-native so PDF side effects, fragmentation,
-  future subgrid support, and spec divergence handling remain under Quire's
+  layout records should stay Spindrift-native so PDF side effects, fragmentation,
+  future subgrid support, and spec divergence handling remain under Spindrift's
   control.
-- Reuse existing Quire machinery for anonymous text items, `display: contents`
+- Reuse existing Spindrift machinery for anonymous text items, `display: contents`
   flattening, block/inline/table/flex child measurement, paint metadata,
   links, bookmarks, counters, and generated content.
 
@@ -372,8 +372,8 @@ or writing-mode behavior.
   items, and basic out-of-flow splitting work. Generated-content fragmentation
   and side-effect replay are tracked with grid fragmentation, and full
   out-of-flow static-position behavior is tracked with absolute positioning.
-- [ ] Taffy adapter maps Quire grid values to Taffy and converts unrounded
-  layouts back to Quire grid item records. Same-page row auto-flow, column
+- [ ] Taffy adapter maps Spindrift grid values to Taffy and converts unrounded
+  layouts back to Spindrift grid item records. Same-page row auto-flow, column
   auto-flow with implicit auto columns, and dense backfill for simple spanning
   items are covered by smoke tests. Implicit `grid-auto-rows` and
   `grid-auto-columns` track lists cycle in simple same-page cases. Same-page
@@ -483,7 +483,7 @@ or writing-mode behavior.
 - [ ] Grid-specific box alignment behavior is partially implemented through
   Taffy's common alignment model. Simple same-page horizontal first- and
   last-baseline self-alignment for text items in the same row is corrected
-  with Quire-owned baseline metadata, and same-page horizontal
+  with Spindrift-owned baseline metadata, and same-page horizontal
   `justify-self`/`justify-items` `self-start`/`self-end` placement follows
   the grid item's own LTR/RTL inline direction, same-page horizontal
   `align-self`/`align-items` `self-start`/`self-end` follows the grid item's
@@ -504,7 +504,7 @@ or writing-mode behavior.
 - Grid layout is not yet implemented end to end. `layout_grid` handles a
   first same-page normal-flow path, but incomplete adapter coverage can still
   fall back to block layout and many Grid Level 1 behaviors are missing.
-- Grid intrinsic sizing is incomplete. Taffy receives Quire-measured
+- Grid intrinsic sizing is incomplete. Taffy receives Spindrift-measured
   min-content, max-content, and preferred leaf contributions for basic grid
   items, which covers simple `min-content`, `max-content`, and
   `fit-content(<length>)` explicit tracks, including the covered
@@ -693,18 +693,18 @@ or writing-mode behavior.
 ## Architecture Notes
 
 - Prefer reusing flex's adapter pattern over introducing a second layout
-  abstraction: estimate children in Quire, compute item geometry with Taffy,
-  then replay children through Quire layout and paint paths.
+  abstraction: estimate children in Spindrift, compute item geometry with Taffy,
+  then replay children through Spindrift layout and paint paths.
 - Keep the Taffy conversion layer in `src/layout/grid/taffy_adapter.rs` so
   Grid computed values, item collection, replay, side effects, and future
-  fragmentation metadata stay Quire-owned.
+  fragmentation metadata stay Spindrift-owned.
 - Keep grid child collection in `src/layout/grid/children.rs` so anonymous
   text items, `display: contents`, order sorting, out-of-flow splitting, and
   static-position probes share one code path across block grid and
   `inline-grid`.
 - Keep grid intrinsic measurement in `src/layout/grid/intrinsic.rs` so Taffy
   leaf measurement, container shrink-to-fit sizing, and future track-sizing
-  contributions use the same Quire-owned estimator.
+  contributions use the same Spindrift-owned estimator.
 - Keep grid item replay in `src/layout/grid/replay.rs` so block grid and
   `inline-grid` use the same style normalization, side-effect, and child
   formatting-context path after Taffy has produced item geometry.
@@ -746,5 +746,5 @@ or writing-mode behavior.
   output. Fragmentation, alignment, links, bookmarks, and future tagged PDF
   support need durable layout metadata.
 - When Taffy differs from CSS Grid or lacks a required paged-media behavior,
-  correct the result in Quire-owned post-processing and record the divergence
+  correct the result in Spindrift-owned post-processing and record the divergence
   until it is fully resolved.

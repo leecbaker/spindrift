@@ -20,7 +20,7 @@ a[href] { -weasy-link: attr(href) }
 /* Display and visibility */
 
 [hidden], area, base, basefont, command, datalist, head, input[type=hidden i], link, menu[type=context i], meta, noembed, noframes, param, rp, script, source, style, template, title, track { display: none }
-/* HTML hides fallback content only when scripting is enabled. Quire's static
+/* HTML hides fallback content only when scripting is enabled. Spindrift's static
    rendering environment reports `scripting: none`, so this rule does not
    suppress `<noscript>` content. https://html.spec.whatwg.org/multipage/rendering.html#hidden-elements */
 @media (scripting) { noscript { display: none !important } }
@@ -109,7 +109,7 @@ address, cite, dfn, em, i, var { font-style: italic }
 b, strong, th { font-weight: bold }
 code, kbd, listing, plaintext, pre, samp, tt, xmp { font-family: monospace }
 /* CSS Text Level 4's default UA stylesheet preserves preformatted character
-   grids by disabling automatic inter-script spacing. Quire does not yet
+   grids by disabling automatic inter-script spacing. Spindrift does not yet
    implement the accompanying text-spacing-trim shorthand effect. */
 code, kbd, listing, plaintext, pre, samp, tt, xmp { text-autospace: no-autospace }
 h1 { font-size: 2em; font-weight: bold }

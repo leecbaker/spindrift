@@ -699,7 +699,7 @@ impl FontSystem {
     }
 
     /// Resolve a CSS generic-family candidate that can be represented by
-    /// Quire's PDF Type 0 outline-font output. Explicit named-family and
+    /// Spindrift's PDF Type 0 outline-font output. Explicit named-family and
     /// `@font-face` selection deliberately use the unrestricted loader above:
     /// those authorship choices must surface an embedding error rather than be
     /// silently replaced.

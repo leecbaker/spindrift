@@ -1,6 +1,6 @@
 //! Typed coordinate spaces used by layout before paint and PDF serialization.
 //!
-//! Quire has several necessary coordinate systems because CSS layout is not one
+//! Spindrift has several necessary coordinate systems because CSS layout is not one
 //! global `x/y` plane. Formatting contexts first resolve logical spec terms
 //! such as inline/block axes, grid slots, table grid cells, and flex main/cross
 //! axes; only later do those values become physical page geometry and finally
@@ -60,9 +60,9 @@ pub(super) enum ContainerSpace {}
 /// Physical coordinates returned by the Taffy flex layout engine.
 ///
 /// Taffy exposes layout locations in its own physical row/column model, using
-/// `direction` and `flex-direction` inputs supplied by Quire's adapter. Values
+/// `direction` and `flex-direction` inputs supplied by Spindrift's adapter. Values
 /// in this space must be converted at the flex/Taffy boundary before being
-/// stored as Quire layout geometry:
+/// stored as Spindrift layout geometry:
 /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TaffySpace {}
@@ -388,7 +388,7 @@ impl PageTopRect {
     }
 }
 
-/// Convert a paint-space rectangle into Quire's current paint clip primitive.
+/// Convert a paint-space rectangle into Spindrift's current paint clip primitive.
 pub(super) fn paint_rect_to_clip(rect: PaintRect) -> PaintClip {
     PaintClip::from_paint_rect(rect)
 }

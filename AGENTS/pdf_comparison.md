@@ -6,7 +6,7 @@ canonical reachable-PDF graph match that ignores only the document title in
 the Info dictionary and XMP `dc:title`. The latter preserves page content,
 resources, ICC profiles, annotations, text mappings, and all other metadata.
 
-Use the runner in the sibling `quire-wpt` checkout as the source of truth. Do
+Use the runner in the sibling `spindrift-wpt` checkout as the source of truth. Do
 not invoke `magick compare` or `magick identify` directly when evaluating a
 test: the runner's in-process comparator is the authoritative metric and
 avoids repeatedly starting ImageMagick.
@@ -19,7 +19,7 @@ For an engine and one reftest the runner uses:
 - `reference.pdf`: the PDF rendered from the reference file.
 - The reftest operator: `==` means the images should match; `!=` means they
   should differ.
-- Raster settings from `quire-wpt.toml`. The normal pass is 96 DPI and the
+- Raster settings from `spindrift-wpt.toml`. The normal pass is 96 DPI and the
   retry pass is 288 DPI. Raster output is canonical 8-bit RGB PNG (`PNG24`).
 - `max_diff_ratio`: the normalized-MAE pass/fail threshold. Its default is
   `0.0004` for every engine. Exact per-test engine overrides remain in effect
@@ -62,8 +62,8 @@ channel, divided by 255. It ranges from `0.0` (identical raster pixels) to
 Use the runner subcommand rather than ImageMagick:
 
 ```bash
-cd /Users/lee/projects/quire-wpt
-target/release/quire-wpt compare-images actual.png reference.png --diff diff.png
+cd /Users/lee/projects/spindrift-wpt
+target/release/spindrift-wpt compare-images actual.png reference.png --diff diff.png
 ```
 
 It prints `max_diff_ratio`, pixel count, and whether the input pixels are
@@ -78,8 +78,8 @@ configured engines, producing the usual PDFs, PNG artifacts, diffs, and HTML
 report:
 
 ```bash
-cd /Users/lee/projects/quire-wpt
-target/release/quire-wpt evaluate-test css/css-color/deprecated-sameas-003.html
+cd /Users/lee/projects/spindrift-wpt
+target/release/spindrift-wpt evaluate-test css/css-color/deprecated-sameas-003.html
 ```
 
 The test path is relative to the WPT tests root. This is exact selection—not a

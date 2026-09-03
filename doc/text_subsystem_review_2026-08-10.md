@@ -37,7 +37,7 @@ The broader mapped-shaping-input representation is still warranted for emoji sel
 
 `ColrPathPainter` intentionally ignores `push_clip`, `push_clip_box`, `push_transform`, `pop_transform`, `push_layer`, and `pop_layer` (`src/text/system/api/glyphs/color.rs:325-331`). `paint_color_glyph` can therefore report success and remove the original glyph from the PDF-font path (`color.rs:80-91`) even though the returned vector paths omit required COLR behavior. The custom COLR v0 override path has the same limitation for any feature beyond simple layers.
 
-Do not claim successful path conversion unless every callback required by the glyph is represented. A safe interim policy is to retain the glyph for the alternative paint path when the painter sees unsupported operations. The complete solution needs a typed COLR paint graph/stack that can carry clip, transform, and compositing state into Quire paint operations. This is a fidelity issue, not merely a missing enhancement.
+Do not claim successful path conversion unless every callback required by the glyph is represented. A safe interim policy is to retain the glyph for the alternative paint path when the painter sees unsupported operations. The complete solution needs a typed COLR paint graph/stack that can carry clip, transform, and compositing state into Spindrift paint operations. This is a fidelity issue, not merely a missing enhancement.
 
 ### Resolved P2 — raster PNG validation rejects mismatched dimensions
 

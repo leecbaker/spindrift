@@ -1,7 +1,7 @@
 use super::*;
 
 fn filled_rect(
-    page: &quire::Page,
+    page: &spindrift::Page,
     fill: CssColor,
 ) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()

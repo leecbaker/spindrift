@@ -12,7 +12,7 @@ compatible with the ordinary rectangular float area. It predates the
 Milestone 1 implementation below, when `shape-outside` was not parsed or
 carried by `ComputedStyle` and `FloatShape` stored only a `PageTopRect`.
 
-An isolated Quire-only remeasurement on 2026-07-20 passes 85/226 (37.6%) and
+An isolated Spindrift-only remeasurement on 2026-07-20 passes 85/226 (37.6%) and
 fails 141/226. This includes 22 circle tests, 21 ellipse tests, 20 shape-box
 tests, and the float-adjacent forced-break cases that retain their empty line
 boxes. The 15-test gain comes from `shape-margin` for boxes, circles, and
@@ -23,7 +23,7 @@ The current audited composite re-runs every family affected since that full
 measurement: circles pass 28/38, ellipses 27/35, and image/gradient shapes
 19/43. Replacing those baseline family results yields **116/226 (51.3%)**.
 This clears the 50% CSS Shapes milestone criterion. The WPT artifacts are in
-`/private/tmp/quire-shapes-{circle,ellipse,image}-final/`.
+`/private/tmp/spindrift-shapes-{circle,ellipse,image}-final/`.
 
 ## Milestone 1 implementation
 

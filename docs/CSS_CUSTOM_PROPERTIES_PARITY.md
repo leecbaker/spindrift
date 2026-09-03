@@ -2,7 +2,7 @@
 
 Last updated: 2026-08-16
 
-Quire resolves unregistered CSS custom properties at computed-value time using
+Spindrift resolves unregistered CSS custom properties at computed-value time using
 CSS Syntax tokens. Custom-property names therefore compare as decoded,
 case-sensitive identifiers, including CSS escapes, invalid Unicode escapes
 that normalize to U+FFFD, and non-ASCII identifiers.
@@ -56,7 +56,7 @@ that normalize to U+FFFD, and non-ASCII identifiers.
 - CSS Values arbitrary substitution functions other than nested `var()` are
   not implemented.
 - CSS Cascade `revert-rule` is not implemented.
-- Full property grammar coverage after substitution is bounded by Quire's
+- Full property grammar coverage after substitution is bounded by Spindrift's
   ordinary property parsers. Complex `background` shorthands still need
   broader CSS Variables conformance coverage.
 - Source-level discovery of every supported at-rule still retains a small

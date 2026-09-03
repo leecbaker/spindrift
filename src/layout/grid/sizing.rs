@@ -17,11 +17,11 @@ use super::*;
 use crate::layout::baseline::{BaselinePair, PhysicalBaselineSets, PhysicalTopBaselineOffset};
 
 impl<'a> LayoutBuilder<'a> {
-    /// Compute same-page grid item geometry with Quire-measured leaf estimates.
+    /// Compute same-page grid item geometry with Spindrift-measured leaf estimates.
     ///
     /// CSS Grid track sizing consumes each item's min-content, max-content, and
     /// preferred size contributions. Taffy owns the Grid Level 1 placement and
-    /// track-sizing algorithm here, while Quire supplies leaf measurements from
+    /// track-sizing algorithm here, while Spindrift supplies leaf measurements from
     /// the same inline, block, flex, table, and replaced-element paths used by
     /// other layout modes:
     /// <https://www.w3.org/TR/css-grid-1/#algo-overview> and
@@ -1022,7 +1022,7 @@ impl<'a> LayoutBuilder<'a> {
         // tracks and gaps, which is particularly observable when size
         // containment removes every real item from the principal sizing pass.
         // A zero-contribution probe item materializes those tracks without
-        // entering Quire's returned item list. Auto-fit grids remain genuinely
+        // entering Spindrift's returned item list. Auto-fit grids remain genuinely
         // empty so their unoccupied repeated tracks can collapse.
         // <https://www.w3.org/TR/css-grid-1/#explicit-grids>
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
@@ -1249,7 +1249,7 @@ impl<'a> LayoutBuilder<'a> {
             taffy::tree::DetailedLayoutInfo::Grid(info) => {
                 // Taffy 0.14 exposes final logical track positions rather
                 // than the former separate size/gutter arrays.  Preserve
-                // Quire's canonical topology by deriving a track extent and
+                // Spindrift's canonical topology by deriving a track extent and
                 // each interior gutter at this sole backend boundary.
                 let physical_column_gap = physical_column_subgrid.map_or_else(
                     || {
@@ -1449,7 +1449,7 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         // Taffy's item rectangles are physical and use the detailed track
-        // positions above. Whenever Quire canonicalizes collapsed auto-fit
+        // positions above. Whenever Spindrift canonicalizes collapsed auto-fit
         // geometry, retain that observed topology as the correction source so
         // item offsets can be rebased onto the canonical physical topology.
         // This also captures Taffy's content-alignment distribution without
@@ -1593,7 +1593,7 @@ impl<'a> LayoutBuilder<'a> {
         // Taffy 0.14 stores Grid columns in logical order and assigns their
         // physical offsets right-to-left for `direction: rtl`.  Its item
         // rectangles are therefore already the CSS physical rectangles; do
-        // not mirror them a second time before Quire's logical-only replay.
+        // not mirror them a second time before Spindrift's logical-only replay.
         apply_grid_self_alignment_corrections(
             style,
             children,
@@ -2162,7 +2162,7 @@ fn apply_frozen_grid_axis_correction(
             )
         } else {
             // A zero-free-space source cannot reveal a self-alignment
-            // fraction. Preserve its start-side offset; later Quire-owned
+            // fraction. Preserve its start-side offset; later Spindrift-owned
             // self-alignment corrections handle writing-mode-specific cases.
             (target_start + source_offset, size)
         };
@@ -2216,10 +2216,10 @@ fn frozen_grid_item_stretches_axis(
             .is_none()
 }
 
-/// Convert Taffy 0.14's final track positions into Quire's canonical track
+/// Convert Taffy 0.14's final track positions into Spindrift's canonical track
 /// extents and interior gutters.
 ///
-/// The positions include content alignment. Quire's subsequent static-position
+/// The positions include content alignment. Spindrift's subsequent static-position
 /// and replay paths deliberately apply content distribution from the canonical
 /// unaligned topology, so retain Taffy's used track sizes but the pre-alignment
 /// CSS gutter at this boundary.
@@ -2258,7 +2258,7 @@ fn physical_grid_topology_from_taffy_positions(
 }
 
 /// Convert Taffy's historical alternating grid-track representation to the
-/// interior gutters used by Quire's line geometry. Taffy 0.14 already yields
+/// interior gutters used by Spindrift's line geometry. Taffy 0.14 already yields
 /// interior gutters through `taffy_grid_track_layout_from_positions`, while
 /// this normalizer retains compatibility with frozen topology corrections.
 fn taffy_grid_track_gutters(taffy_gutters: &[f32], track_count: usize) -> Vec<f32> {
@@ -2474,10 +2474,10 @@ impl CorrectionSource {
 
 /// Collapse empty frozen `auto-fit` tracks after startward implicit expansion.
 ///
-/// Quire freezes a definite auto-repeat count before prepending startward
+/// Spindrift freezes a definite auto-repeat count before prepending startward
 /// implicit tracks so the authored repeat count is not recomputed from the
 /// enlarged Taffy template. CSS Grid still requires empty `auto-fit` repeated
-/// tracks to collapse before content alignment, so Quire mirrors that part of
+/// tracks to collapse before content alignment, so Spindrift mirrors that part of
 /// the used-track geometry after Taffy returns detailed track data:
 /// <https://www.w3.org/TR/css-grid-1/#auto-repeat>.
 fn startward_auto_fit_track_correction(
@@ -2920,7 +2920,7 @@ mod tests {
     fn taffy_track_positions_preserve_rtl_ordered_track_and_gutter_geometry() {
         // Taffy reports physical final positions, including an RTL grid's
         // visual reversal. The bridge retains that exact track order and
-        // derives only the interior gaps needed by Quire's logical replay.
+        // derives only the interior gaps needed by Spindrift's logical replay.
         let positions = [
             taffy_layout::Line {
                 start: 70.0,

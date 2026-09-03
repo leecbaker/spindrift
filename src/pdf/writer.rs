@@ -989,7 +989,7 @@ fn write_images(
 /// Emit PDF tiling pattern streams for repeated raster CSS backgrounds.
 ///
 /// ISO 32000-1:2008, 8.7.3 defines tiling patterns as reusable cells painted
-/// by the PDF consumer. Each Quire pattern cell paints one image XObject at the
+/// by the PDF consumer. Each Spindrift pattern cell paints one image XObject at the
 /// used CSS background tile size; the page content stream clips and fills the
 /// background painting area with the pattern color space.
 #[cfg(any())]
@@ -1737,7 +1737,7 @@ fn write_ext_gstate_objects(pdf: &mut Pdf, page_ext_gstate_plans: &[Vec<ExtGStat
 /// ISO 32000-1:2008, 14.4 "File Identifiers" defines `/ID` as two byte
 /// strings in the file trailer. The first identifies the original file and the
 /// second identifies the current revision; PDF/A-1 requires the array to be
-/// present. Quire writes complete files rather than incremental updates, so a
+/// present. Spindrift writes complete files rather than incremental updates, so a
 /// deterministic identifier derived from the generated document artifacts is
 /// used for both entries.
 fn pdf_file_identifier(
@@ -1749,7 +1749,7 @@ fn pdf_file_identifier(
     page_ext_gstate_plans: &[Vec<ExtGStateObjectPlan>],
 ) -> (Vec<u8>, Vec<u8>) {
     let mut hash = PdfFileIdentifierHash::new();
-    hash.write_bytes(b"quire-pdf-file-id-v1");
+    hash.write_bytes(b"spindrift-pdf-file-id-v1");
     hash.write_document_metadata(&document.metadata);
 
     hash.write_usize(document.pages.len());

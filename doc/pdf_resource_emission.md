@@ -1,6 +1,6 @@
 # PDF Resource Emission
 
-Quire emits regular-PDF resources only when the rendered document can refer to
+Spindrift emits regular-PDF resources only when the rendered document can refer to
 them. An unpainted ordinary-PDF page therefore has no content stream,
 calibrated color profile, or XMP packet when the source supplies no document
 metadata. A page still carries its required empty `/Resources` dictionary; the
@@ -13,7 +13,7 @@ for an unpainted page.
 
 This follows PDF resource dictionaries' role as name scopes for content
 operators (ISO 32000-2:2020, 7.8.3) and avoids declaring names that no content
-stream can use. It does not change Quire's default PDF 1.4 compatibility
+stream can use. It does not change Spindrift's default PDF 1.4 compatibility
 target.
 
 ## Symbolic resource planning
@@ -25,7 +25,7 @@ planner resolves typed Form, Pattern, Function, and ExtGState handles in
 deterministic encounter order. In particular, a Form only receives its own
 direct nested Form dependencies, rather than a copy of the page's Form table.
 This follows the PDF 2.0 requirement for independent Form XObjects to supply
-their named resources and is emitted for Quire's PDF 1.4 output as an
+their named resources and is emitted for Spindrift's PDF 1.4 output as an
 interoperability discipline.
 
 Every emitted content stream is frozen at that boundary, including raster and
@@ -51,7 +51,7 @@ program invariant asserts that all resolved indirect references are unique.
 An isolated transparency Form explicitly selects its sRGB ICCBased blending
 space. That requirement is independent from CSS paint colour spaces, so a
 colourless isolated Form still causes the required sRGB profile to be planned.
-Quire first lowers against a provisional policy with no indirect references,
+Spindrift first lowers against a provisional policy with no indirect references,
 then derives the resolved ICC plan from the final PDF paint operators,
 normalized gradients, SVG tile streams, and emitted Form kinds. This preserves
 CSS conversion and interpolation semantics while allowing unused source paint

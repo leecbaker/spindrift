@@ -9,7 +9,7 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         // The document root has no element parent. Its font-relative
         // `font-size` terms must therefore use the CSS initial values, not
-        // Quire's outer rendering defaults. This mirrors the root cascade
+        // Spindrift's outer rendering defaults. This mirrors the root cascade
         // base and keeps `rem` in a root `font-size` anchored to the initial
         // font size:
         // <https://www.w3.org/TR/css-cascade-5/#root-element> and

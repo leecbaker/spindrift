@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use clap::{ArgGroup, CommandFactory, Parser, ValueEnum, ValueHint};
 use clap_complete::{Shell, generate};
 use log::LevelFilter;
-use quire::{
+use spindrift::{
     Css, FetchErrorPolicy, FontEmbeddingMode, ForcedColorPalette, ForcedColorsMode, Html,
     HttpRequestTimeout, MediaType, PdfCompression, PdfOptions, PdfProfile, RenderOptions,
     ResourcePolicy, Url,
@@ -16,7 +16,7 @@ use quire::{
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "quire",
+    name = "spindrift",
     version,
     about = "Convert HTML documents to PDF.",
     group(ArgGroup::new("logging").args(["verbose", "debug", "quiet"]).multiple(false))
@@ -201,7 +201,7 @@ fn main() {
     initialize_logger(&args);
     let cli_started = Instant::now();
     let result = match thread::Builder::new()
-        .name("quire-cli-render".to_string())
+        .name("spindrift-cli-render".to_string())
         // Recursive CSS layout and paint traversal can exceed macOS's small
         // default spawned-thread stack for deeply nested reports. This is a
         // bounded rendering worker, so reserve a stable 32 MiB stack rather
@@ -216,13 +216,13 @@ fn main() {
         }) {
         Ok(thread) => match thread.join() {
             Ok(result) => result,
-            Err(_) => Err(quire::Error::InvalidInput(
+            Err(_) => Err(spindrift::Error::InvalidInput(
                 "CLI rendering thread panicked".to_string(),
             )),
         },
         Err(error) => Err(error.into()),
     };
-    log::debug!("quire CLI completed in {:.3?}", cli_started.elapsed());
+    log::debug!("spindrift CLI completed in {:.3?}", cli_started.elapsed());
     if let Err(error) = result {
         log::error!("{error}");
         std::process::exit(1);
@@ -243,10 +243,10 @@ fn initialize_logger(args: &Cli) {
     logger.init();
 }
 
-async fn run(args: Cli) -> quire::Result<()> {
+async fn run(args: Cli) -> spindrift::Result<()> {
     if let Some(shell) = args.generate_completion {
         let mut command = Cli::command();
-        generate(shell, &mut command, "quire", &mut io::stdout());
+        generate(shell, &mut command, "spindrift", &mut io::stdout());
         return Ok(());
     }
 
@@ -278,12 +278,12 @@ async fn run(args: Cli) -> quire::Result<()> {
     let input = args
         .input
         .as_deref()
-        .ok_or_else(|| quire::Error::InvalidInput("expected input argument".to_string()))?;
+        .ok_or_else(|| spindrift::Error::InvalidInput("expected input argument".to_string()))?;
     let output = args
         .output
         .as_deref()
-        .ok_or_else(|| quire::Error::InvalidInput("expected output argument".to_string()))?;
-    let output = canonicalize_output_path(output).map_err(quire::Error::InvalidInput)?;
+        .ok_or_else(|| spindrift::Error::InvalidInput("expected output argument".to_string()))?;
+    let output = canonicalize_output_path(output).map_err(spindrift::Error::InvalidInput)?;
     let mut html = if let Some(url) = parse_resource_url(input) {
         log::debug!("loading HTML from URL {input}");
         Html::from_url_with_resource_policy(url, resource_policy).await?
@@ -311,7 +311,7 @@ async fn run(args: Cli) -> quire::Result<()> {
         let [width, height]: [f32; 2] = viewport
             .try_into()
             .expect("clap enforces exactly two initial viewport dimensions");
-        options.set_initial_viewport_size(quire::CssViewportSize::new(width, height))?;
+        options.set_initial_viewport_size(spindrift::CssViewportSize::new(width, height))?;
     }
     options.forced_colors = args.forced_colors.into();
     options.target_fragment = args.target_fragment;
@@ -350,7 +350,7 @@ fn write_info_report(output: &mut impl Write, system: &os_info::Info) -> io::Res
     writeln!(output, "Machine: {architecture}")?;
     writeln!(output, "Version: {}", system.version())?;
     writeln!(output)?;
-    writeln!(output, "Quire version: {}", env!("CARGO_PKG_VERSION"))
+    writeln!(output, "Spindrift version: {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn canonicalize_output_path(value: &str) -> Result<PathBuf, String> {
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn cli_defaults_to_regular_pdf() {
-        let cli = Cli::try_parse_from(["quire", "input.html", "output.pdf"]).unwrap();
+        let cli = Cli::try_parse_from(["spindrift", "input.html", "output.pdf"]).unwrap();
 
         assert_eq!(cli.pdf_profile, PdfProfile::Pdf);
         assert!(!cli.verbose);
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn cli_accepts_initial_viewport_size() {
         let cli = Cli::try_parse_from([
-            "quire",
+            "spindrift",
             "--initial-viewport-size",
             "800",
             "600",
@@ -433,15 +433,15 @@ mod tests {
 
     #[test]
     fn cli_logging_flags_map_to_weasyprint_levels() {
-        let verbose = Cli::try_parse_from(["quire", "-v", "input.html", "output.pdf"]).unwrap();
+        let verbose = Cli::try_parse_from(["spindrift", "-v", "input.html", "output.pdf"]).unwrap();
         assert!(verbose.verbose);
         assert_eq!(verbose.log_level(), LevelFilter::Info);
 
-        let debug = Cli::try_parse_from(["quire", "-d", "input.html", "output.pdf"]).unwrap();
+        let debug = Cli::try_parse_from(["spindrift", "-d", "input.html", "output.pdf"]).unwrap();
         assert!(debug.debug);
         assert_eq!(debug.log_level(), LevelFilter::Debug);
 
-        let quiet = Cli::try_parse_from(["quire", "-q", "input.html", "output.pdf"]).unwrap();
+        let quiet = Cli::try_parse_from(["spindrift", "-q", "input.html", "output.pdf"]).unwrap();
         assert!(quiet.quiet);
         assert_eq!(quiet.log_level(), LevelFilter::Off);
     }
@@ -450,7 +450,7 @@ mod tests {
     fn cli_rejects_combined_logging_flags() {
         for flags in [["-v", "-d"], ["-v", "-q"], ["-d", "-q"]] {
             assert!(
-                Cli::try_parse_from(["quire", flags[0], flags[1], "input.html", "output.pdf"])
+                Cli::try_parse_from(["spindrift", flags[0], flags[1], "input.html", "output.pdf"])
                     .is_err()
             );
         }
@@ -467,14 +467,14 @@ mod tests {
             "--presentational-hints",
             "--no-presentational-hints",
         ] {
-            assert!(Cli::try_parse_from(["quire", flag, "<p>test</p>", "output.pdf"]).is_err());
+            assert!(Cli::try_parse_from(["spindrift", flag, "<p>test</p>", "output.pdf"]).is_err());
         }
     }
 
     #[test]
     fn cli_info_requires_no_rendering_positionals() {
         for flag in ["-i", "--info"] {
-            let cli = Cli::try_parse_from(["quire", flag]).unwrap();
+            let cli = Cli::try_parse_from(["spindrift", flag]).unwrap();
 
             assert!(cli.info);
             assert!(cli.input.is_none());
@@ -484,19 +484,21 @@ mod tests {
 
     #[test]
     fn cli_info_conflicts_with_completion_generation() {
-        assert!(Cli::try_parse_from(["quire", "--info", "--generate-completion", "bash"]).is_err());
+        assert!(
+            Cli::try_parse_from(["spindrift", "--info", "--generate-completion", "bash"]).is_err()
+        );
     }
 
     #[test]
     fn cli_rendering_still_requires_both_positionals() {
-        assert!(Cli::try_parse_from(["quire"]).is_err());
-        assert!(Cli::try_parse_from(["quire", "input.html"]).is_err());
+        assert!(Cli::try_parse_from(["spindrift"]).is_err());
+        assert!(Cli::try_parse_from(["spindrift", "input.html"]).is_err());
     }
 
     #[test]
     fn cli_accepts_pdf_profile_and_legacy_aliases() {
         let cli = Cli::try_parse_from([
-            "quire",
+            "spindrift",
             "--pdf-profile",
             "pdf/a-1b",
             "input.html",
@@ -506,13 +508,18 @@ mod tests {
 
         assert_eq!(cli.pdf_profile, PdfProfile::PdfA1B);
 
-        let variant =
-            Cli::try_parse_from(["quire", "--pdf-variant", "pdf", "input.html", "output.pdf"])
-                .unwrap();
+        let variant = Cli::try_parse_from([
+            "spindrift",
+            "--pdf-variant",
+            "pdf",
+            "input.html",
+            "output.pdf",
+        ])
+        .unwrap();
         assert_eq!(variant.pdf_profile, PdfProfile::Pdf);
 
         let type_alias =
-            Cli::try_parse_from(["quire", "--pdf-type", "pdf", "input.html", "output.pdf"])
+            Cli::try_parse_from(["spindrift", "--pdf-type", "pdf", "input.html", "output.pdf"])
                 .unwrap();
         assert_eq!(type_alias.pdf_profile, PdfProfile::Pdf);
     }
@@ -520,7 +527,7 @@ mod tests {
     #[test]
     fn cli_accepts_full_fonts() {
         let cli =
-            Cli::try_parse_from(["quire", "--full-fonts", "input.html", "output.pdf"]).unwrap();
+            Cli::try_parse_from(["spindrift", "--full-fonts", "input.html", "output.pdf"]).unwrap();
 
         assert!(cli.full_fonts);
         assert_eq!(FontEmbeddingMode::default(), FontEmbeddingMode::Subset);
@@ -532,8 +539,13 @@ mod tests {
 
     #[test]
     fn cli_accepts_uncompressed_pdf() {
-        let cli = Cli::try_parse_from(["quire", "--uncompressed-pdf", "input.html", "output.pdf"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "spindrift",
+            "--uncompressed-pdf",
+            "input.html",
+            "output.pdf",
+        ])
+        .unwrap();
 
         assert!(cli.uncompressed_pdf);
         assert_eq!(PdfCompression::default(), PdfCompression::Compressed);
@@ -546,7 +558,7 @@ mod tests {
     #[test]
     fn cli_accepts_resource_recovery_controls() {
         let cli = Cli::try_parse_from([
-            "quire",
+            "spindrift",
             "--no-http-redirects",
             "--allow-fetch-errors",
             "input.html",
@@ -557,21 +569,28 @@ mod tests {
         assert!(cli.no_http_redirects);
         assert!(cli.allow_fetch_errors);
         assert!(
-            Cli::try_parse_from(["quire", "--fail-on-http-errors", "input.html", "output.pdf",])
-                .is_err()
+            Cli::try_parse_from([
+                "spindrift",
+                "--fail-on-http-errors",
+                "input.html",
+                "output.pdf",
+            ])
+            .is_err()
         );
     }
 
     #[test]
     fn cli_parses_non_zero_http_request_timeout() {
-        let cli = Cli::try_parse_from(["quire", "-t", "15", "input.html", "output.pdf"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["spindrift", "-t", "15", "input.html", "output.pdf"]).unwrap();
 
         assert_eq!(
             cli.http_timeout.unwrap().duration(),
             Duration::from_secs(15)
         );
         assert!(
-            Cli::try_parse_from(["quire", "--timeout", "0", "input.html", "output.pdf"]).is_err()
+            Cli::try_parse_from(["spindrift", "--timeout", "0", "input.html", "output.pdf"])
+                .is_err()
         );
     }
 
@@ -579,7 +598,7 @@ mod tests {
     fn cli_rejects_unsupported_pdf_profile() {
         for profile in ["pdf/a-4f", "pdf/ua-1", "pdf/x-4", "debug"] {
             let error = Cli::try_parse_from([
-                "quire",
+                "spindrift",
                 "--pdf-profile",
                 profile,
                 "input.html",
@@ -602,7 +621,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_output_with_missing_parent() {
-        let missing_parent = format!("quire-missing-output-parent-{}", std::process::id());
+        let missing_parent = format!("spindrift-missing-output-parent-{}", std::process::id());
         let output = format!("{missing_parent}/output.pdf");
         let error = canonicalize_output_path(&output).unwrap_err();
 
@@ -619,7 +638,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(report).unwrap(),
             format!(
-                "System: {}\nMachine: {}\nVersion: {}\n\nQuire version: {}\n",
+                "System: {}\nMachine: {}\nVersion: {}\n\nSpindrift version: {}\n",
                 system.os_type(),
                 std::env::consts::ARCH,
                 system.version(),

@@ -7,7 +7,7 @@
   color functions.
 - Predefined `color()` spaces: `srgb`, `srgb-linear`, `display-p3`,
   `display-p3-linear`, `a98-rgb`, `prophoto-rgb`, `rec2020`, `xyz`,
-  `xyz-d50`, and `xyz-d65`. Quire owns CSS coordinates and alpha, using
+  `xyz-d50`, and `xyz-d65`. Spindrift owns CSS coordinates and alpha, using
   tagged RGB and D50-PCS coordinate variants. Each RGB variant carries a
   distinct private space marker, and raw coordinates are private. XYZ,
   Lab/LCH, and Oklab/Oklch normalize to unbounded D50 XYZ coordinates.
@@ -42,9 +42,9 @@
 - Palette owns the standard, typed D50 XYZ ↔ Lab and D65 XYZ ↔ OKLab
   transforms. Palette's D50 white point uses CSS Color's exact
   `0.96422 / 1 / 0.82521` reference values, and its unchecked conversions
-  preserve CSS extended-range coordinates. Quire adapts only at the explicit
+  preserve CSS extended-range coordinates. Spindrift adapts only at the explicit
   D50/D65 boundary.
-- Quire owns CSS-specific conversion behavior: the CSS D50/D65 Bradford
+- Spindrift owns CSS-specific conversion behavior: the CSS D50/D65 Bradford
   matrices, LCH/OKLCH polar syntax, predefined RGB matrices and signed
   transfer curves, HSL/HWB grammar, missing-component replacement, polar hue
   interpolation, alpha premultiplication, and output gamut policy. Palette's
@@ -57,7 +57,7 @@
   embedded-profile raster transforms, and ICC byte generation. It is not used
   for CSS predefined-space conversion, where ICC rendering intents and
   profile precision would change CSS-defined extended-range results.
-- CSS Color 5 `color-mix()` across Quire's supported gradient interpolation
+- CSS Color 5 `color-mix()` across Spindrift's supported gradient interpolation
   spaces and polar hue routes. The computed result retains its selected CSS
   space; percentage normalization and premultiplied alpha do not force an
   sRGB conversion.

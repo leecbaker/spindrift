@@ -1892,7 +1892,7 @@ impl<'a> LayoutBuilder<'a> {
         let repeat_size = repeated_sizes.iter().sum::<f32>();
         let repeat_track_count = repeated_sizes.len();
         // CSS Grid floors each auto-repeat track's counting breadth to a
-        // UA-defined non-zero value to avoid division by zero. Quire uses the
+        // UA-defined non-zero value to avoid division by zero. Spindrift uses the
         // suggested one CSS-pixel floor; the floor affects only the count,
         // not the eventual used track breadth.
         let counting_repeat_size = repeated_sizes

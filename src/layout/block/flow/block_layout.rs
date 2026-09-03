@@ -3063,7 +3063,7 @@ impl<'a> LayoutBuilder<'a> {
         // CSS Break permits an oversized monolithic box to be sliced when it
         // cannot fit a fragmentainer. Keep decoration-only size-contained
         // boxes intact (matching replaced elements), while allowing boxes
-        // with fragmentable contents to use Quire's contiguous slice path.
+        // with fragmentable contents to use Spindrift's contiguous slice path.
         // <https://www.w3.org/TR/css-break-3/#breaking-rules>
         let retain_size_contained_monolithic_paint = containment.size
             && (border_paint_rect.size.height <= self.page_area_height() + 0.01
@@ -4300,7 +4300,7 @@ impl<'a> LayoutBuilder<'a> {
     /// can therefore reach later outer fragmentainers while the following
     /// sibling starts at the principal box's authored block-end. This applies
     /// both to a promoted spanner and to an ordinary definite box that fits in
-    /// its current column. Quire already uses this speculative/deferred-paint
+    /// its current column. Spindrift already uses this speculative/deferred-paint
     /// model for fragmented floats; the same mechanism preserves counters,
     /// bookmarks, links, named strings, and running elements while restoring
     /// normal-flow geometry.

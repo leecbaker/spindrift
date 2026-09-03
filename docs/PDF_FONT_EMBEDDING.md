@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-17
 
-Quire emits shaped text through PDF Type 0 fonts with Identity-H CIDs. The PDF
+Spindrift emits shaped text through PDF Type 0 fonts with Identity-H CIDs. The PDF
 objects are serialized with `pdf-writer`; TrueType and OpenType/CFF programs
 are subsetted before embedding with `subsetter`.
 
@@ -33,7 +33,7 @@ are subsetted before embedding with `subsetter`.
   forbids outline embedding before shaping. Explicit named system fonts and
   `@font-face` sources remain authoritative and are rejected by the audit when
   their selected program cannot be embedded.
-- If subsetting fails, does not shrink the font, or cannot be validated, Quire
+- If subsetting fails, does not shrink the font, or cannot be validated, Spindrift
   embeds the full original standalone font program for that used font only.
 
 ## Supported And Fallback Cases

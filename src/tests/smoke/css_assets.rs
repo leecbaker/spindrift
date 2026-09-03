@@ -25,7 +25,7 @@ const GREEN_1X1_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAA
 const GREEN_50X50_SVG: &str = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MCIgaGVpZ2h0PSI1MCIgdmlld0JveD0iMCAwIDUwIDUwIj48cmVjdCB3aWR0aD0iNTAiIGhlaWdodD0iNTAiIGZpbGw9ImdyZWVuIi8+PC9zdmc+";
 
 fn filled_rect(
-    page: &quire::Page,
+    page: &spindrift::Page,
     color: CssColor,
 ) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()
@@ -40,7 +40,7 @@ fn filled_rect(
 }
 
 fn filled_rects(
-    page: &quire::Page,
+    page: &spindrift::Page,
     color: CssColor,
 ) -> Vec<&crate::document::paint::shapes::RenderedRect> {
     page.rects()
@@ -49,7 +49,7 @@ fn filled_rects(
         .collect()
 }
 
-fn assert_pdf_clips_image_draw(document: &quire::Document) {
+fn assert_pdf_clips_image_draw(document: &spindrift::Document) {
     let pdf = document
         .write_pdf_bytes(&crate::PdfOptions::default())
         .unwrap();
@@ -203,8 +203,10 @@ async fn inline_content_background_height_is_independent_of_line_height() {
 
 #[tokio::test]
 async fn normal_line_height_includes_selected_fallback_metrics() {
-    let dir =
-        std::env::temp_dir().join(format!("quire-fallback-line-height-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-fallback-line-height-{}",
+        std::process::id()
+    ));
     let fonts_dir = dir.join("fonts");
     std::fs::create_dir_all(&fonts_dir).unwrap();
     std::fs::copy(
@@ -1050,7 +1052,7 @@ async fn rounded_dashed_borders_clip_dashes_to_side_and_border_ring() {
 
 #[tokio::test]
 async fn paints_stretched_border_image_slices_from_source_pixels() {
-    let dir = std::env::temp_dir().join(format!("quire-border-image-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("spindrift-border-image-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let image_path = dir.join("border.png");
     let mut image = image::RgbaImage::new(3, 3);
@@ -1452,8 +1454,10 @@ async fn fragmented_generated_float_does_not_duplicate_non_repeating_svg_backgro
 
 #[tokio::test]
 async fn paints_repeated_border_image_tiles() {
-    let dir =
-        std::env::temp_dir().join(format!("quire-border-image-repeat-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-border-image-repeat-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let image_path = dir.join("border.png");
     let mut image = image::RgbaImage::new(3, 3);
@@ -1502,7 +1506,10 @@ async fn paints_repeated_border_image_tiles() {
 
 #[tokio::test]
 async fn border_image_width_auto_uses_source_slice_size() {
-    let dir = std::env::temp_dir().join(format!("quire-border-image-auto-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-border-image-auto-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let image_path = dir.join("border.png");
     let mut image = image::RgbaImage::new(6, 6);
@@ -1545,7 +1552,8 @@ async fn border_image_width_auto_uses_source_slice_size() {
 
 #[tokio::test]
 async fn border_image_widths_scale_down_before_overlapping() {
-    let dir = std::env::temp_dir().join(format!("quire-border-image-fit-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("spindrift-border-image-fit-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let image_path = dir.join("border.png");
     let mut image = image::RgbaImage::new(3, 3);
@@ -1963,7 +1971,7 @@ async fn accepts_external_stylesheet_api() {
 
 #[tokio::test]
 async fn external_stylesheets_resolve_imports() {
-    let dir = std::env::temp_dir().join(format!("quire-import-style-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("spindrift-import-style-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let imported_path = dir.join("tokens.css");
     let main_path = dir.join("main.css");
@@ -2013,7 +2021,7 @@ async fn applies_print_media_rules() {
 
 #[tokio::test]
 async fn loads_linked_stylesheets_relative_to_html_file() {
-    let dir = std::env::temp_dir().join(format!("quire-linked-style-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("spindrift-linked-style-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let html_path = dir.join("document.html");
     let css_path = dir.join("style.css");
@@ -2037,7 +2045,10 @@ async fn loads_linked_stylesheets_relative_to_html_file() {
 
 #[tokio::test]
 async fn loads_root_relative_stylesheets_from_base_url() {
-    let dir = std::env::temp_dir().join(format!("quire-root-linked-style-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-root-linked-style-{}",
+        std::process::id()
+    ));
     let document_dir = dir.join("css/css-page");
     let root_fonts = dir.join("fonts");
     std::fs::create_dir_all(&document_dir).unwrap();
@@ -2066,7 +2077,7 @@ async fn loads_root_relative_stylesheets_from_base_url() {
 
 #[tokio::test]
 async fn loads_root_relative_font_face_urls_from_base_url() {
-    let dir = std::env::temp_dir().join(format!("quire-root-font-face-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("spindrift-root-font-face-{}", std::process::id()));
     let document_dir = dir.join("css/css-page");
     let root_fonts = dir.join("fonts");
     std::fs::create_dir_all(&document_dir).unwrap();
@@ -2109,7 +2120,7 @@ async fn loads_root_relative_font_face_urls_from_base_url() {
 
 #[tokio::test]
 async fn loads_images_relative_to_html_file() {
-    let dir = std::env::temp_dir().join(format!("quire-linked-image-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("spindrift-linked-image-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let html_path = dir.join("document.html");
     let image_path = dir.join("dot.png");
@@ -2138,8 +2149,10 @@ async fn loads_images_relative_to_html_file() {
 
 #[tokio::test]
 async fn image_source_attributes_are_not_decoded_twice() {
-    let dir =
-        std::env::temp_dir().join(format!("quire-escaped-image-source-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-escaped-image-source-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let html_path = dir.join("document.html");
     let image_path = dir.join("dot&amp;.png");
@@ -2166,7 +2179,10 @@ async fn image_source_attributes_are_not_decoded_twice() {
 
 #[tokio::test]
 async fn loads_root_relative_images_from_base_url() {
-    let dir = std::env::temp_dir().join(format!("quire-root-linked-image-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-root-linked-image-{}",
+        std::process::id()
+    ));
     let document_dir = dir.join("css/css-page");
     let root_images = dir.join("images");
     std::fs::create_dir_all(&document_dir).unwrap();
@@ -2200,7 +2216,8 @@ async fn loads_root_relative_images_from_base_url() {
 
 #[tokio::test]
 async fn paints_background_images_relative_to_stylesheet_file() {
-    let dir = std::env::temp_dir().join(format!("quire-background-image-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("spindrift-background-image-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let html_path = dir.join("document.html");
     let css_path = dir.join("style.css");
@@ -2235,8 +2252,10 @@ async fn paints_background_images_relative_to_stylesheet_file() {
 
 #[tokio::test]
 async fn background_shorthand_url_path_slash_preserves_explicit_size() {
-    let dir =
-        std::env::temp_dir().join(format!("quire-background-url-slash-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-background-url-slash-{}",
+        std::process::id()
+    ));
     let support_dir = dir.join("support");
     std::fs::create_dir_all(&support_dir).unwrap();
     let html_path = dir.join("document.html");
@@ -2627,7 +2646,8 @@ async fn repeated_url_background_pattern_keeps_rounded_background_clip() {
 
 #[tokio::test]
 async fn paints_first_page_background_image_from_page_rule() {
-    let dir = std::env::temp_dir().join(format!("quire-page-background-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("spindrift-page-background-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let html_path = dir.join("document.html");
     let css_path = dir.join("style.css");
@@ -2665,7 +2685,7 @@ async fn paints_first_page_background_image_from_page_rule() {
 #[tokio::test]
 async fn page_background_origin_selects_page_box_positioning_area() {
     let dir = std::env::temp_dir().join(format!(
-        "quire-page-background-origin-{}",
+        "spindrift-page-background-origin-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -2805,8 +2825,10 @@ async fn page_border_with_zero_margin_paints_at_page_edge() {
 
 #[tokio::test]
 async fn page_background_clip_crops_image_to_page_content_box() {
-    let dir =
-        std::env::temp_dir().join(format!("quire-page-background-clip-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "spindrift-page-background-clip-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let html_path = dir.join("document.html");
     let css_path = dir.join("style.css");
@@ -2844,7 +2866,7 @@ async fn page_background_clip_crops_image_to_page_content_box() {
 #[tokio::test]
 async fn page_background_repeat_y_tiles_from_positioned_image() {
     let dir = std::env::temp_dir().join(format!(
-        "quire-page-background-repeat-{}",
+        "spindrift-page-background-repeat-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -3486,7 +3508,7 @@ async fn child_selectors_keep_nested_inline_descendants_out_of_direct_child_rule
         .await
         .unwrap();
 
-    let run_x = |document: &quire::Document, text: &str| {
+    let run_x = |document: &spindrift::Document, text: &str| {
         let line = document.pages[0]
             .lines()
             .iter()

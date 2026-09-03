@@ -20,7 +20,7 @@ use crate::svg::{
 
 /// Controls how a resource fetch failure affects rendering.
 ///
-/// Quire defaults to [`FetchErrorPolicy::Fail`] for primary documents,
+/// Spindrift defaults to [`FetchErrorPolicy::Fail`] for primary documents,
 /// explicit stylesheets, and fonts. Layout preloads visual assets separately:
 /// a missing image remains an unavailable replaced object so the document can
 /// continue rendering. [`FetchErrorPolicy::Allow`] additionally recovers from
@@ -28,10 +28,10 @@ use crate::svg::{
 /// explicitly supplied stylesheet source optional.
 ///
 /// ```no_run
-/// use quire::{FetchErrorPolicy, Html, PdfOptions, RenderOptions, ResourcePolicy};
+/// use spindrift::{FetchErrorPolicy, Html, PdfOptions, RenderOptions, ResourcePolicy};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let resource_policy = ResourcePolicy {
 ///     error_policy: FetchErrorPolicy::Allow,
 ///     ..ResourcePolicy::default()
@@ -60,10 +60,10 @@ pub enum FetchErrorPolicy {
 /// does not apply to `data:` or `file:` resources.
 ///
 /// ```no_run
-/// use quire::{Html, HttpRequestTimeout, PdfOptions, RenderOptions, ResourcePolicy};
+/// use spindrift::{Html, HttpRequestTimeout, PdfOptions, RenderOptions, ResourcePolicy};
 /// use std::{fs::File, time::Duration};
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let resource_policy = ResourcePolicy {
 ///     http_timeout: HttpRequestTimeout::try_from(Duration::from_secs(5))
 ///         .expect("five seconds is non-zero"),
@@ -114,13 +114,13 @@ impl TryFrom<Duration> for HttpRequestTimeout {
 /// Error returned when constructing an [`HttpRequestTimeout`] from zero.
 ///
 /// ```no_run
-/// use quire::{
+/// use spindrift::{
 ///     Error, Html, HttpRequestTimeout, InvalidHttpRequestTimeout, PdfOptions, RenderOptions,
 ///     ResourcePolicy,
 /// };
 /// use std::{fs::File, time::Duration};
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let timeout = HttpRequestTimeout::try_from(Duration::from_secs(5))
 ///     .map_err(|error: InvalidHttpRequestTimeout| Error::InvalidInput(error.to_string()))?;
 /// let html = Html::from_file("document.html")
@@ -153,10 +153,10 @@ impl std::error::Error for InvalidHttpRequestTimeout {}
 /// preloads always recover as unavailable visual assets.
 ///
 /// ```no_run
-/// use quire::{Html, HttpRequestTimeout, PdfOptions, RenderOptions, ResourcePolicy};
+/// use spindrift::{Html, HttpRequestTimeout, PdfOptions, RenderOptions, ResourcePolicy};
 /// use std::{fs::File, time::Duration};
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let resource_policy = ResourcePolicy {
 ///     follow_http_redirects: false,
 ///     http_timeout: HttpRequestTimeout::try_from(Duration::from_secs(5))
@@ -481,7 +481,7 @@ struct ExternalSvgDocument {
 /// Read-only catalog of same-origin external SVG documents used by inline
 /// SVG `<use>` elements.
 ///
-/// It contains only bytes fetched during Quire's visual-resource preload; SVG
+/// It contains only bytes fetched during Spindrift's visual-resource preload; SVG
 /// parsing never performs I/O. <https://www.w3.org/TR/SVG2/linking.html#processingURL>
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExternalSvgUseResolver {
@@ -553,7 +553,7 @@ impl ExternalSvgUseResolver {
         let prefix = if let Some(prefix) = state.prefixes.get(document_url) {
             prefix.clone()
         } else {
-            let prefix = format!("quire-external-{}-", state.prefixes.len());
+            let prefix = format!("spindrift-external-{}-", state.prefixes.len());
             state.prefixes.insert(document_url.clone(), prefix.clone());
             let mut source = source;
             namespace_svg_ids(&mut source, &prefix);
@@ -1548,8 +1548,8 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="assets/symbols.html#green"/></svg>"#.to_owned(),
         );
 
-        assert!(expanded.contains("id=\"quire-external-0-green\""));
-        assert!(expanded.contains("href=\"#quire-external-0-green\""));
+        assert!(expanded.contains("id=\"spindrift-external-0-green\""));
+        assert!(expanded.contains("href=\"#spindrift-external-0-green\""));
         assert!(!expanded.contains("symbols.html#green"));
         let asset = crate::svg::parse_svg_bytes(expanded.as_bytes()).unwrap();
         assert_eq!(
@@ -1581,8 +1581,8 @@ mod tests {
                 .to_owned(),
         );
 
-        assert!(expanded.contains("#quire-external-0-outer"));
-        assert!(expanded.contains("#quire-external-1-green"));
+        assert!(expanded.contains("#spindrift-external-0-outer"));
+        assert!(expanded.contains("#spindrift-external-1-green"));
         let asset = crate::svg::parse_svg_bytes(expanded.as_bytes()).unwrap();
         assert_eq!(
             asset.opaque_viewport_fill(),
@@ -1605,7 +1605,7 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="https://other.test/symbols.svg#green"/></svg>"#.to_owned(),
         );
 
-        assert!(!expanded.contains("quire-external"));
+        assert!(!expanded.contains("spindrift-external"));
         assert!(crate::svg::parse_svg_bytes(expanded.as_bytes()).is_ok());
     }
 
@@ -1625,7 +1625,7 @@ mod tests {
                 .to_owned(),
         );
 
-        assert!(!expanded.contains("quire-external"));
+        assert!(!expanded.contains("spindrift-external"));
         assert!(expanded.contains("symbols.svg#missing"));
     }
 
@@ -1651,10 +1651,10 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg"><use href="first.svg#green"/><use href="second.svg#green"/></svg>"#.to_owned(),
         );
 
-        assert!(expanded.contains("id=\"quire-external-0-green\""));
-        assert!(expanded.contains("id=\"quire-external-1-green\""));
-        assert!(expanded.contains("href=\"#quire-external-0-green\""));
-        assert!(expanded.contains("href=\"#quire-external-1-green\""));
+        assert!(expanded.contains("id=\"spindrift-external-0-green\""));
+        assert!(expanded.contains("id=\"spindrift-external-1-green\""));
+        assert!(expanded.contains("href=\"#spindrift-external-0-green\""));
+        assert!(expanded.contains("href=\"#spindrift-external-1-green\""));
     }
 
     #[test]
@@ -1680,7 +1680,7 @@ mod tests {
                 .to_owned(),
         );
 
-        assert!(expanded.contains("#quire-external-0-first"));
+        assert!(expanded.contains("#spindrift-external-0-first"));
         assert!(crate::svg::parse_svg_bytes(expanded.as_bytes()).is_ok());
     }
 

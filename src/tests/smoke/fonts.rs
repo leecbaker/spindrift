@@ -1057,7 +1057,7 @@ async fn rtl_inline_color_boundary_matches_zwj_shaping_reference() {
 
 type ArabicLineGeometry = (i32, i32, Vec<(u16, i32)>);
 
-fn arabic_line_geometry(document: &quire::Document) -> Vec<ArabicLineGeometry> {
+fn arabic_line_geometry(document: &spindrift::Document) -> Vec<ArabicLineGeometry> {
     let mut lines = document.pages[0]
         .lines()
         .iter()
@@ -1951,7 +1951,7 @@ struct AlreqLineGlyphs {
     unicode: Vec<String>,
 }
 
-fn alreq_first_line_glyphs(document: &quire::Document) -> Option<AlreqLineGlyphs> {
+fn alreq_first_line_glyphs(document: &spindrift::Document) -> Option<AlreqLineGlyphs> {
     document
         .pages
         .iter()

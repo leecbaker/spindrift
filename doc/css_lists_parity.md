@@ -32,7 +32,7 @@ fragmented, and PDF/UA list-label semantics remain tracked in
 `SPEC_DIVERGENCES.md`.
 
 An empty inline scope whose font or line-height establishes a distinct strut is
-also an accepted first line for this purpose. Quire retains only its resolved
+also an accepted first line for this purpose. Spindrift retains only its resolved
 metrics: it neither paints glyphs or decorations nor advances the inline axis.
 
 An outside marker remains paint-owned by its originating list item even when

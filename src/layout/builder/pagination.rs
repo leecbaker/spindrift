@@ -639,7 +639,7 @@ impl<'a> LayoutBuilder<'a> {
     /// Apply this generated box's `break-before` in the active fragmentainer.
     ///
     /// CSS Fragmentation defines `break-before` generically across
-    /// fragmentainer types. Quire currently materializes only page transitions
+    /// fragmentainer types. Spindrift currently materializes only page transitions
     /// at this builder layer, but the break value is still resolved through the
     /// shared target-aware break context so column-specific values remain
     /// ignored here rather than accidentally treated as page breaks:

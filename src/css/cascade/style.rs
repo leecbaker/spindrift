@@ -7,7 +7,7 @@ use crate::css::html5_user_agent_stylesheet;
 use crate::css::parse::LayerRegistry;
 
 /// Whether an attribute-free element with `tag` has a block-level default
-/// display in Quire's HTML UA stylesheet.
+/// display in Spindrift's HTML UA stylesheet.
 ///
 /// This is intentionally derived through the ordinary UA cascade rather than
 /// duplicating the stylesheet's display selector list. Inline-text collection
@@ -759,7 +759,7 @@ fn style_for_element_with_signature_inner(
     let initial_style = ComputedStyle::initial();
     // The document root has no element parent. Its inherited values, including
     // the `em` basis of its own `font-size`, therefore begin at CSS initial
-    // values rather than at Quire's outer rendering defaults.
+    // values rather than at Spindrift's outer rendering defaults.
     // https://www.w3.org/TR/css-cascade-5/#root-element
     // https://www.w3.org/TR/css-values-4/#em
     let is_document_root = ancestors.is_empty() && current.tag.eq_ignore_ascii_case("html");
@@ -1807,7 +1807,7 @@ fn resolve_typed_attr_references(
             // computed-value time.  Keep a token sequence no modeled
             // property grammar accepts instead of accidentally treating an
             // attribute value as a CSS-wide keyword.
-            declaration.value = std::borrow::Cow::Borrowed("--quire-invalid-attr--");
+            declaration.value = std::borrow::Cow::Borrowed("--spindrift-invalid-attr--");
             continue;
         };
         declaration.value = std::borrow::Cow::Owned(value);

@@ -494,7 +494,7 @@ impl PaintClipPathEffect {
 
 /// Masking source recorded for context-level PDF grouping.
 ///
-/// CSS Masking allows image and generated-image masks. Quire currently records
+/// CSS Masking allows image and generated-image masks. Spindrift currently records
 /// the presence of a mask for isolation/grouping and leaves shape/raster
 /// emission as a remaining conformance step:
 /// <https://www.w3.org/TR/css-masking-1/#the-mask-image>.

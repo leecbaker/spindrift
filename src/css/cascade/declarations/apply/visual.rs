@@ -866,7 +866,7 @@ pub(super) fn parse_contain_intrinsic_size_component(
 /// Parses the size-query subset of CSS `container-type`.
 ///
 /// Style and scroll-state containers are intentionally not represented here:
-/// they select a different condition grammar and are outside Quire's current
+/// they select a different condition grammar and are outside Spindrift's current
 /// containment-query surface.
 /// <https://www.w3.org/TR/css-contain-3/#container-type>
 fn parse_container_type(value: &str) -> Option<ContainerType> {

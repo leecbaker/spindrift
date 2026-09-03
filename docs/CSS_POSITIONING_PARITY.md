@@ -2,7 +2,7 @@
 
 Last updated: 2026-08-20
 
-This document tracks current CSS positioning and stacking behavior in Quire.
+This document tracks current CSS positioning and stacking behavior in Spindrift.
 Known unresolved divergences belong in `SPEC_DIVERGENCES.md`; this file is a
 working parity snapshot for implemented behavior and nearby follow-up areas.
 

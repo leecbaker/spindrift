@@ -76,7 +76,7 @@ serialization representation.
   remain color-management gaps.
 - Successful PDF output only references non-empty, embeddable font programs.
   When compact subsetting is unsuitable but outline embedding is permitted,
-  Quire embeds the compatible full program; otherwise serialization reports a
+  Spindrift embeds the compatible full program; otherwise serialization reports a
   font-embedding error rather than emitting a rejected font resource.
 - Empty normal-flow and out-of-flow geometry does not materialize blank PDF
   pages. Backgrounds, borders, outlines, descendant paint, anchors, bookmarks,
@@ -94,10 +94,10 @@ serialization representation.
 
 ## Remaining Work
 
-- Make Quire-authored ICC profile resources byte-deterministic. Direct
+- Make Spindrift-authored ICC profile resources byte-deterministic. Direct
   `moxcms` 0.9 currently ignores `ColorProfile::creation_date_time` and writes
   the current UTC time during encoding. Adopt an upstream or pinned moxcms fix
-  that preserves the supplied date, assign Quire's built-in profiles a
+  that preserves the supplied date, assign Spindrift's built-in profiles a
   source-controlled fixed date, then add ICC/PDF byte-identity coverage and
   re-evaluate the four `css3-text-line-break-opclns` WPTs.
 - Add visual comparison coverage for representative paint-tree output with

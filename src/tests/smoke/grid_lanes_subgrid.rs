@@ -1,7 +1,7 @@
 use super::*;
 
 fn painted_rect(
-    page: &quire::Page,
+    page: &spindrift::Page,
     color: CssColor,
 ) -> &crate::document::paint::shapes::RenderedRect {
     page.rects()

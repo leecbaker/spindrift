@@ -85,8 +85,8 @@ fn taffy_grid_item_dimension_for_purpose(
 ) -> taffy_layout::Dimension {
     // Preferred item sizes can retain Taffy's native intrinsic keywords:
     // `taffy_grid_measurement` answers their min/max-content requests from
-    // Quire's typed estimate. Track-sizing constraints intentionally stay on
-    // Quire's scalar path because CSS Grid gives their percentage phase a
+    // Spindrift's typed estimate. Track-sizing constraints intentionally stay on
+    // Spindrift's scalar path because CSS Grid gives their percentage phase a
     // different basis.
     if purpose == GridTaffyDimensionPurpose::UsedItemSize {
         match &value {
@@ -201,7 +201,7 @@ fn taffy_grid_item_dimension_for_purpose(
 /// Taffy's grid algorithm resolves a percentage `Dimension` relative to its
 /// available sizing input while calculating tracks. That is appropriate for a
 /// used item size only after its grid area is known, but not for a constraint
-/// that participates in track sizing. Resolve intrinsic values to Quire's
+/// that participates in track sizing. Resolve intrinsic values to Spindrift's
 /// measured scalar contributions and defer cyclic percentages as `auto`.
 ///
 /// Taffy accepts only scalar lengths, percentages, or `auto` for min/max
@@ -838,7 +838,7 @@ pub(super) fn taffy_grid_justify_content(
 ///
 /// CSS Grid applies `align-items`/`justify-items` as defaults for grid items
 /// and lets `align-self`/`justify-self` override them. Baseline alignment and
-/// writing-mode-sensitive self-start/self-end need Quire-owned follow-up
+/// writing-mode-sensitive self-start/self-end need Spindrift-owned follow-up
 /// handling after Taffy for cases outside the adapter's common positional and
 /// stretch keyword mapping:
 /// <https://www.w3.org/TR/css-align-3/#self-alignment> and
@@ -1052,7 +1052,7 @@ fn taffy_grid_template_line_names_with_startward_adjustment(
 ///
 /// CSS Grid's explicit grid can be enlarged by `grid-template-areas`, and
 /// missing named span lines can synthesize startward implicit tracks. When
-/// Quire prepends those tracks for Taffy, area coordinates must be shifted so
+/// Spindrift prepends those tracks for Taffy, area coordinates must be shifted so
 /// generated `*-start`/`*-end` lines remain attached to their explicit area
 /// columns:
 /// <https://www.w3.org/TR/css-grid-1/#explicit-grids> and
@@ -1081,7 +1081,7 @@ pub(super) fn taffy_grid_template_areas_with_startward_adjustment(
 ///
 /// CSS Grid treats missing named lines in the search direction as existing on
 /// implicit grid lines. Taffy currently resolves a backward named span with a
-/// missing name on the after-explicit side, so Quire pre-expands simple
+/// missing name on the after-explicit side, so Spindrift pre-expands simple
 /// before-explicit tracks and rewrites the affected item placement into
 /// numeric line coordinates before calling Taffy:
 /// <https://www.w3.org/TR/css-grid-1/#grid-placement-span-int>.
@@ -1274,7 +1274,7 @@ fn collect_startward_adjustment_line_names(
 /// Compute the definite same-page count for fixed-size auto-repeat.
 ///
 /// This mirrors the fixed-size branch of Taffy's explicit-grid initialization
-/// so Quire can resolve startward implicit named spans before constructing the
+/// so Spindrift can resolve startward implicit named spans before constructing the
 /// Taffy tree. Startward auto-fit support currently freezes the repeat count
 /// for simple occupied-track placement; broader empty-track collapse
 /// interactions remain tracked as a grid placement divergence:
@@ -1780,7 +1780,7 @@ pub(super) fn taffy_grid_template_component(
 ///
 /// The auto-repeat count algorithm must floor a zero fixed track breadth to a
 /// UA-defined non-zero value to avoid division by zero and an unbounded repeat
-/// count. Quire uses one CSS pixel (0.75 PDF points), the value suggested by
+/// count. Spindrift uses one CSS pixel (0.75 PDF points), the value suggested by
 /// CSS Grid. The floor only affects repeat-count selection; flexible growth
 /// and auto-fit collapse remain Taffy's ordinary track sizing behavior.
 /// <https://www.w3.org/TR/css-grid-1/#auto-repeat>

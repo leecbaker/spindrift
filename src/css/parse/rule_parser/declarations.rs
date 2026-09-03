@@ -10,7 +10,7 @@ use crate::css::{
     parse_font_synthesis_subproperty, parse_object_fit,
 };
 
-/// A declaration accepted by Quire's specified-value-time declaration parser.
+/// A declaration accepted by Spindrift's specified-value-time declaration parser.
 ///
 /// Keeping this operation separate from the cascade order lets normal rules
 /// and CSS Conditional feature queries share the same property grammar.

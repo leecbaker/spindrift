@@ -22,7 +22,7 @@ pub(in crate::layout) struct FloatRunState {
     pub(in crate::layout) available_span: PageInlineSpan,
     /// Physical block interval occupied by same-row floats.
     ///
-    /// The span uses Quire's page top-edge convention: `top_y` is the row top
+    /// The span uses Spindrift's page top-edge convention: `top_y` is the row top
     /// and `bottom_y` moves downward as floats are added. CSS floats shorten
     /// later line boxes until the lowest same-row float bottom:
     /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.

@@ -1,24 +1,23 @@
 [package]
-name = "quire"
+name = "spindrift"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
 description = "A HTML/CSS to PDF renderer, targeting spec compliance and efficiency"
-repository = "https://github.com/lee/quire"
+repository = "https://github.com/leecbaker/spindrift"
 readme = "README.md"
 keywords = ["html", "css", "pdf", "renderer", "weasyprint"]
 categories = ["command-line-utilities", "rendering"]
-exclude = [
-    "doc/stack_profiling.md",
-    "example_html_reports/**",
-    "example_reports_*/**",
-    "render_example_reports*",
-    "request_*_debug.html",
-    "request_*_default_stack.html",
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "examples/",
+    "src/",
+    "tests/"
 ]
 
 [lib]
-name = "quire"
+name = "spindrift"
 path = "src/lib.rs"
 
 [features]
@@ -26,17 +25,11 @@ layout-profile = []
 stack-profile = []
 
 [[bin]]
-name = "quire"
+name = "spindrift"
 path = "src/main.rs"
 
-[[bench]]
-name = "weasyprint_samples"
-harness = false
-
 [profile.release]
-debug = 1
-strip = false
-lto = false #"thin"
+lto = "thin"
 split-debuginfo = "packed"
 
 [profile.test]
@@ -73,7 +66,7 @@ subsetter = { version = "0.2.6", default-features = false, features = ["variable
 markup5ever_rcdom = "0.39.0"
 miniz_oxide = "0.8.9"
 # Keep Parley's internal word and line segmentation aware of scripts that use
-# dictionary breaking. Quire's own ICU-derived graph remains the CSS break
+# dictionary breaking. Spindrift's own ICU-derived graph remains the CSS break
 # opportunity authority.
 parley = { version = "0.11", features = ["complex-scripts"] }
 pdf-writer = "0.15"
@@ -85,10 +78,10 @@ selectors = "0.40"
 taffy = "0.14"
 thiserror = "2"
 tiny-skia-path = "0.12"
-# SVG effect surfaces are composed directly from Quire's retained paint scene.
+# SVG effect surfaces are composed directly from Spindrift's retained paint scene.
 # This intentionally avoids usvg's optional renderer.
 tiny-skia = "0.12"
-# `sync` is supported on every Quire target. Runtime and filesystem support
+# `sync` is supported on every Spindrift target. Runtime and filesystem support
 # are native-only; browser-Wasm currently compiles the library but does not
 # provide a resource-loading backend.
 tokio = { version = "1.52", default-features = false, features = ["sync"] }
@@ -96,7 +89,7 @@ ttf-parser = "0.25"
 unicode-bidi = "0.3.18"
 url = "2"
 # SVG text is converted by upstream usvg into its visual path/image scene.
-# Quire keeps the source string only for PDF /ActualText accessibility.
+# Spindrift keeps the source string only for PDF /ActualText accessibility.
 usvg = { version = "=0.48.1", default-features = false, features = ["text", "system-fonts"] }
 wuff = { version = "0.2.8", default-features = false, features = ["z", "brotli"] }
 kamadak-exif = "0.6.1"

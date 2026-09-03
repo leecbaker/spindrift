@@ -81,15 +81,15 @@ except where existing code already implements draft properties.
   through PDF emission. Synthetic join context stays outside authored source
   geometry, so vertical source slices retain the same resolved typesetting as
   their explicit-ZWJ equivalent. For glyph-affecting changes such as `font-style`,
-  Quire preserves compatible selected-face context with synthetic shaping-only
+  Spindrift preserves compatible selected-face context with synthetic shaping-only
   joiners where possible. Alignment and justification use final visual
   advances, so source-preserved default-ignorable join controls do not shift an
   RTL line's inline origin.
 - Boundary-shaping WPT coverage is restored for Arabic (`shaping-001` through
   `008`, `014`, `016` through `018`), N'Ko (`020` through `022`), and vertical
-  Mongolian (`024`). Quire shapes each eligible inline group from one authored
+  Mongolian (`024`). Spindrift shapes each eligible inline group from one authored
   stream; U+200C/U+200D remain authored extraction text, while any required
-  font-transition context is virtual, zero-metric input. Quire never
+  font-transition context is virtual, zero-metric input. Spindrift never
   synthesizes U+0640 ARABIC TATWEEL for boundary shaping.
 - Horizontal mixed inline bidi reordering now operates on measured inline
   items, preserving neutral text fragments such as collapsed spaces and keeping
@@ -279,7 +279,7 @@ except where existing code already implements draft properties.
   glyph, shaping advance, and source mapping flow through to PDF paint and
   extraction. Line-edge hanging excludes their advance from fitting where CSS
   Text requires without changing glyph selection or paint ownership.
-- Ordinary UAX #14 candidates are finalized only after ICU and Quire's CJK
+- Ordinary UAX #14 candidates are finalized only after ICU and Spindrift's CJK
   fallback candidates have been combined. This retains the LB13 prohibition
   on beginning a line with any `NS` Nonstarter, including ideographic and
   kana iteration marks, without weakening explicit or emergency breaks.
@@ -357,7 +357,7 @@ except where existing code already implements draft properties.
   tracking advances only the following column.
 - The legacy references for `letter-spacing-202`, `letter-spacing-203`, and
   `letter-spacing-206` encode an earlier common-ancestor ownership model for
-  tracking. Quire follows the current CSS Text model instead: each adjacent
+  tracking. Spindrift follows the current CSS Text model instead: each adjacent
   typographic unit contributes half of its own used `letter-spacing`, and
   formatting controls are transparent when identifying the boundary. These
   are WPT compatibility mismatches rather than CSS Text conformance

@@ -60,10 +60,10 @@ pub(crate) struct LayerOrder(pub(in crate::css) Vec<usize>);
 /// `screen`: <https://www.w3.org/TR/mediaqueries-4/#media-types>.
 ///
 /// ```no_run
-/// use quire::{Html, MediaType, PdfOptions, RenderOptions};
+/// use spindrift::{Html, MediaType, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let mut render_options = RenderOptions::default();
 /// render_options.media_type = MediaType::Screen;
 /// let mut output = File::create("document.pdf")?;
@@ -90,12 +90,12 @@ pub enum MediaType {
 /// <https://www.w3.org/TR/css-color-adjust-1/#forced-colors-mode>.
 ///
 /// ```no_run
-/// use quire::{
+/// use spindrift::{
 ///     ForcedColorPalette, ForcedColorsMode, Html, PdfOptions, RenderOptions,
 /// };
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let mut render_options = RenderOptions::default();
 /// render_options.forced_colors = ForcedColorsMode::Active(ForcedColorPalette::DARK);
 /// let mut output = File::create("document.pdf")?;
@@ -200,12 +200,12 @@ impl ForcedColorPalette {
 /// Whether CSS forced-colors mode is active for this render.
 ///
 /// ```no_run
-/// use quire::{
+/// use spindrift::{
 ///     ForcedColorPalette, ForcedColorsMode, Html, PdfOptions, RenderOptions,
 /// };
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let mut render_options = RenderOptions::default();
 /// render_options.forced_colors = ForcedColorsMode::Active(ForcedColorPalette::LIGHT);
 /// let mut output = File::create("document.pdf")?;
@@ -317,7 +317,7 @@ pub enum CssViewportSpace {}
 /// the `@page` `size` descriptor.
 ///
 /// ```
-/// let viewport = quire::CssViewportSize::new(800.0, 600.0);
+/// let viewport = spindrift::CssViewportSize::new(800.0, 600.0);
 /// assert_eq!(viewport.width, 800.0);
 /// ```
 pub type CssViewportSize = euclid::Size2D<f32, CssViewportSpace>;
@@ -391,7 +391,7 @@ impl ViewportLengthBasis {
     }
 
     /// CSS container units with no eligible container fall back to the small
-    /// viewport. Quire's fixed paged viewport makes that the active page area.
+    /// viewport. Spindrift's fixed paged viewport makes that the active page area.
     /// <https://www.w3.org/TR/css-contain-3/#container-lengths>
     pub(crate) fn container_fallback(self) -> ContainerLengthBasis {
         ContainerLengthBasis::for_writing_mode(
@@ -559,7 +559,7 @@ pub(crate) struct RootFontMetricLengthBasis {
 /// applications normally configure the public render options directly.
 ///
 /// ```
-/// use quire::{CssViewportSize, MediaEnvironment, MediaType};
+/// use spindrift::{CssViewportSize, MediaEnvironment, MediaType};
 ///
 /// let environment = MediaEnvironment::new(
 ///     MediaType::Screen,
@@ -588,10 +588,10 @@ pub struct MediaEnvironment {
 /// <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-preference>
 ///
 /// ```no_run
-/// use quire::{ColorSchemePreference, Html, PdfOptions, RenderOptions};
+/// use spindrift::{ColorSchemePreference, Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let mut render_options = RenderOptions::default();
 /// render_options.color_scheme_preference = ColorSchemePreference::Dark;
 /// let mut output = File::create("document.pdf")?;
@@ -617,7 +617,7 @@ pub enum ColorSchemePreference {
     OverrideDark,
 }
 
-/// One of the color schemes whose rendering behavior Quire implements.
+/// One of the color schemes whose rendering behavior Spindrift implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum UsedColorScheme {
     Light,
@@ -687,7 +687,7 @@ impl MediaEnvironment {
 
 impl Default for MediaEnvironment {
     fn default() -> Self {
-        // CSS's initial A4 page box in Quire's default print environment.
+        // CSS's initial A4 page box in Spindrift's default print environment.
         Self::new(MediaType::Print, CssViewportSize::new(793.7008, 1122.5197))
     }
 }
@@ -742,7 +742,7 @@ mod tests {
 ///
 /// CSS CssColor 4 keeps colors in their specified space until they are used by a
 /// physical output device.  In particular, an out-of-sRGB Display-P3 color
-/// must not be clipped merely because Quire's layout engine is not itself a
+/// must not be clipped merely because Spindrift's layout engine is not itself a
 /// display device.  See <https://www.w3.org/TR/css-color-4/#color-conversion>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -1134,7 +1134,7 @@ pub(crate) struct Stylesheet {
     /// input as its nested `@media` rules.
     pub forced_colors: ForcedColorsMode,
     pub color_scheme_preference: ColorSchemePreference,
-    /// Whether this is Quire's built-in HTML presentational-hints sheet.
+    /// Whether this is Spindrift's built-in HTML presentational-hints sheet.
     ///
     /// Static selector-expressible hints live in the stylesheet itself, while
     /// value-dependent hints are injected during element cascade with the same
@@ -1694,7 +1694,7 @@ pub(crate) enum FontFaceSource {
 #[derive(Debug, Clone)]
 pub(crate) struct StyleRule {
     pub selector_text: String,
-    pub selector: SelectorList<QuireSelectorImpl>,
+    pub selector: SelectorList<SpindriftSelectorImpl>,
     /// The selector context supplied by the owning stylesheet. It is used by
     /// CSS Nesting's `&` selector when no enclosing style rule or `@scope`
     /// rule supplies a closer scope.
@@ -1874,13 +1874,13 @@ pub(crate) struct KeyframeStep {
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeRule {
     pub root: ScopeRoot,
-    pub limit: Option<SelectorList<QuireSelectorImpl>>,
+    pub limit: Option<SelectorList<SpindriftSelectorImpl>>,
 }
 
 /// The upper boundary of a CSS `@scope` rule.
 #[derive(Debug, Clone)]
 pub(crate) enum ScopeRoot {
-    Explicit(SelectorList<QuireSelectorImpl>),
+    Explicit(SelectorList<SpindriftSelectorImpl>),
     Owner(StylesheetScopeAnchor),
 }
 

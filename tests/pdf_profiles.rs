@@ -2,14 +2,14 @@
 
 use base64::Engine as _;
 use moxcms::{ColorProfile, ToneReprCurve};
-use quire::{Document, Html, PdfCompression, PdfOptions, PdfProfile, RenderOptions};
+use spindrift::{Document, Html, PdfCompression, PdfOptions, PdfProfile, RenderOptions};
 
 trait PdfBytesForTest {
-    fn write_pdf_bytes(&self, options: &PdfOptions) -> quire::Result<Vec<u8>>;
+    fn write_pdf_bytes(&self, options: &PdfOptions) -> spindrift::Result<Vec<u8>>;
 }
 
 impl PdfBytesForTest for Document {
-    fn write_pdf_bytes(&self, options: &PdfOptions) -> quire::Result<Vec<u8>> {
+    fn write_pdf_bytes(&self, options: &PdfOptions) -> spindrift::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         self.write_pdf(&mut bytes, options)?;
         Ok(bytes)
@@ -21,7 +21,7 @@ trait HtmlPdfBytesForTest {
         &self,
         render_options: &RenderOptions,
         pdf_options: &PdfOptions,
-    ) -> quire::Result<Vec<u8>>;
+    ) -> spindrift::Result<Vec<u8>>;
 }
 
 impl HtmlPdfBytesForTest for Html {
@@ -29,7 +29,7 @@ impl HtmlPdfBytesForTest for Html {
         &self,
         render_options: &RenderOptions,
         pdf_options: &PdfOptions,
-    ) -> quire::Result<Vec<u8>> {
+    ) -> spindrift::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         self.write_pdf(&mut bytes, render_options, pdf_options)
             .await?;
@@ -108,9 +108,9 @@ async fn rendered_document_can_be_serialized_with_distinct_pdf_policies() {
     let default_pdf = document.write_pdf_bytes(&PdfOptions::default()).unwrap();
     let alternate_options = PdfOptions {
         profile: PdfProfile::Pdf,
-        font_embedding: quire::FontEmbeddingMode::Full,
+        font_embedding: spindrift::FontEmbeddingMode::Full,
         compression: PdfCompression::Uncompressed,
-        producer: "Quire integration test".to_string(),
+        producer: "Spindrift integration test".to_string(),
     };
     let alternate_pdf = document.write_pdf_bytes(&alternate_options).unwrap();
     let alternate_text = String::from_utf8_lossy(&alternate_pdf);
@@ -118,7 +118,7 @@ async fn rendered_document_can_be_serialized_with_distinct_pdf_policies() {
     assert_eq!(document.metadata().title(), Some("Reusable"));
     assert!(default_pdf.starts_with(b"%PDF-1.4"));
     assert!(alternate_pdf.starts_with(b"%PDF-1.4"));
-    assert!(alternate_text.contains("/Producer (Quire integration test)"));
+    assert!(alternate_text.contains("/Producer (Spindrift integration test)"));
     assert!(!alternate_text.contains("/FlateDecode"));
     assert_ne!(default_pdf, alternate_pdf);
 }

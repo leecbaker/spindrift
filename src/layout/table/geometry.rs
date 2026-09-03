@@ -11,7 +11,7 @@ use super::{
 /// Logical coordinates inside a CSS table grid box.
 ///
 /// `x` advances along the table's logical inline axis and `y` along its logical
-/// block axis. [`TableGridPlacement`] projects this coordinate space to Quire's
+/// block axis. [`TableGridPlacement`] projects this coordinate space to Spindrift's
 /// physical page-top geometry:
 /// <https://drafts.csswg.org/css-tables-3/#table-layout-algorithm>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +27,7 @@ pub(super) enum TableGridSpace {}
 /// <https://drafts.csswg.org/css-tables-3/#table-layout-algorithm>.
 pub(super) type TableGridLength = euclid::Length<f32, TableGridSpace>;
 
-/// Legacy HTML `cellpadding` expressed in Quire's layout unit.
+/// Legacy HTML `cellpadding` expressed in Spindrift's layout unit.
 ///
 /// This is a one-edge padding input, not a padding-plus-border contribution.
 /// Keeping it separate from ordinary CSS edges prevents an attribute value
@@ -696,7 +696,7 @@ impl TableCellBorderBox {
 /// A table-cell content box projected to current page/container coordinates.
 ///
 /// CSS table-cell contents establish a block container inside the cell's
-/// padding box. Quire's block layout state still consumes physical `left`,
+/// padding box. Spindrift's block layout state still consumes physical `left`,
 /// `right`, and `cursor_y` floats, so this type localizes that projection:
 /// <https://www.w3.org/TR/CSS22/tables.html#model>.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -761,7 +761,7 @@ impl TableCellContentBox {
         Self { rect }
     }
 
-    /// The physical inline-start edge used by Quire's block container state.
+    /// The physical inline-start edge used by Spindrift's block container state.
     ///
     /// The value is page/container-local after projecting the CSS table-cell
     /// padding box out of [`TableGridSpace`]. It is named `left` because table
@@ -771,7 +771,7 @@ impl TableCellContentBox {
         self.rect.x()
     }
 
-    /// The physical inline-end edge used by Quire's block container state.
+    /// The physical inline-end edge used by Spindrift's block container state.
     ///
     /// This is the right edge of the projected table-cell content box in the
     /// current page/container coordinate convention, not a CSS logical
@@ -808,7 +808,7 @@ impl TableCellContentBox {
         self.rect.height()
     }
 
-    /// Return this content box in Quire's page top-edge rectangle convention.
+    /// Return this content box in Spindrift's page top-edge rectangle convention.
     ///
     /// This is the typed bridge from projected table-cell content geometry into
     /// layout and paint helpers that expect a top-edge page rectangle.
@@ -819,7 +819,7 @@ impl TableCellContentBox {
 
 /// Places table-grid physical coordinates onto the current page/container.
 ///
-/// `origin` is the physical top-left of the CSS table grid box in Quire's
+/// `origin` is the physical top-left of the CSS table grid box in Spindrift's
 /// page-top coordinate convention. This is the final projection boundary from
 /// typed table-grid geometry into page, paint, and positioned-layout geometry:
 /// <https://drafts.csswg.org/css-tables-3/#table-layout-algorithm>.

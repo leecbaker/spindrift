@@ -3,7 +3,7 @@ use crate::document::paint::geometry::AxisSelectivePaintClip;
 use crate::layout::block::{BlockLayoutInlineConstraint, suppress_fragmented_box_edges};
 use crate::units::Definite;
 
-/// Resolve Flexbox's scrollport reservation for Quire's static PDF user
+/// Resolve Flexbox's scrollport reservation for Spindrift's static PDF user
 /// agent.
 ///
 /// PDF output has no native interactive scrollbar chrome, so even

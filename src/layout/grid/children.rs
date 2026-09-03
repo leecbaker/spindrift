@@ -109,7 +109,7 @@ pub(super) fn grid_child_lists_from_boxes<'a>(
     itemize_blockified_children(
         child_boxes,
         ItemizationOptions {
-            anonymous_item_tag: "__quire_anonymous_grid_item",
+            anonymous_item_tag: "__spindrift_anonymous_grid_item",
             strip_blockified_inline_text_paint: true,
             establish_independent_formatting_context: true,
         },

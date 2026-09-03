@@ -31,7 +31,7 @@ pub(crate) fn parse_gap_rule_style_list(value: &str) -> Option<GapRuleList<Borde
 /// Parses CSS Gaps Level 1 `*-rule-color` list values.
 ///
 /// `currentcolor` is resolved using the current cascaded `color`, matching the
-/// rest of Quire's border color model:
+/// rest of Spindrift's border color model:
 /// <https://drafts.csswg.org/css-gaps-1/#column-row-rule-color>.
 pub(crate) fn parse_gap_rule_color_list(
     value: &str,

@@ -186,7 +186,7 @@ impl DocumentFontRegistry {
     }
 
     /// Returns whether a system font program can be emitted as a PDF outline
-    /// font. CSS generic-family selection is user-agent-defined, so Quire
+    /// font. CSS generic-family selection is user-agent-defined, so Spindrift
     /// excludes candidates whose OS/2 embedding permissions prohibit the PDF
     /// outline program that its writer emits.
     ///
@@ -501,7 +501,7 @@ fn document_font_metadata(
     let program_metrics = OpenTypeVerticalMetrics {
         ascender,
         descender,
-        // Preserve Quire's existing normal-line-height policy for unmodified
+        // Preserve Spindrift's existing normal-line-height policy for unmodified
         // faces. A CSS `line-gap-override` supplies an explicit replacement
         // below; raw OpenType line-gap adoption remains a separate policy
         // decision.

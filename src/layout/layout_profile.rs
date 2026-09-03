@@ -12,7 +12,7 @@ std::thread_local! {
 }
 
 /// Start collecting one document's layout aggregate. Dropping the guard emits
-/// one `quire::layout_profile` record for that document.
+/// one `spindrift::layout_profile` record for that document.
 #[must_use = "the document profile guard must cover the complete layout"]
 pub(in crate::layout) fn begin_document() -> LayoutProfileDocument {
     DOCUMENTS.with(|documents| documents.borrow_mut().push(ActiveDocument::default()));
@@ -58,7 +58,7 @@ impl Drop for LayoutProfileDocument {
         });
         let stats = document.stats;
         log::info!(
-            target: "quire::layout_profile",
+            target: "spindrift::layout_profile",
             "document_us={} inline_line_measure_index_scans={} inline_line_measure_index_candidates={} inline_line_measure_index_builds={} inline_line_measure_index_build_us={} inline_line_measure_exact_remeasurements={} inline_line_measure_exact_remeasurement_bytes={} inline_line_measure_exact_remeasurement_us={} block_height_estimates={} block_height_estimate_us={} inline_intrinsic_measurements={} inline_intrinsic_measurement_us={} inline_opportunity_graph_builds={} inline_opportunity_graph_build_us={} float_intrinsic_width_calls={} float_intrinsic_width_us={} float_auto_height_cache_hits={} float_auto_height_cache_misses={} float_auto_height_measurements={} float_auto_height_measurement_us={} grid_float_block_size_measurements={} grid_float_block_size_measurement_us={} grid_layout_final_calls={} grid_layout_intrinsic_calls={} grid_layout_orthogonal_calls={} grid_layout_us={} grid_track_sizing_final_passes={} grid_track_sizing_intrinsic_passes={} grid_track_sizing_items={} grid_track_sizing_us={} grid_baseline_plan_calls={} grid_baseline_plan_items={} grid_baseline_plan_us={} grid_feedback_initial_sweeps={} grid_feedback_container_sweeps={} grid_feedback_column_sweeps={} grid_feedback_items={} grid_feedback_us={} grid_feedback_inline_corrections={} grid_feedback_block_corrections={} grid_item_replays={} grid_item_replay_us={}",
             document.started.elapsed().as_micros(),
             stats.inline_line_measure_index_scans,

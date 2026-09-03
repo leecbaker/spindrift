@@ -1,4 +1,4 @@
-//! Text preparation and Parley-to-Quire shaping conversion.
+//! Text preparation and Parley-to-Spindrift shaping conversion.
 
 use crate::css::ComputedStyle;
 use crate::units::SemanticLengthExt;

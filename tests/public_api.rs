@@ -1,6 +1,6 @@
 //! Integration tests for the public document metadata and bookmark API.
 
-use quire::{Html, PdfCompression, PdfOptions, RenderOptions};
+use spindrift::{Html, PdfCompression, PdfOptions, RenderOptions};
 
 #[tokio::test]
 async fn document_metadata_and_bookmarks_remain_public_without_page_paint_data() {
@@ -24,14 +24,14 @@ async fn document_metadata_and_bookmarks_remain_public_without_page_paint_data()
         document
             .metadata()
             .created()
-            .map(quire::DocumentDate::as_str),
+            .map(spindrift::DocumentDate::as_str),
         Some("1997-07-16T19:20+01:00")
     );
     assert_eq!(
         document
             .metadata()
             .modified()
-            .map(quire::DocumentDate::as_str),
+            .map(spindrift::DocumentDate::as_str),
         Some("1998-12-23")
     );
     assert!(document.bookmarks().is_empty());
@@ -54,7 +54,7 @@ async fn document_metadata_and_bookmarks_remain_public_without_page_paint_data()
             date_document
                 .metadata()
                 .created()
-                .map(quire::DocumentDate::as_str),
+                .map(spindrift::DocumentDate::as_str),
             Some(source)
         );
     }

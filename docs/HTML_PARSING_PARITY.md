@@ -2,7 +2,7 @@
 
 ## Current behavior
 
-Quire parses HTML with `html5ever` and XML with `xml5ever` before converting
+Spindrift parses HTML with `html5ever` and XML with `xml5ever` before converting
 the result into its internal DOM. Character references are resolved by the
 respective parser exactly once in text nodes and attribute values. Later DOM,
 layout, resource, and generated-content processing consumes those parsed

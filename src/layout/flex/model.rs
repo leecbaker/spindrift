@@ -1621,7 +1621,7 @@ pub(super) struct FlexFragmentSlice {
     pub(super) block_end: FlexFragmentBlockOffset,
 }
 
-/// CSS flex axes mapped into Quire's physical container coordinate system.
+/// CSS flex axes mapped into Spindrift's physical container coordinate system.
 ///
 /// CSS Flexbox defines `row` as the inline axis and `column` as the block axis,
 /// then CSS Writing Modes maps those axes to physical directions. Taffy only
@@ -1670,7 +1670,7 @@ impl FlexAxes {
     /// reversed its logical axis, but before any line-packing behavior is
     /// applied.
     ///
-    /// Keeping this mapping here lets the Taffy adapter and Quire's final
+    /// Keeping this mapping here lets the Taffy adapter and Spindrift's final
     /// placement agree about the same CSS edge in RTL and vertical writing
     /// modes.  `flex-wrap: reverse` changes only the cross axis.
     /// <https://www.w3.org/TR/css-flexbox-1/#flex-direction-property>
@@ -1753,7 +1753,7 @@ impl FlexAxes {
 
     /// Return the conversion from Taffy's physical cross coordinate to CSS's
     /// physical cross coordinate. The conversion is applied as soon as Taffy
-    /// returns item rectangles, before Quire rebuilds line slots or resolves
+    /// returns item rectangles, before Spindrift rebuilds line slots or resolves
     /// CSS Align placement.
     pub(super) fn taffy_cross_axis_projection(self) -> TaffyCrossAxisProjection {
         if self.is_main_row_axis()
@@ -1788,7 +1788,7 @@ impl FlexPhysicalAxis for FlexAxes {
     }
 }
 
-/// Maps CSS flex main/cross axes into Quire's physical layout axes.
+/// Maps CSS flex main/cross axes into Spindrift's physical layout axes.
 ///
 /// CSS Flexbox defines `row` from the inline axis and `column` from the block
 /// axis, while Taffy lays out rows on physical X and columns on physical Y.
@@ -2503,7 +2503,7 @@ pub(super) struct FlexAutomaticMinimumCrossIntrinsicContributions {
 /// The pass-scoped inputs to Flexbox's automatic main-axis minimum.
 ///
 /// This travels with the flex item so Taffy's primary flexible-length pass and
-/// Quire's post-layout safeguard cannot reconstruct different content or
+/// Spindrift's post-layout safeguard cannot reconstruct different content or
 /// transferred suggestions from a scalar intrinsic estimate.
 /// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
 #[derive(Debug, Clone, Copy)]
@@ -2683,7 +2683,7 @@ impl FlexItemEstimate {
     }
 
     /// Preserve the automatic-minimum inputs used by both Taffy's
-    /// flexible-length allocation and Quire's final guard.
+    /// flexible-length allocation and Spindrift's final guard.
     pub(super) fn set_automatic_main_minimum_inputs(&mut self, inputs: FlexAutomaticMinimumInputs) {
         self.automatic_main_minimum_inputs = Some(inputs);
     }
@@ -2785,7 +2785,7 @@ impl DerefMut for FlexItemEstimate {
 }
 
 /// One flex item's sizing state after Taffy has allocated its provisional
-/// border box and before Quire measures the item's final formatting context.
+/// border box and before Spindrift measures the item's final formatting context.
 ///
 /// The intrinsic estimate and allocation have different roles, but they must
 /// advance through the final normal-flow probe together. Keeping that
@@ -2793,7 +2793,7 @@ impl DerefMut for FlexItemEstimate {
 /// combining the allocation of one item with the intrinsic metrics of another
 /// as later Flexbox sizing stages grow more precise.
 ///
-/// Taffy remains responsible only for flexible-length allocation. Quire owns
+/// Taffy remains responsible only for flexible-length allocation. Spindrift owns
 /// the final content measurement and may update `estimate` from that result;
 /// it must not treat the provisional allocation as an intrinsic measurement.
 /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>

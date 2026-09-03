@@ -30,7 +30,7 @@ type FlexLogicalInlinePercentageBasis = LogicalInlinePercentageBasis<FlexAvailab
 
 /// Wraps a raw Taffy layout result in the Taffy coordinate space.
 ///
-/// Taffy returns physical x/y coordinates after Quire has mapped CSS flex axes
+/// Taffy returns physical x/y coordinates after Spindrift has mapped CSS flex axes
 /// and writing direction into Taffy's row/column model. The returned rect must
 /// be converted to container coordinates before storage in flex layout data:
 /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>.
@@ -297,7 +297,7 @@ fn resolved_stretch_fit_content_box_size(
 /// Converts a CSS size to Taffy, resolving mixed length-percentages when possible.
 ///
 /// CSS Values allows `<length-percentage>` math such as `calc(50% + 10pt)`.
-/// Taffy's style interface cannot carry Quire's mixed CSS math representation
+/// Taffy's style interface cannot carry Spindrift's mixed CSS math representation
 /// or percentage-definiteness semantics, so flex layout resolves mixed values
 /// at this bridge when the relevant flex container axis is definite. CSS Sizing
 /// leaves nonzero percentages unresolved when their basis is indefinite, so
@@ -509,9 +509,9 @@ pub(super) fn measure_flex_item(
     )
 }
 
-/// Adapt Quire's typed flex-item estimate to Taffy 0.14's leaf-layout
+/// Adapt Spindrift's typed flex-item estimate to Taffy 0.14's leaf-layout
 /// callback. Only physical top-edge baselines are supplied; vertical-writing
-/// and last-baseline reconciliation remain Quire-owned.
+/// and last-baseline reconciliation remain Spindrift-owned.
 pub(super) fn taffy_flex_measurement(
     input: ::taffy::tree::LayoutInput,
     estimate: Option<&mut FlexItemEstimate>,
@@ -625,7 +625,7 @@ pub(super) fn flex_min_size_dimension(
 
 /// The resolved content-based automatic minimum of one flex-item axis.
 ///
-/// This record is deliberately shared by the Taffy adapter and Quire's
+/// This record is deliberately shared by the Taffy adapter and Spindrift's
 /// post-layout safeguard.  CSS Flexbox defines a single automatic-minimum
 /// decision; keeping its suggestions and selected content-box result together
 /// prevents either consumer from silently selecting a different minimum.
@@ -1566,7 +1566,7 @@ pub(super) fn flex_automatic_minimum_inputs(
 /// Store the one pass-scoped automatic-main-minimum input record used by all
 /// Flexbox consumers.
 ///
-/// Intrinsic contribution sizing, Taffy's flexible-length pass, and Quire's
+/// Intrinsic contribution sizing, Taffy's flexible-length pass, and Spindrift's
 /// final-layout safeguard must select the same content-size source and
 /// preferred aspect ratio. The content probe is supplied separately because
 /// it suppresses the preferred main size while retaining every other style.
@@ -1627,7 +1627,7 @@ pub(super) fn flex_item_cross_size_property(
     }
 }
 
-/// Whether this item may use automatic cross-size reconciliation in Quire's
+/// Whether this item may use automatic cross-size reconciliation in Spindrift's
 /// current replaced-element adapter. The CSS-property classification remains
 /// separate: an automatic preferred replaced size does not make its computed
 /// cross-size property non-auto.

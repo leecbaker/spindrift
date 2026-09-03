@@ -167,7 +167,7 @@ impl PaintFragment {
 
     /// Move an ordinary in-flow box's outline before positioned descendants.
     ///
-    /// CSS UI leaves overlapping-outline stacking to implementations. Quire's
+    /// CSS UI leaves overlapping-outline stacking to implementations. Spindrift's
     /// compatibility policy follows CSS 2.2's optional per-box outline phase,
     /// rather than treating every outline as the final outline of its parent
     /// stacking context:

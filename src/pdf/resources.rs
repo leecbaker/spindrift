@@ -190,7 +190,7 @@ fn direct_jpeg_resource(
     })
 }
 
-/// Map a used paint extent to Quire's static CSS device grid.
+/// Map a used paint extent to Spindrift's static CSS device grid.
 ///
 /// A PDF has no inherent raster density. The density selected for CSS media
 /// queries and `image-set()` is therefore the deterministic output grid for
@@ -215,7 +215,7 @@ fn target_raster_size(
 /// `pixelated` first scales the selected image to the closest positive integer
 /// multiple of its natural CSS size with nearest-neighbor, then applies the
 /// smooth pass to the final target. `crisp-edges` is nearest-neighbor at the
-/// final target. Other values choose Quire's deterministic smooth policy.
+/// final target. Other values choose Spindrift's deterministic smooth policy.
 /// <https://drafts.csswg.org/css-images-3/#the-image-rendering>
 fn sampled_image_resource(
     data: ImageResourceData,
@@ -416,7 +416,7 @@ fn resize_image_resource_data(
     }
 }
 
-/// Smooth cubic B-spline weights for Quire's deterministic `auto` policy.
+/// Smooth cubic B-spline weights for Spindrift's deterministic `auto` policy.
 ///
 /// The four-tap filter is deliberately distinct from the final linear pass
 /// required by `pixelated`: the property asks the UA to choose its ordinary

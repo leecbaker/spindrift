@@ -441,7 +441,7 @@ impl<'a> LayoutBuilder<'a> {
         self.resolve_float_adjacent_outside_marker_fallback(fallback)
     }
 
-    /// Resolve Quire's compatibility placement for an outside marker that
+    /// Resolve Spindrift's compatibility placement for an outside marker that
     /// lacks a principal line. CSS Lists leaves float-adjacent placement
     /// undefined; using the fallback line's float band keeps the marker on
     /// the inline-start side of the principal box without moving that box.

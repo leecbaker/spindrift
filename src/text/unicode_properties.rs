@@ -395,7 +395,7 @@ pub(crate) struct SegmentBreakContext<'a> {
 /// Return whether CSS Text removes the segment break in this typed context.
 ///
 /// Level 3 leaves the choice between a space and removal to language-aware UA
-/// rules. Quire uses no-word-separator behavior for the Chinese, Japanese,
+/// rules. Spindrift uses no-word-separator behavior for the Chinese, Japanese,
 /// and Yi writing systems, and retains the conservative Unicode width fallback
 /// for untagged content. Currency symbols and Hangul retain their established
 /// word-separating behavior. Default ignorables are skipped by inline

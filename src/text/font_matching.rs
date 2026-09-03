@@ -97,7 +97,7 @@ pub(super) fn fontique_width(width: FontWidth) -> FontiqueFontWidth {
 /// explicitly permits the quoted empty string as a font-family name.
 /// Keep the sentinel entirely at the font-backend boundary; CSS-facing
 /// metadata and matching keys retain the authored empty string.
-pub(super) const EMPTY_CSS_FONT_FAMILY_ALIAS: &str = "__quire_empty_css_font_family__";
+pub(super) const EMPTY_CSS_FONT_FAMILY_ALIAS: &str = "__spindrift_empty_css_font_family__";
 
 pub(super) fn fontique_family_name(name: &str) -> &str {
     if name.is_empty() {
@@ -614,7 +614,7 @@ fn push_font_kerning_features(
 ) {
     let active_value = match font_kerning {
         // CSS permits user agents to decide whether `auto` enables kerning.
-        // Quire consistently enables the relevant OpenType feature, matching
+        // Spindrift consistently enables the relevant OpenType feature, matching
         // the OpenType recommendation and the existing horizontal behavior.
         FontKerning::Auto | FontKerning::Normal => 1,
         FontKerning::None => 0,
@@ -893,7 +893,7 @@ fn parley_language(style: &ComputedStyle) -> Option<ParleyLanguage> {
 }
 
 pub(super) fn parley_word_break(_word_break: CssWordBreak) -> ParleyWordBreak {
-    // Quire's inline opportunity graph owns CSS Text line breaking. Parley is
+    // Spindrift's inline opportunity graph owns CSS Text line breaking. Parley is
     // used only for unwrapped shaping here; forwarding a CSS `word-break`
     // value would change Parley's internal cluster boundaries and therefore
     // perturb otherwise identical glyph metrics without participating in line

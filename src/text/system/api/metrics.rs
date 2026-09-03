@@ -408,7 +408,7 @@ impl FontSystem {
     /// Resolve scaled vertical metrics for a CSS inline text box.
     ///
     /// CSS 2.2 keeps the non-replaced inline content area separate from the
-    /// line-height box. Quire's content-area policy uses the primary metric
+    /// line-height box. Spindrift's content-area policy uses the primary metric
     /// face's em box, independent of `line-height` and the glyph runs selected
     /// by fallback. CSS 2.2 leaves the multi-font content-area choice
     /// unspecified, but it requires the choice not to change with
@@ -848,7 +848,7 @@ impl FontSystem {
     /// extents around the baseline in layout units.
     ///
     /// CSS Inline's `ideographic-ink` text edge is an ink edge for ideographic
-    /// glyphs. Quire synthesizes it from the OpenType bounding box of U+6C34
+    /// glyphs. Spindrift synthesizes it from the OpenType bounding box of U+6C34
     /// WATER shaped through the normal CSS Fonts fallback stack, falling back
     /// to the ideographic em edge when no such glyph box is available:
     /// <https://drafts.csswg.org/css-inline-3/#text-edges>.

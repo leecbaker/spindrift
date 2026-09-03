@@ -7,7 +7,7 @@ fn fragments_share_visual_line(lines: &[crate::document::paint::text::RenderedLi
     lines.iter().all(|line| (line.y() - first.y()).abs() < 3.0)
 }
 
-fn rendered_text_occurrences(document: &quire::Document, needle: &str) -> usize {
+fn rendered_text_occurrences(document: &spindrift::Document, needle: &str) -> usize {
     document
         .pages
         .iter()
@@ -1901,7 +1901,7 @@ async fn empty_inside_marker_representation_does_not_advance_parent_flow() {
         .render(&RenderOptions::default())
         .await
         .unwrap();
-    let after_y = |document: &quire::Document| {
+    let after_y = |document: &spindrift::Document| {
         document.pages[0]
             .lines()
             .iter()
@@ -3099,7 +3099,7 @@ async fn hanging_punctuation_allow_end_ignores_empty_inline_but_respects_bordere
 
 #[tokio::test]
 async fn wpt_hanging_punctuation_allow_end_inline_boundaries() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3152,7 +3152,7 @@ async fn wpt_hanging_punctuation_allow_end_inline_boundaries() {
 
 #[tokio::test]
 async fn wpt_hanging_punctuation_first_and_last_match_negative_margin_reference() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3263,7 +3263,7 @@ async fn wpt_hanging_punctuation_inline_background_includes_hung_stop() {
 
 #[tokio::test]
 async fn wpt_hanging_punctuation_uses_punctuation_font_size() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3380,7 +3380,7 @@ async fn text_indent_justify_uses_stable_line_widths() {
 
 #[tokio::test]
 async fn text_justify_none_disables_inter_word_distribution() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3411,7 +3411,7 @@ async fn text_justify_none_disables_inter_word_distribution() {
 
 #[tokio::test]
 async fn text_justify_ignores_pre_wrap_trailing_space_ltr() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3446,7 +3446,7 @@ async fn text_justify_ignores_pre_wrap_trailing_space_ltr() {
 
 #[tokio::test]
 async fn text_justify_ignores_pre_wrap_trailing_space_rtl() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3559,7 +3559,7 @@ async fn pre_wrap_hanging_spaces_do_not_affect_final_text_alignment() {
 
 #[tokio::test]
 async fn wpt_text_justify_hangs_pre_wrap_trailing_space_inside_split_fragment() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3585,7 +3585,7 @@ async fn wpt_text_justify_hangs_pre_wrap_trailing_space_inside_split_fragment() 
 
 #[tokio::test]
 async fn wpt_text_justify_inter_word_expands_unicode_word_separators() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3644,7 +3644,7 @@ async fn wpt_text_justify_inter_word_expands_unicode_word_separators() {
 
 #[tokio::test]
 async fn local_wpt_text_justify_word_separators_hide_separator_glyphs_if_available() {
-    let wpt_root = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt");
+    let wpt_root = std::path::Path::new("/Users/lee/oss/spindrift-wpt/third_party/wpt");
     if !wpt_root.exists() {
         return;
     }
@@ -3854,7 +3854,7 @@ async fn wpt_text_align_end_rtl_aligns_to_physical_left() {
 
 #[tokio::test]
 async fn wpt_text_align_justify_rtl_uses_start_on_last_line() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3897,7 +3897,7 @@ async fn wpt_text_align_justify_rtl_uses_start_on_last_line() {
 
 #[tokio::test]
 async fn wpt_text_align_justify_all_ltr_justifies_final_line_in_rtl_parent() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3926,7 +3926,7 @@ async fn wpt_text_align_justify_all_ltr_justifies_final_line_in_rtl_parent() {
 
 #[tokio::test]
 async fn justified_inline_spans_keep_one_shaped_text_group() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -3983,7 +3983,7 @@ async fn justified_bidi_line_expands_visual_span() {
 
 #[tokio::test]
 async fn justified_mixed_inline_shifts_atom_and_later_text() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -4146,7 +4146,7 @@ async fn percentage_word_spacing_matches_em_across_current_font_sizes() {
 
 #[tokio::test]
 async fn wpt_text_autospace_inserts_ideograph_alpha_spacing() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -4182,7 +4182,7 @@ async fn wpt_text_autospace_inserts_ideograph_alpha_spacing() {
 
 #[tokio::test]
 async fn wpt_text_autospace_does_not_treat_punctuation_as_normal_alpha_spacing() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -4211,7 +4211,7 @@ async fn wpt_text_autospace_does_not_treat_punctuation_as_normal_alpha_spacing()
 
 #[tokio::test]
 async fn nonzero_letter_spacing_disables_common_ligature_shaping() {
-    let mplus = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/mplus-1p-regular.woff";
+    let mplus = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/mplus-1p-regular.woff";
     if !std::path::Path::new(mplus).exists() {
         return;
     }
@@ -4449,7 +4449,7 @@ fn lines_grouped_by_y(
     groups
 }
 
-fn grouped_line_texts(page: &quire::Page) -> Vec<String> {
+fn grouped_line_texts(page: &spindrift::Page) -> Vec<String> {
     let mut groups = Vec::<Vec<&crate::document::paint::text::RenderedLine>>::new();
     for line in page.lines() {
         if let Some(group) = groups
@@ -4727,7 +4727,7 @@ async fn vertical_lr_upright_preserved_leading_space_keeps_sibling_line_origin()
         .render(&RenderOptions::default())
         .await
         .unwrap();
-    let text_origin = |document: &quire::Document, text: char| {
+    let text_origin = |document: &spindrift::Document, text: char| {
         document
             .pages
             .iter()
@@ -4743,7 +4743,7 @@ async fn vertical_lr_upright_preserved_leading_space_keeps_sibling_line_origin()
             })
             .expect("each test character should produce a rendered line")
     };
-    let line_origin = |document: &quire::Document, text: char| {
+    let line_origin = |document: &spindrift::Document, text: char| {
         document
             .pages
             .iter()
@@ -4945,7 +4945,7 @@ async fn vertical_soft_hyphen_preserves_definite_height_and_sibling_position() {
     .await
     .unwrap();
 
-    let background_geometry = |document: &quire::Document, color| {
+    let background_geometry = |document: &spindrift::Document, color| {
         let rect = document.pages[0]
             .rects()
             .iter()
@@ -5610,7 +5610,7 @@ async fn wpt_empty_inline_spans_preserve_bidi_scope_across_forced_breaks() {
     .await
     .unwrap();
 
-    let bidi_rows = |document: &quire::Document| {
+    let bidi_rows = |document: &spindrift::Document| {
         document.pages[0]
             .lines()
             .iter()
@@ -7164,7 +7164,7 @@ async fn text_top_bottom_paint_to_parent_content_edges_with_mixed_font_sizes() {
 
 #[tokio::test]
 async fn explicit_line_height_overrides_loaded_font_metrics() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }
@@ -7227,7 +7227,7 @@ async fn trailing_ideographic_space_hangs_and_paints_inline_background() {
 
 #[tokio::test]
 async fn combining_grapheme_joiner_suppresses_wrap_before_atomic_inline() {
-    let ahem = "/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf";
+    let ahem = "/Users/lee/oss/spindrift-wpt/third_party/wpt/fonts/Ahem.ttf";
     if !std::path::Path::new(ahem).exists() {
         return;
     }

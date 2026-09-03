@@ -15,7 +15,7 @@ and [CSS Positioned Layout §2.1](https://drafts.csswg.org/css-position-3/#abspo
 ## Compatibility outline paint ordering
 
 CSS UI intentionally leaves the paint order of outlines and overlapping
-outlines implementation-defined. Quire chooses the compatibility order in
+outlines implementation-defined. Spindrift chooses the compatibility order in
 which an ordinary normal-flow outline paints after inline content but before
 auto/zero-z positioned descendants. This is compatible with CSS 2.2
 Appendix E's optional per-box outline stage and matches the positioned Grid

@@ -1,9 +1,9 @@
 use super::*;
 
-/// Repack flex lines after Quire-side main-size corrections.
+/// Repack flex lines after Spindrift-side main-size corrections.
 ///
 /// Taffy performs flexible length resolution and `justify-content` packing
-/// before Quire applies the final automatic minimum-size guard for edge cases
+/// before Spindrift applies the final automatic minimum-size guard for edge cases
 /// Taffy cannot represent. When that guard changes a main size, CSS Flexbox's
 /// main-axis alignment must be recomputed from the corrected outer sizes:
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-main-align> and

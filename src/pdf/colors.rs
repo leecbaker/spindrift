@@ -105,7 +105,7 @@ pub(super) enum PdfColorMode {
     SrgbOutputIntent,
 }
 
-/// RGB output spaces that Quire can name as PDF ICCBased color resources.
+/// RGB output spaces that Spindrift can name as PDF ICCBased color resources.
 ///
 /// D50 XYZ is a CSS profile connection space, rather than a legal RGB PDF
 /// paint space, so it intentionally has no entry here.
@@ -564,7 +564,7 @@ pub(super) fn output_color(color: CssColor, mode: PdfColorMode) -> CssColor {
             } else {
                 let p3 = crate::css::color_to_predefined_rgb(color, CssColorSpace::DisplayP3)
                     .expect("Display-P3 is a built-in CSS output space");
-                // D50 XYZ is Quire's PCS, not an ordinary PDF paint space.
+                // D50 XYZ is Spindrift's PCS, not an ordinary PDF paint space.
                 // P3 is likewise the fixed ordinary-PDF output condition for
                 // every color that cannot use sRGB. Its final components are
                 // clipped only here, never through an sRGB detour. Emitting
@@ -617,7 +617,7 @@ const fn rgb_coordinates_are_in_unit_gamut(color: CssColor) -> bool {
         && color.components()[2] <= 1.0 + EPSILON
 }
 
-/// Match the legacy CSS RGB paint representation used by Quire's PDF path.
+/// Match the legacy CSS RGB paint representation used by Spindrift's PDF path.
 ///
 /// An `rgb()` percentage is stored as an 8-bit sample today. Quantizing an
 /// equivalently in-gamut PCS conversion at the same paint boundary prevents

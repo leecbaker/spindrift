@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-08
 
-This document tracks Quire's implementation status for CSS Box Alignment
+This document tracks Spindrift's implementation status for CSS Box Alignment
 features that are shared across layout modes. The normative reference is CSS
 Box Alignment Level 3, with layout-mode-specific behavior from CSS Flexible
 Box Layout Level 1, CSS Display Level 3, CSS Writing Modes Level 4, and CSS
@@ -18,9 +18,9 @@ Fragmentation Level 3.
   `safe` and `unsafe`, which lets layout modes apply their own initial-overflow
   rules.
 - Flex containers map `align-content` to Taffy's flex line-packing model for
-  positional, distributed, safe, and stretch values. Quire corrects wrapped
+  positional, distributed, safe, and stretch values. Spindrift corrects wrapped
   `normal`/`stretch` overflow fallback after layout so overflowing stretched
-  lines pack to `flex-start`, including `wrap-reverse`. Quire adds post-layout
+  lines pack to `flex-start`, including `wrap-reverse`. Spindrift adds post-layout
   baseline content-alignment for wrapped row flex containers on both physical
   y and physical x cross axes, using vertical-writing horizontal baseline
   estimates when the CSS row axis is vertical. Those vertical row estimates
@@ -77,7 +77,7 @@ Fragmentation Level 3.
   participate in their start-most or end-most spanned row as required. Other
   single-subject values use the same block-axis fallback as ordinary block
   containers.
-- Quire's current definition-list column layout applies multicol
+- Spindrift's current definition-list column layout applies multicol
   `align-content` overflow defaults: omitted positional values remain unsafe,
   explicit `safe` values fall back to block-start on overflow, and distribution
   values keep their safe fallback.
@@ -85,7 +85,7 @@ Fragmentation Level 3.
   `align-content`, `justify-content`, `align-items`, `justify-items`,
   `align-self`, and `justify-self` through Taffy's grid alignment model.
   Simple horizontal first- and last-baseline self-alignment between measured
-  text items in the same row is corrected with a Quire-owned post-layout pass;
+  text items in the same row is corrected with a Spindrift-owned post-layout pass;
   horizontal `justify-self`/`justify-items` `self-start`/`self-end` placement
   also uses a post-layout correction so LTR/RTL grid items align the edge
   defined by their own inline direction; horizontal `align-self`/`align-items`
@@ -129,7 +129,7 @@ Fragmentation Level 3.
 - Grid alignment is partial. Common same-page self/content alignment keywords
   are passed to Taffy, and simple horizontal first-/last-baseline same-row
   text alignment plus occupied-row first/last exported grid container
-  baselines are corrected with Quire-measured item baselines. Horizontal
+  baselines are corrected with Spindrift-measured item baselines. Horizontal
   grid `justify-self`/`justify-items` and `align-self`/`align-items`
   `self-start`/`self-end`, plus `justify-self`/`justify-items` `left`/`right`,
   placement is covered for LTR/RTL grids. Simple spanning items share baselines

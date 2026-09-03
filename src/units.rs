@@ -1,12 +1,12 @@
 //! Typed scalar units used across CSS computation, layout, paint, and PDF output.
 //!
-//! Quire's canonical layout scalar is a CSS computed absolute length measured
+//! Spindrift's canonical layout scalar is a CSS computed absolute length measured
 //! in PDF points. CSS Values and Units defines `1in = 96px`, while PDF default
 //! user space uses 72 points per inch, so `1px = 0.75pt`:
 //! <https://www.w3.org/TR/css-values-4/#absolute-lengths> and
 //! ISO 32000-2:2020, 8.3 "Coordinate Systems".
 
-/// Marker for Quire's canonical computed/layout length unit.
+/// Marker for Spindrift's canonical computed/layout length unit.
 ///
 /// Values are stored numerically as PDF points. This names the scalar unit
 /// separately from coordinate spaces such as paint space and PDF user space.
@@ -31,7 +31,7 @@ pub(crate) enum CssPixelUnit {}
 
 /// Marker for a CSS content-box length or size.
 ///
-/// This is still stored in Quire's PDF-point layout scalar, but the marker
+/// This is still stored in Spindrift's PDF-point layout scalar, but the marker
 /// records the CSS box-model semantic space. Keeping content-box values
 /// distinct from border-box values makes padding and border expansion explicit:
 /// <https://www.w3.org/TR/css-box-3/#content-box> and
@@ -41,7 +41,7 @@ pub(crate) enum ContentBoxUnit {}
 
 /// Marker for a CSS border-box length or size.
 ///
-/// This is a semantic coordinate space over Quire's PDF-point layout scalar,
+/// This is a semantic coordinate space over Spindrift's PDF-point layout scalar,
 /// not a different physical unit. Conversions to or from content-box values
 /// must explicitly add or subtract padding and border widths:
 /// <https://www.w3.org/TR/css-box-3/#border-box> and
@@ -118,10 +118,10 @@ pub(crate) enum AtomicInlineMarginBoxBaselineUnit {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicInlinePaintPlacementBaselineUnit {}
 
-/// A CSS computed absolute length in Quire's canonical layout unit.
+/// A CSS computed absolute length in Spindrift's canonical layout unit.
 pub(crate) type LayoutLength = euclid::Length<f32, LayoutUnit>;
 
-/// A CSS computed size in Quire's canonical layout unit.
+/// A CSS computed size in Spindrift's canonical layout unit.
 pub(crate) type LayoutSize = euclid::Size2D<f32, LayoutUnit>;
 
 /// A decoded raster image size in source pixels.
@@ -133,16 +133,16 @@ pub(crate) type RasterPixelSize = euclid::Size2D<u32, RasterPixelUnit>;
 /// dimensions. It becomes a [`LayoutSize`] only at the CSS layout boundary.
 pub(crate) type CssPixelSize = euclid::Size2D<u32, CssPixelUnit>;
 
-/// A CSS content-box length in Quire's PDF-point layout scalar.
+/// A CSS content-box length in Spindrift's PDF-point layout scalar.
 pub(crate) type ContentBoxLength = euclid::Length<f32, ContentBoxUnit>;
 
-/// A CSS border-box length in Quire's PDF-point layout scalar.
+/// A CSS border-box length in Spindrift's PDF-point layout scalar.
 pub(crate) type BorderBoxLength = euclid::Length<f32, BorderBoxUnit>;
 
-/// Padding plus border extent in Quire's PDF-point layout scalar.
+/// Padding plus border extent in Spindrift's PDF-point layout scalar.
 pub(crate) type NonContentLength = euclid::Length<f32, NonContentUnit>;
 
-/// A CSS margin-box extent in Quire's PDF-point layout scalar.
+/// A CSS margin-box extent in Spindrift's PDF-point layout scalar.
 pub(crate) type MarginBoxLength = euclid::Length<f32, MarginBoxUnit>;
 
 pub(crate) type ContentBoxBaselineOffset = euclid::Length<f32, ContentBoxBaselineUnit>;
@@ -158,17 +158,17 @@ pub(crate) type AtomicInlineMarginBoxBaselineOffset =
 pub(crate) type AtomicInlinePaintPlacementBaselineOffset =
     euclid::Length<f32, AtomicInlinePaintPlacementBaselineUnit>;
 
-/// A physical CSS margin-box size in Quire's PDF-point layout coordinates.
+/// A physical CSS margin-box size in Spindrift's PDF-point layout coordinates.
 ///
 /// Float placement uses both physical dimensions of the margin box, while
 /// collision of BFC roots continues to use their border boxes:
 /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
 pub(crate) type MarginBoxSize = euclid::Size2D<f32, MarginBoxUnit>;
 
-/// A CSS content-box size in Quire's PDF-point layout scalar.
+/// A CSS content-box size in Spindrift's PDF-point layout scalar.
 pub(crate) type ContentBoxSize = euclid::Size2D<f32, ContentBoxUnit>;
 
-/// A CSS border-box size in Quire's PDF-point layout scalar.
+/// A CSS border-box size in Spindrift's PDF-point layout scalar.
 pub(crate) type BorderBoxSize = euclid::Size2D<f32, BorderBoxUnit>;
 
 /// Construct a layout length from PDF points.
@@ -281,7 +281,7 @@ pub(crate) fn layout_to_border_box_length(length: LayoutLength) -> BorderBoxLeng
 
 /// Extract the numeric PDF-point value from a typed layout length.
 pub(crate) trait SemanticLengthExt {
-    /// Return this typed length in Quire's canonical PDF-point layout scalar.
+    /// Return this typed length in Spindrift's canonical PDF-point layout scalar.
     fn points(self) -> f32;
 }
 
@@ -298,7 +298,7 @@ impl<Unit> SemanticLengthExt for euclid::Length<f32, Unit> {
 /// arithmetic; use the named content-box/border-box helpers when padding and
 /// border must be added or removed.
 pub(crate) trait IntoLayoutLength {
-    /// Return this length as Quire's generic layout length.
+    /// Return this length as Spindrift's generic layout length.
     fn into_layout_length(self) -> LayoutLength;
 }
 
@@ -493,7 +493,7 @@ pub(crate) fn border_box_to_content_box_size(
 /// Convert an image's preferred natural CSS-pixel dimensions into layout
 /// dimensions.
 ///
-/// CSS Values fixes `1px = 1/96in`, while Quire's layout unit is PDF points,
+/// CSS Values fixes `1px = 1/96in`, while Spindrift's layout unit is PDF points,
 /// so each CSS pixel contributes `0.75pt`:
 /// <https://www.w3.org/TR/css-values-4/#absolute-lengths>.
 pub(crate) fn css_pixel_natural_layout_size(size: CssPixelSize) -> LayoutSize {

@@ -1,7 +1,7 @@
 //! Static CSS Scroll Snap geometry and candidate selection.
 //!
 //! CSS Scroll Snap deliberately leaves user-input physics to the user agent.
-//! Quire has no interactive session, so this module provides the deterministic
+//! Spindrift has no interactive session, so this module provides the deterministic
 //! used-value policy used when painting a document's initial static view.
 //! <https://www.w3.org/TR/css-scroll-snap-1/#scroll-snap-model>
 
@@ -264,7 +264,7 @@ impl<'a> LayoutBuilder<'a> {
 
 impl Scrollport {
     /// Construct the snapport by reducing a padding-box scrollport using the
-    /// specified scroll-padding offsets. `auto` has Quire's static used value
+    /// specified scroll-padding offsets. `auto` has Spindrift's static used value
     /// of zero; percentages resolve against the corresponding scrollport axis.
     pub(in crate::layout) fn from_padding_box(
         padding_box: PaintRect,
@@ -308,7 +308,7 @@ impl Scrollport {
         Self { rect, max_offset }
     }
 
-    /// Select Quire's initial static offset. Mandatory containers choose the
+    /// Select Spindrift's initial static offset. Mandatory containers choose the
     /// closest clamped candidate to the initial scroll position. Proximity containers only
     /// choose candidates already intersecting the initial snapport; this makes
     /// an initial static render stable without inventing interaction physics.

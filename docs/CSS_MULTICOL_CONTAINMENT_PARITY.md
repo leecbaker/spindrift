@@ -1,6 +1,6 @@
 # CSS Multi-column and Containment Parity
 
-This note tracks Quire's implementation of CSS Multi-column Layout Level 1,
+This note tracks Spindrift's implementation of CSS Multi-column Layout Level 1,
 the implemented `column-height`/`column-wrap` portions of Level 2, CSS
 Containment Level 1, and their shared CSS Fragmentation behavior.
 

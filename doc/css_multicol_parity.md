@@ -1,6 +1,6 @@
 # CSS Multi-column parity
 
-Quire models a wrapped multicolumn formatting context as a source-ordered row
+Spindrift models a wrapped multicolumn formatting context as a source-ordered row
 plan. Authored column block size, fragmentation progress capacity, and
 container-local row offsets are distinct types. The plan records occupied
 columns, row boundaries, actual final-row extent, and gap slots; paint replay

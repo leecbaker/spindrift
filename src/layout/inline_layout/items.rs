@@ -1507,7 +1507,7 @@ impl<'a> LayoutBuilder<'a> {
     /// Resolve the block-start and block-end trim amounts from CSS Inline
     /// `<text-edge>` metrics.
     ///
-    /// The `text` and `ideographic` metrics map to Quire's existing em/content
+    /// The `text` and `ideographic` metrics map to Spindrift's existing em/content
     /// box. `cap`, `ex`, `alphabetic`, and `ideographic-ink` use selected-font
     /// metrics where available, with spec-compatible synthesis fallbacks:
     /// <https://drafts.csswg.org/css-inline-3/#text-edges>.

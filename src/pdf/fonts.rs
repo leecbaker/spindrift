@@ -856,7 +856,7 @@ fn sanitize_pdf_font_name(name: &str) -> String {
         })
         .collect::<String>();
     if sanitized.is_empty() {
-        "QuireFont".to_string()
+        "SpindriftFont".to_string()
     } else {
         sanitized
     }
@@ -878,7 +878,7 @@ fn cid_set_stream_data(glyph_ids: impl IntoIterator<Item = u16>) -> Vec<u8> {
 
 pub(super) fn to_unicode_cmap(font: &EmbeddedFontPlan<'_>) -> Vec<u8> {
     let mut cmap = pdf_writer::types::UnicodeCmap::<u16>::new(
-        pdf_writer::Name(b"Quire-ToUnicode"),
+        pdf_writer::Name(b"Spindrift-ToUnicode"),
         pdf_writer::types::SystemInfo {
             registry: pdf_writer::Str(b"Adobe"),
             ordering: pdf_writer::Str(b"Identity"),

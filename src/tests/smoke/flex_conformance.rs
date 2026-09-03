@@ -396,7 +396,7 @@ async fn normal_flow_column_reference_matches_flex_margin_geometry() {
     .await
     .unwrap();
 
-    let colored_rects = |document: &quire::Document| {
+    let colored_rects = |document: &spindrift::Document| {
         document.pages[0]
             .rects()
             .iter()
@@ -3818,7 +3818,7 @@ async fn display_contents_wpt_flex_single_contents_child_match_reference_paint()
     assert_display_contents_wpt_flex_output(&document);
 }
 
-fn assert_display_contents_wpt_flex_output(document: &quire::Document) {
+fn assert_display_contents_wpt_flex_output(document: &spindrift::Document) {
     let page = &document.pages[0];
     for text in ["0x", "y", "2a", "3", "4", "5a", "5b", "6", "8", "10"] {
         assert!(
@@ -3855,7 +3855,7 @@ fn assert_display_contents_wpt_flex_output(document: &quire::Document) {
 }
 
 fn rendered_line<'a>(
-    page: &'a quire::Page,
+    page: &'a spindrift::Page,
     text: &str,
 ) -> &'a crate::document::paint::text::RenderedLine {
     page.lines()
@@ -3895,7 +3895,7 @@ fn glyph_center_x(line: &crate::document::paint::text::RenderedLine, index: usiz
 }
 
 fn assert_blue_at_text_position(
-    page: &quire::Page,
+    page: &spindrift::Page,
     line: &crate::document::paint::text::RenderedLine,
     x: f32,
 ) {
@@ -3907,7 +3907,7 @@ fn assert_blue_at_text_position(
 }
 
 fn assert_no_blue_at_text_position(
-    page: &quire::Page,
+    page: &spindrift::Page,
     line: &crate::document::paint::text::RenderedLine,
     x: f32,
 ) {
@@ -3919,7 +3919,7 @@ fn assert_no_blue_at_text_position(
 }
 
 fn blue_rect_covers_text_position(
-    page: &quire::Page,
+    page: &spindrift::Page,
     line: &crate::document::paint::text::RenderedLine,
     x: f32,
 ) -> bool {

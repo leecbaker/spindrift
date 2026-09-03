@@ -1215,7 +1215,7 @@ impl Fragmentainer {
 
     /// Build a fragmentainer from the current physical cursor bounds.
     ///
-    /// Quire's paged-media replay currently measures remaining block capacity
+    /// Spindrift's paged-media replay currently measures remaining block capacity
     /// from the current content block-start cursor down to the fragmentainer
     /// block-end edge. The arithmetic is shared by any fragmentainer whose
     /// physical cursor uses the same block-axis coordinates; callers remain
@@ -1275,7 +1275,7 @@ impl FragmentainerKind {
     /// paged-media page cursor.
     ///
     /// CSS Fragmentation uses the same break selection model for page and
-    /// column fragmentation. Quire currently has concrete cursor materialization
+    /// column fragmentation. Spindrift currently has concrete cursor materialization
     /// only for pages in these replay paths; column-targeted transitions remain
     /// committed break decisions but must not mutate paged-media state:
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.

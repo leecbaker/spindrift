@@ -10,8 +10,8 @@ use selectors::parser::{NonTSPseudoClass, PseudoElement, SelectorImpl};
 use super::LanguageRange;
 use crate::css::types::Direction;
 
-impl NonTSPseudoClass for QuirePseudoClass {
-    type Impl = QuireSelectorImpl;
+impl NonTSPseudoClass for SpindriftPseudoClass {
+    type Impl = SpindriftSelectorImpl;
 
     fn is_active_or_hover(&self) -> bool {
         false
@@ -23,7 +23,7 @@ impl NonTSPseudoClass for QuirePseudoClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum QuirePseudoElement {
+pub(crate) enum SpindriftPseudoElement {
     Before,
     After,
     ScrollMarker,
@@ -35,27 +35,27 @@ pub(crate) enum QuirePseudoElement {
     FirstLetter,
 }
 
-impl ToCss for QuirePseudoElement {
+impl ToCss for SpindriftPseudoElement {
     fn to_css<W>(&self, dest: &mut W) -> fmt::Result
     where
         W: fmt::Write,
     {
         dest.write_str(match self {
-            QuirePseudoElement::Before => "::before",
-            QuirePseudoElement::After => "::after",
-            QuirePseudoElement::ScrollMarker => "::scroll-marker",
-            QuirePseudoElement::ScrollMarkerGroup => "::scroll-marker-group",
-            QuirePseudoElement::FootnoteCall => "::footnote-call",
-            QuirePseudoElement::FootnoteMarker => "::footnote-marker",
-            QuirePseudoElement::Marker => "::marker",
-            QuirePseudoElement::FirstLine => "::first-line",
-            QuirePseudoElement::FirstLetter => "::first-letter",
+            SpindriftPseudoElement::Before => "::before",
+            SpindriftPseudoElement::After => "::after",
+            SpindriftPseudoElement::ScrollMarker => "::scroll-marker",
+            SpindriftPseudoElement::ScrollMarkerGroup => "::scroll-marker-group",
+            SpindriftPseudoElement::FootnoteCall => "::footnote-call",
+            SpindriftPseudoElement::FootnoteMarker => "::footnote-marker",
+            SpindriftPseudoElement::Marker => "::marker",
+            SpindriftPseudoElement::FirstLine => "::first-line",
+            SpindriftPseudoElement::FirstLetter => "::first-letter",
         })
     }
 }
 
-impl PseudoElement for QuirePseudoElement {
-    type Impl = QuireSelectorImpl;
+impl PseudoElement for SpindriftPseudoElement {
+    type Impl = SpindriftSelectorImpl;
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
@@ -117,9 +117,9 @@ impl ToCss for CssString {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct QuireSelectorImpl;
+pub(crate) struct SpindriftSelectorImpl;
 
-impl SelectorImpl for QuireSelectorImpl {
+impl SelectorImpl for SpindriftSelectorImpl {
     type ExtraMatchingData<'a> = ();
     type AttrValue = CssString;
     type Identifier = CssAtom;
@@ -128,12 +128,12 @@ impl SelectorImpl for QuireSelectorImpl {
     type NamespacePrefix = CssAtom;
     type BorrowedLocalName = CssAtom;
     type BorrowedNamespaceUrl = CssAtom;
-    type NonTSPseudoClass = QuirePseudoClass;
-    type PseudoElement = QuirePseudoElement;
+    type NonTSPseudoClass = SpindriftPseudoClass;
+    type PseudoElement = SpindriftPseudoElement;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum QuirePseudoClass {
+pub(crate) enum SpindriftPseudoClass {
     Link,
     AnyLink,
     Visited,
@@ -167,7 +167,7 @@ pub(crate) enum QuirePseudoClass {
     ReadOnly,
 }
 
-impl ToCss for QuirePseudoClass {
+impl ToCss for SpindriftPseudoClass {
     fn to_css<W>(&self, dest: &mut W) -> fmt::Result
     where
         W: fmt::Write,

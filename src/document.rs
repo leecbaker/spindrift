@@ -29,10 +29,10 @@ use crate::{CssColor, Error, Result, pdf};
 /// The fully rendered, inspectable document before PDF serialization.
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, RenderOptions};
+/// use spindrift::{Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let document = Html::from_file("document.html")
 ///     .await?
 ///     .render(&RenderOptions::default())
@@ -69,7 +69,7 @@ impl Document {
     /// Returns document-wide PDF metadata extracted during rendering.
     ///
     /// ```no_run
-    /// # fn inspect(document: &quire::Document) {
+    /// # fn inspect(document: &spindrift::Document) {
     /// let title = document.metadata().title();
     /// # let _ = title;
     /// # }
@@ -81,7 +81,7 @@ impl Document {
     /// Returns document bookmarks in source order.
     ///
     /// ```no_run
-    /// # fn inspect(document: &quire::Document) {
+    /// # fn inspect(document: &spindrift::Document) {
     /// for bookmark in document.bookmarks() {
     ///     println!("{}", bookmark.label());
     /// }
@@ -95,8 +95,8 @@ impl Document {
     /// options.
     ///
     /// ```no_run
-    /// # fn write(document: &quire::Document, output: &mut Vec<u8>) -> quire::Result<()> {
-    /// document.write_pdf(output, &quire::PdfOptions::default())?;
+    /// # fn write(document: &spindrift::Document, output: &mut Vec<u8>) -> spindrift::Result<()> {
+    /// document.write_pdf(output, &spindrift::PdfOptions::default())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -120,17 +120,17 @@ impl Document {
     }
 }
 
-/// Controls whether Quire applies Flate compression to generated PDF streams.
+/// Controls whether Spindrift applies Flate compression to generated PDF streams.
 ///
 /// ISO 32000-1:2008, 7.4.4 defines the `/FlateDecode` stream filter. Disabling
 /// compression is useful when inspecting generated PDF syntax, but increases
 /// output size substantially for images and embedded font programs.
 ///
 /// ```no_run
-/// use quire::{Html, PdfCompression, PdfOptions, RenderOptions};
+/// use spindrift::{Html, PdfCompression, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let pdf_options = PdfOptions {
 ///     compression: PdfCompression::Uncompressed,
 ///     ..PdfOptions::default()
@@ -162,10 +162,10 @@ pub enum PdfCompression {
 /// program requirements.
 ///
 /// ```no_run
-/// use quire::{FontEmbeddingMode, Html, PdfOptions, RenderOptions};
+/// use spindrift::{FontEmbeddingMode, Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let pdf_options = PdfOptions {
 ///     font_embedding: FontEmbeddingMode::Full,
 ///     ..PdfOptions::default()
@@ -196,10 +196,10 @@ pub enum FontEmbeddingMode {
 /// not by itself a guarantee that every PDF/A requirement has been satisfied.
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, PdfProfile, RenderOptions};
+/// use spindrift::{Html, PdfOptions, PdfProfile, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let pdf_options = PdfOptions {
 ///     profile: PdfProfile::PdfA1B,
 ///     ..PdfOptions::default()
@@ -226,7 +226,7 @@ impl PdfProfile {
     /// Returns the PDF version required by this profile.
     ///
     /// ```
-    /// assert_eq!(quire::PdfProfile::PdfA1B.pdf_version(), (1, 4));
+    /// assert_eq!(spindrift::PdfProfile::PdfA1B.pdf_version(), (1, 4));
     /// ```
     pub const fn pdf_version(self) -> (u8, u8) {
         match self {
@@ -237,7 +237,7 @@ impl PdfProfile {
     /// Returns whether this profile targets a PDF/A conformance level.
     ///
     /// ```
-    /// assert!(!quire::PdfProfile::Pdf.is_pdfa());
+    /// assert!(!spindrift::PdfProfile::Pdf.is_pdfa());
     /// ```
     pub const fn is_pdfa(self) -> bool {
         !matches!(self, Self::Pdf)
@@ -290,10 +290,10 @@ pub(crate) struct PdfAIdentification {
 /// profiles, compression, font embedding, or producer values.
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, PdfProfile, RenderOptions};
+/// use spindrift::{Html, PdfOptions, PdfProfile, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let pdf_options = PdfOptions {
 ///     profile: PdfProfile::Pdf,
 ///     producer: "Example report service".to_string(),
@@ -327,7 +327,7 @@ impl Default for PdfOptions {
             profile: PdfProfile::default(),
             font_embedding: FontEmbeddingMode::default(),
             compression: PdfCompression::default(),
-            producer: "quire 0.1.0".to_string(),
+            producer: "spindrift 0.1.0".to_string(),
         }
     }
 }
@@ -336,12 +336,12 @@ impl Default for PdfOptions {
 /// Source metadata associated with a rendered document.
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, RenderOptions};
+/// use spindrift::{Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let document = Html::from_string(
-///     "<title>Quarterly report</title><meta name=author content=Quire>",
+///     "<title>Quarterly report</title><meta name=author content=Spindrift>",
 /// )
 /// .render(&RenderOptions::default())
 /// .await?;
@@ -384,7 +384,7 @@ impl DocumentMetadata {
     /// Returns the document title, if one was present in the source.
     ///
     /// ```no_run
-    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// # fn inspect(metadata: &spindrift::DocumentMetadata) {
     /// assert!(metadata.title().is_none());
     /// # }
     /// ```
@@ -395,7 +395,7 @@ impl DocumentMetadata {
     /// Returns the document author, if one was present in the source.
     ///
     /// ```no_run
-    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// # fn inspect(metadata: &spindrift::DocumentMetadata) {
     /// let author = metadata.author();
     /// # let _ = author;
     /// # }
@@ -407,7 +407,7 @@ impl DocumentMetadata {
     /// Returns the document creator, if one was present in the source.
     ///
     /// ```no_run
-    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// # fn inspect(metadata: &spindrift::DocumentMetadata) {
     /// let creator = metadata.creator();
     /// # let _ = creator;
     /// # }
@@ -419,7 +419,7 @@ impl DocumentMetadata {
     /// Returns the document language from the root HTML element, if specified.
     ///
     /// ```no_run
-    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// # fn inspect(metadata: &spindrift::DocumentMetadata) {
     /// let language = metadata.language();
     /// # let _ = language;
     /// # }
@@ -431,7 +431,7 @@ impl DocumentMetadata {
     /// Returns the document description, if one was present in the source.
     ///
     /// ```no_run
-    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// # fn inspect(metadata: &spindrift::DocumentMetadata) {
     /// let description = metadata.description();
     /// # let _ = description;
     /// # }
@@ -443,7 +443,7 @@ impl DocumentMetadata {
     /// Returns the document keywords in source order.
     ///
     /// ```no_run
-    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// # fn inspect(metadata: &spindrift::DocumentMetadata) {
     /// for keyword in metadata.keywords() {
     ///     println!("{keyword}");
     /// }
@@ -456,7 +456,7 @@ impl DocumentMetadata {
     /// Returns the document creation date, if one was present in the source.
     ///
     /// ```no_run
-    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// # fn inspect(metadata: &spindrift::DocumentMetadata) {
     /// let created = metadata.created();
     /// # let _ = created;
     /// # }
@@ -468,7 +468,7 @@ impl DocumentMetadata {
     /// Returns the document modification date, if one was present in the source.
     ///
     /// ```no_run
-    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// # fn inspect(metadata: &spindrift::DocumentMetadata) {
     /// let modified = metadata.modified();
     /// # let _ = modified;
     /// # }
@@ -486,10 +486,10 @@ impl DocumentMetadata {
 /// [W3C's ISO 8601 profile]: <https://www.w3.org/TR/NOTE-datetime>
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, RenderOptions};
+/// use spindrift::{Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let document = Html::from_string(
 ///     r#"<meta name="dcterms.created" content="2026-08-08">"#,
 /// )
@@ -539,7 +539,7 @@ impl DocumentDate {
     /// Returns the validated source date in W3C ISO 8601 profile form.
     ///
     /// ```no_run
-    /// # fn inspect(date: &quire::DocumentDate) {
+    /// # fn inspect(date: &spindrift::DocumentDate) {
     /// println!("{}", date.as_str());
     /// # }
     /// ```
@@ -816,10 +816,10 @@ mod tests {
 /// A document bookmark derived from the rendered source.
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, RenderOptions};
+/// use spindrift::{Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let document = Html::from_string("<h1>Introduction</h1>")
 ///     .render(&RenderOptions::default())
 ///     .await?;
@@ -873,7 +873,7 @@ impl Bookmark {
     /// Returns the bookmark destination's horizontal position in PDF points.
     ///
     /// ```no_run
-    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// # fn inspect(bookmark: &spindrift::Bookmark) {
     /// let x = bookmark.x();
     /// # let _ = x;
     /// # }
@@ -885,7 +885,7 @@ impl Bookmark {
     /// Returns the bookmark destination's vertical position in PDF points.
     ///
     /// ```no_run
-    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// # fn inspect(bookmark: &spindrift::Bookmark) {
     /// let y = bookmark.y();
     /// # let _ = y;
     /// # }
@@ -897,7 +897,7 @@ impl Bookmark {
     /// Returns the bookmark nesting level, starting at one.
     ///
     /// ```no_run
-    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// # fn inspect(bookmark: &spindrift::Bookmark) {
     /// assert!(bookmark.level() >= 1);
     /// # }
     /// ```
@@ -908,7 +908,7 @@ impl Bookmark {
     /// Returns the bookmark's displayed label.
     ///
     /// ```no_run
-    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// # fn inspect(bookmark: &spindrift::Bookmark) {
     /// let label = bookmark.label();
     /// # let _ = label;
     /// # }
@@ -920,7 +920,7 @@ impl Bookmark {
     /// Returns the zero-based index of the destination page.
     ///
     /// ```no_run
-    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// # fn inspect(bookmark: &spindrift::Bookmark) {
     /// let page_index = bookmark.page_index();
     /// # let _ = page_index;
     /// # }
@@ -932,7 +932,7 @@ impl Bookmark {
     /// Returns the bookmark's initial expansion state.
     ///
     /// ```no_run
-    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// # fn inspect(bookmark: &spindrift::Bookmark) {
     /// let state = bookmark.state();
     /// # let _ = state;
     /// # }
@@ -955,10 +955,10 @@ impl Bookmark {
 /// The initial expansion state of a bookmark in a PDF viewer.
 ///
 /// ```no_run
-/// use quire::{BookmarkState, Html, PdfOptions, RenderOptions};
+/// use spindrift::{BookmarkState, Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let document = Html::from_string(
 ///     "<style>h1 { bookmark-state: closed }</style><h1>Introduction</h1>",
 /// )
@@ -1353,7 +1353,7 @@ impl DocumentFontVariationCoordinates {
 ///
 /// The optional delta-set index belongs to a `BaseCoord` format 3 record and
 /// is resolved against the font's selected normalized variation coordinates at
-/// layout time. Quire lays out PDF text without device hinting, so format 2's
+/// layout time. Spindrift lays out PDF text without device hinting, so format 2's
 /// nominal design coordinate is retained without its ppem-specific point
 /// adjustment.
 /// <https://learn.microsoft.com/en-us/typography/opentype/spec/base#basecoord-tables>

@@ -370,7 +370,7 @@ pub(in crate::layout::grid) fn cycled_definite_auto_track_size_before(
 
 /// Return the content-aligned offset for a grid line.
 ///
-/// Taffy applies CSS Box Alignment to the final grid tracks, but some Quire
+/// Taffy applies CSS Box Alignment to the final grid tracks, but some Spindrift
 /// static-position paths compute line offsets directly from CSS track sizes.
 /// The aligned line offset is derivable from the final track line geometry:
 /// positional keywords apply one shared shift, while distributed keywords add

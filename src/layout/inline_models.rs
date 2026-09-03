@@ -2064,7 +2064,7 @@ impl FragmentainerSequence {
     }
 }
 
-/// A temporary fragmentainer materialized through Quire's page cursor.
+/// A temporary fragmentainer materialized through Spindrift's page cursor.
 ///
 /// Multi-column layout uses isolated page-shaped canvases as anonymous column
 /// boxes. This keeps all existing nested fragmentation paths on one cursor

@@ -1,6 +1,6 @@
 # GCPM footnotes parity
 
-Quire implements the page-footnote model from CSS Generated Content for
+Spindrift implements the page-footnote model from CSS Generated Content for
 Paged Media Level 3:
 <https://www.w3.org/TR/css-gcpm-3/#footnotes>.
 

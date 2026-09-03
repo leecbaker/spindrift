@@ -176,7 +176,7 @@ fn filled_rect_count(rendered: &str) -> usize {
 
 /// Return whether a tagged sRGB PDF/A fill uses the requested components.
 ///
-/// PDF/A content may not depend on uncalibrated device RGB. Quire therefore
+/// PDF/A content may not depend on uncalibrated device RGB. Spindrift therefore
 /// selects the page's ICCBased sRGB resource with `cs` before setting a color
 /// with `scn` (ISO 32000-2:2020, 8.6.8).
 fn has_srgb_fill(rendered: &str, components: &str) -> bool {
@@ -208,7 +208,7 @@ fn rendered_pdf_for_page(page: Page) -> String {
 ///
 /// Production PDFs Flate-compress every stream. Tests still need to inspect
 /// PDF operators and XMP text, so this deliberately small reader handles the
-/// direct `/Length` streams produced by Quire's writer rather than relying on
+/// direct `/Length` streams produced by Spindrift's writer rather than relying on
 /// uncompressed implementation details.
 fn pdf_searchable_text(pdf: &[u8]) -> String {
     let mut text = String::new();
@@ -333,7 +333,7 @@ fn assert_all_pdf_streams_use_flate(pdf: &[u8]) {
     while let Some(stream_marker) = find_bytes_from(pdf, b"stream\n", search_start) {
         let stream_start = stream_marker + b"stream\n".len();
         let (dictionary_start, stream_end) =
-            pdf_stream_bounds(pdf, stream_start).expect("Quire stream has a direct /Length");
+            pdf_stream_bounds(pdf, stream_start).expect("Spindrift stream has a direct /Length");
         let dictionary = &pdf[dictionary_start..stream_marker];
         assert!(
             dictionary
@@ -353,7 +353,7 @@ fn assert_no_pdf_streams_use_flate(pdf: &[u8]) {
     while let Some(stream_marker) = find_bytes_from(pdf, b"stream\n", search_start) {
         let stream_start = stream_marker + b"stream\n".len();
         let (dictionary_start, stream_end) =
-            pdf_stream_bounds(pdf, stream_start).expect("Quire stream has a direct /Length");
+            pdf_stream_bounds(pdf, stream_start).expect("Spindrift stream has a direct /Length");
         let dictionary = &pdf[dictionary_start..stream_marker];
         assert!(
             !dictionary
@@ -961,7 +961,7 @@ fn pdf_metadata_stream_mirrors_document_info_dictionary() {
     let document = metadata_test_document(DocumentMetadata {
         title: Some("Spec Title".to_string()),
         author: Some("Ada Lovelace".to_string()),
-        creator: Some("Quire Test Suite".to_string()),
+        creator: Some("Spindrift Test Suite".to_string()),
         language: Some("en-US".to_string()),
         description: Some("Specification summary".to_string()),
         keywords: vec!["PDF".to_string(), "metadata".to_string()],
@@ -970,7 +970,7 @@ fn pdf_metadata_stream_mirrors_document_info_dictionary() {
     });
 
     let pdf_options = PdfOptions {
-        producer: "quire-test producer".to_string(),
+        producer: "spindrift-test producer".to_string(),
         ..PdfOptions::default()
     };
     let pdf = document.write_pdf_bytes(&pdf_options).unwrap();
@@ -981,16 +981,16 @@ fn pdf_metadata_stream_mirrors_document_info_dictionary() {
     assert!(rendered.contains("/Subtype /XML"));
     assert!(rendered.contains("/Title (Spec Title)"));
     assert!(rendered.contains("/Author (Ada Lovelace)"));
-    assert!(rendered.contains("/Creator (Quire Test Suite)"));
-    assert!(rendered.contains("/Producer (quire-test producer)"));
+    assert!(rendered.contains("/Creator (Spindrift Test Suite)"));
+    assert!(rendered.contains("/Producer (spindrift-test producer)"));
     assert!(rendered.contains("/Lang (en-US)"));
     assert!(rendered.contains("/Subject (Specification summary)"));
     assert!(rendered.contains("/Keywords (PDF, metadata)"));
     assert!(rendered.contains("/CreationDate (D:19970716192000+01'00)"));
     assert!(rendered.contains("/ModDate (D:19981223)"));
-    assert!(xmp.contains("<pdf:Producer>quire-test producer</pdf:Producer>"));
+    assert!(xmp.contains("<pdf:Producer>spindrift-test producer</pdf:Producer>"));
     assert!(!xmp.contains("pdfaid"));
-    assert!(xmp.contains("<xmp:CreatorTool>Quire Test Suite</xmp:CreatorTool>"));
+    assert!(xmp.contains("<xmp:CreatorTool>Spindrift Test Suite</xmp:CreatorTool>"));
     assert!(xmp.contains("<dc:creator><rdf:Seq><rdf:li>Ada Lovelace</rdf:li>"));
     assert!(xmp.contains("<dc:language><rdf:Bag><rdf:li>en-US</rdf:li>"));
     assert!(xmp.contains(
@@ -1063,7 +1063,7 @@ fn ordinary_pdf_without_source_metadata_omits_unused_document_resources() {
     let rendered = pdf_searchable_text(&pdf);
 
     assert!(pdf.starts_with(b"%PDF-1.4"));
-    assert!(rendered.contains("/Producer (quire 0.1.0)"));
+    assert!(rendered.contains("/Producer (spindrift 0.1.0)"));
     assert!(!rendered.contains("/Subtype /XML"));
     assert!(!rendered.contains("/Metadata"));
     assert!(!rendered.contains("/ICCBased"));
@@ -1105,7 +1105,7 @@ fn pdf_xmp_metadata_escapes_text_values() {
 
     let options = PdfOptions {
         profile: PdfProfile::Pdf,
-        producer: "Quire & Producer <PDF>".to_string(),
+        producer: "Spindrift & Producer <PDF>".to_string(),
         ..PdfOptions::default()
     };
     let pdf = document.write_pdf_bytes(&options).unwrap();
@@ -1114,7 +1114,7 @@ fn pdf_xmp_metadata_escapes_text_values() {
     assert!(xmp.contains("AT&amp;T &lt;PDF&gt; &quot;Title&quot; &#39;Test&#39; Café"));
     assert!(xmp.contains("Ada &amp; Bob &lt;Team&gt; &quot;A&quot; &#39;B&#39; Ł"));
     assert!(xmp.contains("Tool &amp; Chain &lt;1&gt;"));
-    assert!(xmp.contains("Quire &amp; Producer &lt;PDF&gt;"));
+    assert!(xmp.contains("Spindrift &amp; Producer &lt;PDF&gt;"));
     assert!(xmp.contains("en&amp;&lt;US&gt;&quot;&#39;"));
     assert!(xmp.contains("A &amp; B &lt;C&gt;"));
     assert!(xmp.contains("<pdf:Keywords>A&amp;B</pdf:Keywords>"));
@@ -2969,7 +2969,7 @@ fn pdf_subset_font_names_use_six_uppercase_prefix() {
             .all(|character| character.is_ascii_uppercase())
     );
     assert_eq!(post_script_name, "SourceSans3-Regular");
-    assert!(!rendered.contains("/BaseFont /QUIREP+"));
+    assert!(!rendered.contains("/BaseFont /SPINDRIFTP+"));
 }
 
 #[test]

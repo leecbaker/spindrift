@@ -8,7 +8,7 @@ struct TemporaryDirectory(std::path::PathBuf);
 impl TemporaryDirectory {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "quire-cli-info-{}-{}",
+            "spindrift-cli-info-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -29,12 +29,12 @@ impl Drop for TemporaryDirectory {
 #[test]
 fn info_reports_the_host_without_rendering_or_logging() {
     let directory = TemporaryDirectory::new();
-    let result = Command::new(env!("CARGO_BIN_EXE_quire"))
+    let result = Command::new(env!("CARGO_BIN_EXE_spindrift"))
         .current_dir(&directory.0)
         .env_remove("RUST_LOG")
         .args(["--info", "input.html", "missing/output.pdf"])
         .output()
-        .expect("quire binary should run");
+        .expect("spindrift binary should run");
 
     assert!(result.status.success());
     assert!(result.stderr.is_empty());
@@ -49,7 +49,7 @@ fn info_reports_the_host_without_rendering_or_logging() {
     assert!(report.starts_with("System: "));
     assert!(report.contains("\nMachine: "));
     assert!(report.contains("\nVersion: "));
-    assert!(report.contains("\n\nQuire version: "));
+    assert!(report.contains("\n\nSpindrift version: "));
     assert!(!report.contains("Pango version:"));
     assert!(!report.contains("Pydyf version:"));
 }

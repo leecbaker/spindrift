@@ -510,7 +510,7 @@ macro_rules! define_modeled_syntax {
     };
 }
 
-// Physical shorthands and aggregate spelling supported by Quire. Each spelling
+// Physical shorthands and aggregate spelling supported by Spindrift. Each spelling
 // is a closed variant so cascade identity cannot retain an authored string.
 define_modeled_syntax! {
     ModeledShorthand, ALL_MODELED_SHORTHANDS {

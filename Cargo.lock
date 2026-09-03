@@ -2414,61 +2414,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quire"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "clap_complete",
- "criterion",
- "cssparser",
- "data-url",
- "env_logger",
- "euclid",
- "fontique",
- "html5ever",
- "hyphenation",
- "icu_casemap",
- "icu_locale_core",
- "icu_properties",
- "icu_provider",
- "icu_segmenter",
- "image",
- "jiff",
- "jxl-oxide",
- "kamadak-exif",
- "kham-core",
- "kurbo",
- "log",
- "markup5ever_rcdom",
- "miniz_oxide 0.8.9",
- "moxcms 0.9.0",
- "os_info",
- "palette",
- "parley",
- "parse-srcset",
- "pdf-writer",
- "png",
- "precomputed-hash",
- "read-fonts 0.40.2",
- "reqwest",
- "selectors",
- "sha2",
- "subsetter",
- "taffy",
- "thiserror",
- "tiny-skia",
- "tiny-skia-path",
- "tokio",
- "ttf-parser",
- "unicode-bidi",
- "url",
- "usvg",
- "wuff",
- "xml5ever",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2992,6 +2937,61 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spindrift"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "clap_complete",
+ "criterion",
+ "cssparser",
+ "data-url",
+ "env_logger",
+ "euclid",
+ "fontique",
+ "html5ever",
+ "hyphenation",
+ "icu_casemap",
+ "icu_locale_core",
+ "icu_properties",
+ "icu_provider",
+ "icu_segmenter",
+ "image",
+ "jiff",
+ "jxl-oxide",
+ "kamadak-exif",
+ "kham-core",
+ "kurbo",
+ "log",
+ "markup5ever_rcdom",
+ "miniz_oxide 0.8.9",
+ "moxcms 0.9.0",
+ "os_info",
+ "palette",
+ "parley",
+ "parse-srcset",
+ "pdf-writer",
+ "png",
+ "precomputed-hash",
+ "read-fonts 0.40.2",
+ "reqwest",
+ "selectors",
+ "sha2",
+ "subsetter",
+ "taffy",
+ "thiserror",
+ "tiny-skia",
+ "tiny-skia-path",
+ "tokio",
+ "ttf-parser",
+ "unicode-bidi",
+ "url",
+ "usvg",
+ "wuff",
+ "xml5ever",
 ]
 
 [[package]]

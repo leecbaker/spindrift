@@ -1,8 +1,8 @@
 use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
 
-/// Largest coordinate representable in Quire's default PDF user space.
+/// Largest coordinate representable in Spindrift's default PDF user space.
 ///
-/// PDF limits default user-space coordinates to 200 inches. Quire does not
+/// PDF limits default user-space coordinates to 200 inches. Spindrift does not
 /// currently emit `/UserUnit`, so preserving larger CSS values would create
 /// invalid PDF geometry and can turn one box into billions of fragmentainers.
 /// Clamp at the CSS used-value boundary instead.

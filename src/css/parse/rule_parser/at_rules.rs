@@ -60,7 +60,7 @@ pub(in crate::css) fn parse_property_names<'i, 't>(
     })
 }
 
-/// Parses Quire's supported `<color>` subset of an `@property` rule.
+/// Parses Spindrift's supported `<color>` subset of an `@property` rule.
 ///
 /// Descriptor boundaries and names are validated by CSS Syntax. Unknown or
 /// malformed descriptors recover locally; the completed rule is emitted only
@@ -232,16 +232,16 @@ pub(in crate::css) fn parse_namespace_prelude(prelude: &str) -> Option<(Option<S
 
 /// Parses the supported CSS Cascade 5 `@scope` prelude forms.
 ///
-/// Quire currently accepts explicit root selectors and optional lower
+/// Spindrift currently accepts explicit root selectors and optional lower
 /// boundaries, `@scope (<root>)` and `@scope (<root>) to (<limit>)`. Invalid
 /// or unsupported preludes are ignored so their declarations do not enter the
 /// cascade:
 /// <https://www.w3.org/TR/css-cascade-5/#scope-atrule>.
 pub(in crate::css) fn parse_scope_prelude<'i, 't>(
     input: &mut Parser<'i, 't>,
-    selector_parser: &QuireSelectorParser,
+    selector_parser: &SpindriftSelectorParser,
     owner: StylesheetScopeAnchor,
-    nesting_parent: Option<&SelectorList<QuireSelectorImpl>>,
+    nesting_parent: Option<&SelectorList<SpindriftSelectorImpl>>,
 ) -> Result<ScopeRule, cssparser::ParseError<'i, SelectorParseErrorKind<'i>>> {
     let root = if input
         .try_parse(|input| input.expect_parenthesis_block())
@@ -272,10 +272,12 @@ pub(in crate::css) fn parse_scope_prelude<'i, 't>(
 
 fn parse_scope_selector_from_parser<'i, 't>(
     input: &mut Parser<'i, 't>,
-    selector_parser: &QuireSelectorParser,
-    nesting_parent: Option<&SelectorList<QuireSelectorImpl>>,
-) -> Result<SelectorList<QuireSelectorImpl>, cssparser::ParseError<'i, SelectorParseErrorKind<'i>>>
-{
+    selector_parser: &SpindriftSelectorParser,
+    nesting_parent: Option<&SelectorList<SpindriftSelectorImpl>>,
+) -> Result<
+    SelectorList<SpindriftSelectorImpl>,
+    cssparser::ParseError<'i, SelectorParseErrorKind<'i>>,
+> {
     let selector = SelectorList::parse(selector_parser, input, ParseRelative::No)?;
     input.expect_exhausted()?;
     let selector = if selector
@@ -304,9 +306,11 @@ fn parse_scope_selector_from_parser<'i, 't>(
 /// Parsing that replacement as selectors keeps it in the same selector model
 /// as ordinary scope boundaries.
 fn nesting_scope_limit_parent<'i>(
-    selector_parser: &QuireSelectorParser,
-) -> Result<SelectorList<QuireSelectorImpl>, cssparser::ParseError<'i, SelectorParseErrorKind<'i>>>
-{
+    selector_parser: &SpindriftSelectorParser,
+) -> Result<
+    SelectorList<SpindriftSelectorImpl>,
+    cssparser::ParseError<'i, SelectorParseErrorKind<'i>>,
+> {
     let mut input = ParserInput::new(":where(:scope)");
     let mut parser = Parser::new(&mut input);
     let selector = SelectorList::parse(selector_parser, &mut parser, ParseRelative::No)?;
@@ -316,8 +320,8 @@ fn nesting_scope_limit_parent<'i>(
 
 pub(in crate::css) fn parse_scope_selector(
     selector: &str,
-    selector_parser: &QuireSelectorParser,
-) -> Option<SelectorList<QuireSelectorImpl>> {
+    selector_parser: &SpindriftSelectorParser,
+) -> Option<SelectorList<SpindriftSelectorImpl>> {
     let mut input = ParserInput::new(selector);
     let mut parser = Parser::new(&mut input);
     let selector = SelectorList::parse(selector_parser, &mut parser, ParseRelative::No).ok()?;

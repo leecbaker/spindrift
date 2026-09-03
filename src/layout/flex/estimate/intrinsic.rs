@@ -991,7 +991,7 @@ pub(in crate::layout::flex) fn intrinsic_flex_container_max_main_size(
 /// Return the ideal-algorithm max-content flex fraction from Flexbox 9.9.1.1.
 ///
 /// The current Flexbox draft leaves the web-compatible algorithm in 9.9.1.2
-/// partially unresolved. Quire therefore implements the concrete ideal
+/// partially unresolved. Spindrift therefore implements the concrete ideal
 /// flex-fraction algorithm and records any remaining browser-compatibility
 /// mismatch as a spec divergence rather than encoding undefined behavior.
 /// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-main-sizes>.

@@ -2,10 +2,10 @@
 
 use std::fs::File;
 
-use quire::{Css, Html, PdfOptions, RenderOptions};
+use spindrift::{Css, Html, PdfOptions, RenderOptions};
 
 #[tokio::main]
-async fn main() -> quire::Result<()> {
+async fn main() -> spindrift::Result<()> {
     let css = Css::from_string(
         r#"
         @page { size: 300px 240px; margin: 24px }
@@ -14,12 +14,12 @@ async fn main() -> quire::Result<()> {
         "#,
     );
 
-    let mut output = File::create("output/quire-styled-example.pdf")?;
+    let mut output = File::create("output/spindrift-styled-example.pdf")?;
     Html::from_string(
         r#"
         <title>Styled</title>
         <h1>Styled PDF</h1>
-        <div class="box">A styled block from quire.</div>
+        <div class="box">A styled block from spindrift.</div>
         <ol><li>Parse HTML</li><li>Apply CSS</li><li>Write PDF</li></ol>
         "#,
     )

@@ -199,7 +199,7 @@ pub(crate) fn parse_color_from_currentcolor_in_scheme(
 ///
 /// The function must resolve to whichever of black and white has the greater
 /// contrast against its argument. CSS leaves the exact contrast algorithm to
-/// the user agent; Quire uses the WCAG relative-luminance contrast ratio,
+/// the user agent; Spindrift uses the WCAG relative-luminance contrast ratio,
 /// whose monotonic ordering makes this choice well-defined:
 /// <https://www.w3.org/TR/css-color-5/#contrast-color>.
 fn parse_contrast_color(value: &str, current: CssColor) -> Option<CssColor> {
@@ -229,7 +229,7 @@ fn relative_luminance(color: CssColor) -> f32 {
         + 0.0722 * srgb_component_to_linear(color.components()[2] as f64) as f32
 }
 
-/// Resolve the light branch of `light-dark()` in Quire's fixed light print
+/// Resolve the light branch of `light-dark()` in Spindrift's fixed light print
 /// color scheme. CSS CssColor Adjustment selects the branch from the used
 /// `color-scheme`: <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-effect>.
 fn parse_light_dark(
@@ -567,7 +567,7 @@ pub(crate) fn normalize_css_comments(value: &str) -> String {
     result
 }
 
-/// Resolve CSS system colors to Quire's deterministic print palette.
+/// Resolve CSS system colors to Spindrift's deterministic print palette.
 ///
 /// CSS CssColor 4 leaves these colors dependent on the user agent and operating
 /// system, while requiring deprecated system-color aliases to equal their
@@ -796,7 +796,7 @@ fn parse_modern_hsl_hwb_component(value: &str) -> Option<f32> {
     parse_percentage(value).or_else(|| value.parse::<f32>().ok().map(|value| value / 100.0))
 }
 
-/// Parse CSS CssColor 4's predefined `color()` spaces into Quire's sRGB paint
+/// Parse CSS CssColor 4's predefined `color()` spaces into Spindrift's sRGB paint
 /// representation. CssColor conversion follows the conversion matrices and
 /// transfer functions in <https://www.w3.org/TR/css-color-4/#color-conversion-code>.
 pub(crate) fn parse_color_function(value: &str) -> Option<CssColor> {
@@ -1543,7 +1543,7 @@ fn lab_to_xyz_d50(lightness: f64, a: f64, b: f64) -> Triplet {
 ///
 /// CSS CssColor 4 defines OKLab relative to D65 XYZ, exactly the semantic model
 /// represented by Palette's `Oklab` and `Xyz<D65>` types. Parsing and hue
-/// grammar remain Quire-owned CSS behavior; Palette owns this standard math.
+/// grammar remain Spindrift-owned CSS behavior; Palette owns this standard math.
 /// <https://www.w3.org/TR/css-color-4/#ok-lab>
 fn oklab_to_xyz_d65(lightness: f64, a: f64, b: f64) -> Triplet {
     let xyz: Xyz<D65, f64> = Xyz::from_color_unclamped(Oklab::new(lightness, a, b));

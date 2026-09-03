@@ -36,13 +36,13 @@ fn cli_rejects_literal_html_as_a_nonexistent_path() {
             .join("tests/fixtures")
             .join(format!("cli-literal-html-{}.pdf", std::process::id())),
     );
-    let result = Command::new(env!("CARGO_BIN_EXE_quire"))
+    let result = Command::new(env!("CARGO_BIN_EXE_spindrift"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("RUST_LOG")
         .arg("<p>literal HTML input</p>")
         .arg(&output.0)
         .output()
-        .expect("quire binary should run");
+        .expect("spindrift binary should run");
 
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("No such file or directory"));
@@ -55,7 +55,7 @@ fn cli_stylesheet_supplies_the_default_page_size() {
     let stylesheet = temporary_fixture("user-page-default", "css", "@page { size: 200pt 200pt }");
     let output = temporary_fixture("user-page-default", "pdf", "");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_quire"))
+    let result = Command::new(env!("CARGO_BIN_EXE_spindrift"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("RUST_LOG")
         .arg("--stylesheet")
@@ -63,7 +63,7 @@ fn cli_stylesheet_supplies_the_default_page_size() {
         .arg(&input.0)
         .arg(&output.0)
         .output()
-        .expect("quire binary should run");
+        .expect("spindrift binary should run");
 
     assert!(result.status.success());
     assert_media_box(&output.0, 200, 200);
@@ -83,7 +83,7 @@ fn cli_stylesheet_does_not_override_an_author_page_size() {
     );
     let output = temporary_fixture("user-page-author-wins", "pdf", "");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_quire"))
+    let result = Command::new(env!("CARGO_BIN_EXE_spindrift"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("RUST_LOG")
         .arg("--stylesheet")
@@ -91,7 +91,7 @@ fn cli_stylesheet_does_not_override_an_author_page_size() {
         .arg(&input.0)
         .arg(&output.0)
         .output()
-        .expect("quire binary should run");
+        .expect("spindrift binary should run");
 
     assert!(result.status.success());
     assert_media_box(&output.0, 300, 300);

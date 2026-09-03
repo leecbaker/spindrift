@@ -322,10 +322,10 @@ impl PageMargins {
 /// Inputs that control document parsing, cascade, and layout.
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, RenderOptions};
+/// use spindrift::{Html, PdfOptions, RenderOptions};
 /// use std::fs::File;
 ///
-/// # async fn render() -> quire::Result<()> {
+/// # async fn render() -> spindrift::Result<()> {
 /// let mut render_options = RenderOptions::default();
 /// render_options.target_fragment = Some("summary".to_string());
 /// let mut output = File::create("document.pdf")?;
@@ -423,7 +423,7 @@ impl RenderOptions {
     /// Returns the initial font size in PDF points.
     ///
     /// ```
-    /// let options = quire::RenderOptions::default();
+    /// let options = spindrift::RenderOptions::default();
     /// assert!(options.font_size() > 0.0);
     /// ```
     pub fn font_size(&self) -> f32 {
@@ -433,7 +433,7 @@ impl RenderOptions {
     /// Returns the initial line height in PDF points.
     ///
     /// ```
-    /// let options = quire::RenderOptions::default();
+    /// let options = spindrift::RenderOptions::default();
     /// assert!(options.line_height() > 0.0);
     /// ```
     pub fn line_height(&self) -> f32 {
@@ -1303,7 +1303,7 @@ fn svg_css_transform_function_matrix(function: css::TransformFunction) -> SvgCss
 
 fn svg_css_length_in_user_units(value: css::ComputedLengthPercentage) -> f32 {
     // SVG user units are CSS px in an inline SVG viewport. Computed CSS
-    // lengths are stored in Quire points, so convert back at this boundary.
+    // lengths are stored in Spindrift points, so convert back at this boundary.
     used_length_percentage(value, PercentageBasis::definite(layout_pt(0.0))).points()
         / css::CSS_PX_TO_PT
 }
@@ -1837,7 +1837,7 @@ impl FragmentOffsets {
             PhysicalSide::Right => self.right = 0.0,
             PhysicalSide::Left => self.left = 0.0,
             PhysicalSide::Bottom => {
-                // Quire's horizontal principal flow is `horizontal-tb`, so
+                // Spindrift's horizontal principal flow is `horizontal-tb`, so
                 // no active page continuation stores a physical bottom
                 // cursor. Retain this branch to make any future block-upward
                 // writing mode an explicit implementation decision.

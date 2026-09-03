@@ -102,7 +102,7 @@ impl StackProfile {
         self.stack_size_bytes = unsafe { pthread_get_stacksize_np(thread) };
         self.next_report_bytes = STACK_REPORT_INTERVAL_BYTES;
         log::info!(
-            target: "quire::stack_profile",
+            target: "spindrift::stack_profile",
             "stack_bytes={} report_interval_bytes={STACK_REPORT_INTERVAL_BYTES}",
             self.stack_size_bytes,
         );
@@ -127,7 +127,7 @@ impl StackProfile {
             self.next_report_bytes += STACK_REPORT_INTERVAL_BYTES;
         }
         log::info!(
-            target: "quire::stack_profile",
+            target: "spindrift::stack_profile",
             "used_bytes={used_bytes} stack_bytes={} percent={:.1} path={}",
             self.stack_size_bytes,
             used_bytes as f64 * 100.0 / self.stack_size_bytes as f64,

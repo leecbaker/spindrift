@@ -8,7 +8,7 @@ pub(in crate::layout) struct PageMarginBoxLayout<'a> {
     ///
     /// CSS Paged Media defines generated page-margin boxes around the page
     /// area. At this point their used rectangles have already been projected
-    /// into Quire paint space: origin at the page bottom-left, `x` increasing
+    /// into Spindrift paint space: origin at the page bottom-left, `x` increasing
     /// rightward, and `y` increasing upward:
     /// <https://www.w3.org/TR/css-page-3/#page-margin-boxes>.
     pub(in crate::layout) border_rect: PaintRect,

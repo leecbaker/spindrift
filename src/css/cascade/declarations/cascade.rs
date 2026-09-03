@@ -107,7 +107,7 @@ pub(in crate::css) fn cascaded_declarations_from(
 /// Sorts declarations into winning cascade order before computed-value resolution.
 ///
 /// CSS Cascade Level 5 sorts by origin/importance, layer order, specificity,
-/// scoped proximity, and source order. Quire currently models UA, user,
+/// scoped proximity, and source order. Spindrift currently models UA, user,
 /// and author origins:
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-sort>.
 pub(crate) fn sort_cascaded_declarations(declarations: &mut [CascadedDeclaration<'_>]) {
@@ -178,7 +178,7 @@ pub(crate) fn declaration_is_important(value: &str) -> bool {
 
 /// Returns the Cascade Level 5 origin/importance rank from weakest to strongest.
 ///
-/// Quire currently has no transition or animation origin, so the modeled
+/// Spindrift currently has no transition or animation origin, so the modeled
 /// origin ladder is UA normal, user normal, author normal, author important,
 /// user important, then UA important:
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-origin>.

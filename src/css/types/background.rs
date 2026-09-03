@@ -649,7 +649,7 @@ impl BackgroundImage {
         }
     }
 
-    /// Resolve an `image-set()` using Quire's deterministic quality-first
+    /// Resolve an `image-set()` using Spindrift's deterministic quality-first
     /// static-rendering policy. Unsupported MIME options are removed before
     /// duplicate-resolution elimination, exactly as required by CSS Images.
     pub(crate) fn select_image_set(&mut self, device_resolution_dppx: f32) -> bool {

@@ -151,12 +151,12 @@ footers.
 - Variable-dimension sizing remains incomplete only for genuinely indefinite
   or mutually interdependent orthogonal cross-axis constraints.
 - `writing-mode` is outside CSS Page 3's normative page-margin property list.
-  Quire retains its normal CSS Writing Modes rendering for that undefined
+  Spindrift retains its normal CSS Writing Modes rendering for that undefined
   combination; three imported reftests (`dimensions-004`, `dimensions-013`,
   and `dimensions-014`) encode different compatibility behavior. The
-  `quire-wpt` configuration records their exact, observed pixel ratios as
+  `spindrift-wpt` configuration records their exact, observed pixel ratios as
   runner-only expected differences; it does not alter either document or
-  Quire's rendering.
+  Spindrift's rendering.
 
 ## Verification
 
@@ -168,7 +168,7 @@ footers.
 - Local smoke coverage verifies page/page-count named-string counters across
   pagination plus direct, nested, and inline `display:none` named-string
   sources. The 20 manual `css/css-gcpm/` documents are rendered directly by
-  Quire because they do not provide WPT reference links.
+  Spindrift because they do not provide WPT reference links.
 - PDF tests verify that negative `z-index` page-margin opacity emits a
   transparency group, preventing regressions where below-document replay drops
   paint effects.

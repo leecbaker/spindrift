@@ -70,7 +70,7 @@ but spec conformance takes priority when behavior differs.
 - A computed percentage table-root height makes cell descendants eligible for
   CSS Tables 3's second layout pass even when that percentage behaves as
   `auto`; `percent-height-table-cell-child.html` remains a legacy
-  interoperability difference rather than a Quire conformance target.
+  interoperability difference rather than a Spindrift conformance target.
 - First-pass table-cell row minimum sizing treats descendants whose block size
   depends on the parent cell height as auto, including direct atomic and
   replaced content. A percentage-height no-source image therefore cannot

@@ -1171,7 +1171,7 @@ async fn applies_asymmetric_page_margins_to_page_area() {
 
 #[tokio::test]
 async fn viewport_units_resolve_to_paged_media_page_area() {
-    let wpt_root = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt");
+    let wpt_root = std::path::Path::new("/Users/lee/oss/spindrift-wpt/third_party/wpt");
     if !wpt_root.exists() {
         return;
     }
@@ -1202,7 +1202,7 @@ async fn viewport_units_resolve_to_paged_media_page_area() {
 
 #[tokio::test]
 async fn left_and_right_page_selectors_set_alternating_page_areas() {
-    let wpt_root = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt");
+    let wpt_root = std::path::Path::new("/Users/lee/oss/spindrift-wpt/third_party/wpt");
     if !wpt_root.exists() {
         return;
     }
@@ -1242,7 +1242,7 @@ async fn left_and_right_page_selectors_set_alternating_page_areas() {
 
 #[tokio::test]
 async fn page_margin_box_default_alignment_matches_wpt() {
-    let wpt_root = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt");
+    let wpt_root = std::path::Path::new("/Users/lee/oss/spindrift-wpt/third_party/wpt");
     if !wpt_root.exists() {
         return;
     }
@@ -1877,7 +1877,7 @@ async fn page_margin_text_box_trim_start_adjusts_fixed_box_paint_origin() {
         .await
         .unwrap();
 
-    let header_y = |document: &quire::Document| {
+    let header_y = |document: &spindrift::Document| {
         document.pages[0]
             .lines()
             .iter()
@@ -1910,7 +1910,7 @@ async fn vertical_page_margin_text_box_trim_start_uses_margin_box_writing_mode()
         .await
         .unwrap();
 
-    let line_position = |document: &quire::Document| {
+    let line_position = |document: &spindrift::Document| {
         let line = document.pages[0]
             .lines()
             .iter()
@@ -3863,7 +3863,7 @@ async fn page_margin_boxes_default_to_document_font_size() {
 }
 
 fn line_has_font_containing(
-    document: &quire::Document,
+    document: &spindrift::Document,
     line: &crate::document::paint::text::RenderedLine,
     needle: &str,
 ) -> bool {
@@ -4255,7 +4255,7 @@ async fn page_margin_vertical_fixed_box_uses_logical_inline_axis() {
              </style>"
         ))
     };
-    let line_position = |document: &quire::Document| {
+    let line_position = |document: &spindrift::Document| {
         let line = document.pages[0]
             .lines()
             .iter()
@@ -4661,7 +4661,7 @@ async fn taiwanese_numerals_footnote_does_not_fragment_the_table() {
     );
 }
 
-fn rounded_page_rects(page: &quire::Page) -> Vec<(i32, i32, i32, i32)> {
+fn rounded_page_rects(page: &spindrift::Page) -> Vec<(i32, i32, i32, i32)> {
     let mut rects = page
         .rects()
         .iter()
@@ -4678,7 +4678,7 @@ fn rounded_page_rects(page: &quire::Page) -> Vec<(i32, i32, i32, i32)> {
     rects
 }
 
-fn rounded_page_lines(page: &quire::Page) -> Vec<(String, i32, i32)> {
+fn rounded_page_lines(page: &spindrift::Page) -> Vec<(String, i32, i32)> {
     let mut lines = page
         .lines()
         .iter()

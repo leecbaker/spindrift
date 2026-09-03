@@ -2,7 +2,7 @@
 
 Last updated: 2026-08-21
 
-This document tracks Quire's implementation status for CSS Flexible Box
+This document tracks Spindrift's implementation status for CSS Flexible Box
 Layout. The normative references are CSS Flexible Box Layout Level 1, CSS Box
 Alignment Level 3, CSS Writing Modes Level 4, CSS Sizing Level 3, and CSS
 Fragmentation Level 3. WeasyPrint tests and behavior are useful compatibility
@@ -62,7 +62,7 @@ references, but spec conformance is the priority when the two disagree.
   physical line sides in RTL rows instead of Taffy's logical start/end, and
   vertical bottom-origin cross coordinates are reprojected after baseline
   placement.
-- Taffy-specific limitations and Quire adapter workarounds are tracked in
+- Taffy-specific limitations and Spindrift adapter workarounds are tracked in
   `docs/TAFFY_SHORTCOMINGS.md`.
 
 ## Sizing and replay matrix
@@ -91,7 +91,7 @@ final line measurement and the distribution consumers that depend on those
 unresolved final geometries. Image-edge-only comparisons such as
 `aspect-ratio-intrinsic-size-006.html` remain raster-export triage rather than
 Flex geometry failures.
-- Quire supplies CSS/PDF-specific adapter behavior for flex child collection,
+- Spindrift supplies CSS/PDF-specific adapter behavior for flex child collection,
   anonymous text items, intrinsic estimates, `flex-basis` keyword resolution,
   automatic minimum sizes, replaced-item sizing, baseline correction, absolute
   flex child static positions, inline-flex atoms, and PDF painting.
@@ -196,7 +196,7 @@ Flex geometry failures.
 - A single final cross-axis placement phase runs after main-size and cross-size
   remeasurement, automatic-minimum correction, and line-slot refresh. Taffy
   continues to construct lines, size stretch items, and resolve auto cross
-  margins; Quire resolves the final CSS Align side, center, safe-overflow, and
+  margins; Spindrift resolves the final CSS Align side, center, safe-overflow, and
   first/last baseline placement from those final margin-box slots. Baseline
   metadata is then refreshed before `align-content`, RTL mirroring, and other
   whole-line translations move items and their exported baselines together.
@@ -276,8 +276,8 @@ Flex geometry failures.
   `vertical-lr`, and `vertical-rl` inline-flex baseline transport.
 - Exact evaluation of all 17 non-reference
   `css/css-flexbox/flexbox-baseline-*` WPTs on 2026-08-21 passes 17 of 17 in
-  Quire. The multiline reference documents also exercise HTML `<br>` under an
-  author-specified atomic display and a following float: Quire retains the
+  Spindrift. The multiline reference documents also exercise HTML `<br>` under an
+  author-specified atomic display and a following float: Spindrift retains the
   semantic forced break without materializing it as an atomic line box, resets
   the adjoining-float source-order floor after the committed line, and keeps
   the preceding in-flow line as the inline-block baseline.
@@ -382,7 +382,7 @@ Flex geometry failures.
   min/max constraints into the content-basis candidate used by
   `flex-basis:auto`, while keeping main-axis min/max constraints out of the
   flex base size. Raster image natural dimensions, including HTML-validated
-  EXIF density correction, convert from CSS px to Quire layout points before
+  EXIF density correction, convert from CSS px to Spindrift layout points before
   they contribute to flex max-content main-size calculations, including
   vertical-writing row flex items.
 - Automatic flex minimums use a preferred aspect ratio to transfer a definite
@@ -402,7 +402,7 @@ Flex geometry failures.
   padding and borders contribute exactly once to cross sizing and inline
   fallback references.
 - Resource-less video and iframe elements now remain atomic replaced boxes for
-  flex sizing and replay even when Quire has no frame/embed painter. Their
+  flex sizing and replay even when Spindrift has no frame/embed painter. Their
   unavailable content is transparent while author backgrounds and borders
   still paint; iframe fallback dimensions deliberately carry no preferred
   aspect ratio. Ratio-only inline SVG roots likewise use CSS's 300px default
@@ -415,7 +415,7 @@ Flex geometry failures.
   supplies the real line height for otherwise zero-height atomic-inline
   floats, so their overflow and clearance geometry remains materialized.
 - When a content-based flex basis runs along an item's logical inline axis,
-  Quire measures hypothetical cross-size line boxes at that resolved
+  Spindrift measures hypothetical cross-size line boxes at that resolved
   max-content base rather than at a narrower available container width. This
   avoids introducing soft wraps before the flex algorithm establishes the
   item's main size. Float-only block items re-enter block formatting with the
@@ -438,7 +438,7 @@ Flex geometry failures.
   the opposite axis. This keeps the generic default object dimensions from
   becoming an erroneous flex base size.
 - Authored `aspect-ratio` values on non-replaced flex items participate in
-  Quire's flex base-size and automatic minimum main-size calculations, including
+  Spindrift's flex base-size and automatic minimum main-size calculations, including
   content-box transferred flex bases that Taffy expands through item padding
   and borders according to `box-sizing`. The flex/Taffy adapter carries those
   transferred sizes through semantic content-box and non-content typed lengths
@@ -530,7 +530,7 @@ Flex geometry failures.
   without painting their images or consuming main-axis space, and
   vertical-writing row flex items preserve the same physical cross-size strut
   behavior.
-- Wrapped row flex containers apply Quire post-Taffy baseline passes for
+- Wrapped row flex containers apply Spindrift post-Taffy baseline passes for
   `align-content: baseline` and `align-content: last baseline`, using recorded
   first/last line baseline sets and content baselines synthesized from flex
   item estimates when needed. Horizontal writing modes align physical y
@@ -812,7 +812,7 @@ Flex geometry failures.
   flex items, definite-cross-size raster image flex items using flex-resolved
   main sizes, and stretched column flex items whose aspect-ratio transferred
   main size is clamped by content auto-minimum sizing. Add
-  Quire-specific regression tests for full PDF fragment
+  Spindrift-specific regression tests for full PDF fragment
   metadata, running elements and links inside fragmented flex items, full
   cloned decorations, and Taffy adapter edge cases as fragmentation is
   completed. Current flex sizing coverage includes auto-height row containers

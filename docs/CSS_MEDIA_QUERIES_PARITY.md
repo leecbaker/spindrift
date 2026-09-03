@@ -1,6 +1,6 @@
 # CSS Media Queries Parity
 
-Quire evaluates `@media` and `@import` media lists in an explicit rendering
+Spindrift evaluates `@media` and `@import` media lists in an explicit rendering
 environment. PDF output defaults to the `print` media type; callers can select
 the `screen` media type and an initial viewport through render options without
 changing the default PDF semantics. The implementation preserves the Media Queries distinction

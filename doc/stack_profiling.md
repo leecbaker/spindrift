@@ -1,6 +1,6 @@
 # Stack-usage diagnosis
 
-This guide documents Quire's macOS stack high-water and call-path profiler,
+This guide documents Spindrift's macOS stack high-water and call-path profiler,
 the KinSNP stack sweep, and static frame inspection. It is developer
 documentation, not a renderer feature contract.
 
@@ -16,7 +16,7 @@ feature, then run it directly:
 
 ```sh
 cargo build --release --features stack-profile
-env -u RUST_MIN_STACK RUST_LOG=quire::stack_profile=info target/release/quire request_kinsnp_default_stack.html request_kinsnp_default_stack.pdf
+env -u RUST_MIN_STACK RUST_LOG=spindrift::stack_profile=info target/release/spindrift request_kinsnp_default_stack.html request_kinsnp_default_stack.pdf
 ```
 
 Unsetting `RUST_MIN_STACK` prevents a shell or test configuration from carrying
@@ -54,7 +54,7 @@ The recorded investigation used 200 KiB increments above Rust's 2 MiB default:
 ```sh
 for stack_bytes in 2301952 2506752 2711552; do
   echo "RUST_MIN_STACK=${stack_bytes}"
-  RUST_MIN_STACK="${stack_bytes}" RUST_LOG=quire::stack_profile=info target/release/quire request_kinsnp_default_stack.html request_kinsnp_default_stack.pdf && break
+  RUST_MIN_STACK="${stack_bytes}" RUST_LOG=spindrift::stack_profile=info target/release/spindrift request_kinsnp_default_stack.html request_kinsnp_default_stack.pdf && break
 done
 ```
 
@@ -99,8 +99,8 @@ not show which functions reserve the stack. On ARM64/macOS, inspect the
 optimized binary's function prologue with `otool`:
 
 ```sh
-nm -nm target/release/quire | rg 'layout_formatting_box_flow_children'
-otool -tvV target/release/quire
+nm -nm target/release/spindrift | rg 'layout_formatting_box_flow_children'
+otool -tvV target/release/spindrift
 ```
 
 Find the mangled name from `nm` in the disassembly. Sum the initial
@@ -115,7 +115,7 @@ frames determine the actual live stack.
 Nightly Rust can emit additional static metadata:
 
 ```sh
-cargo +nightly rustc --release --features stack-profile --bin quire -- -Z emit-stack-sizes
+cargo +nightly rustc --release --features stack-profile --bin spindrift -- -Z emit-stack-sizes
 ```
 
 The flag emits object metadata for a stack-size-aware inspection tool; it does

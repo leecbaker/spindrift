@@ -1,6 +1,6 @@
-# Quire Spec Divergences
+# Spindrift Spec Divergences
 
-This document is the central inventory of known places where `quire` diverges
+This document is the central inventory of known places where `spindrift` diverges
 from the relevant CSS, HTML, SVG, and PDF specifications.
 
 Only unresolved divergences belong here. Do not record implementation history,
@@ -68,7 +68,7 @@ Primary references:
 
 - `font-language-override` cannot yet preserve a raw, case-sensitive OpenType
   language-system tag through Parley's BCP-47 locale API to HarfBuzz shaping.
-  Quire preserves the authored tag case and passes
+  Spindrift preserves the authored tag case and passes
   `css/css-fonts/font-language-override-03.html`, but fonts using arbitrary
   raw tags that cannot be represented by a BCP-47 locale remain divergent. See
   <https://drafts.csswg.org/css-fonts/#font-language-override-prop> and
@@ -121,7 +121,7 @@ Primary references:
   incomplete.
   The `trailing-space-and-text-alignment-002`, `004`, and `rtl-002` WPT
   references use an `X` glyph as a visible proxy for a blank preserved U+0020
-  at a scrollport edge. Quire keeps the source space and its no-ink glyph, but
+  at a scrollport edge. Spindrift keeps the source space and its no-ink glyph, but
   PDF rasterization anti-aliases the coincident source-coverage and
   overflow-clip edges differently from the reference's extending `X`
   coverage. This leaves 82/82/2 pixels despite identical line measures and
@@ -191,7 +191,7 @@ Primary references:
   discard` captures direct-inline cutoffs and direct multicolumn child-prefix
   region breaks (including later spanners) locally, but its complete Category-3
   region-fragmentation remainder model across mixed and nested formatting
-  contexts remains unimplemented. Quire also has no JavaScript/CSSOM runtime,
+  contexts remains unimplemented. Spindrift also has no JavaScript/CSSOM runtime,
   so script-driven mutation tests for legacy clamping are unsupported.
   <https://drafts.csswg.org/css-overflow-4/#line-clamp>
   <https://drafts.csswg.org/css-overflow-4/#continue>
@@ -231,7 +231,7 @@ Primary references:
 - Divergence: image marker sizing and general marker box geometry do not fully
   follow CSS Lists. Horizontal outside textual markers use the first accepted
   in-flow line's baseline (and images its block-start edge). When no such line
-  exists beside a float, Quire uses the float-shortened fallback line span to
+  exists beside a float, Spindrift uses the float-shortened fallback line span to
   match WPT compatibility geometry; CSS Lists leaves that float-adjacent
   placement undefined. Fragmented, atomic `flow-root list-item` descendant-line
   cases still need broader auditing.
@@ -241,7 +241,7 @@ Primary references:
 - Divergence: vertical writing-mode geometry for outside markers is incomplete.
 - Divergence: PDF marker output lacks tagged marker semantics for PDF/UA.
   Bitmap marker glyphs retain replacement text through PDF `/ActualText`, but
-  Quire does not yet emit the structure tree needed to associate them with a
+  Spindrift does not yet emit the structure tree needed to associate them with a
   PDF/UA list-label element.
 - Divergence: custom counter-style `speak-as` has no observable effect because
   speech output is not generated.
@@ -261,7 +261,7 @@ Primary references:
 - Divergence: `@property` supports only the exact `<color>` syntax. Valid
   registrations using the universal syntax or any other CSS Properties and
   Values grammar are not computed, and JavaScript `CSS.registerProperty()` is
-  unavailable because Quire has no DOM runtime.
+  unavailable because Spindrift has no DOM runtime.
 - Divergence: registered `<color>` values are serialized at `var()` boundaries,
   but typed computation for every other registered syntax, animation behavior,
   and relative-unit dependency cycles is not implemented.
@@ -299,7 +299,7 @@ Primary references:
   styles and resolves `ruby-align` plus `ruby-overhang: spaces` after visual
   line materialization. Legacy `ruby-overhang: none` aliases `spaces`.
   `spaces` supports preserved document spaces/tabs, U+00A0, Unicode `Zs`, and
-  the eligible untrimmed fullwidth punctuation shares. `auto` has Quire's
+  the eligible untrimmed fullwidth punctuation shares. `auto` has Spindrift's
   deterministic UA policy of at most `0.5ic` borrowed from each immediately
   adjacent non-atomic visual text item. This is intentionally not a complete
   glyph-ink collision analysis; complete vertical ruby paint projection is
@@ -322,7 +322,7 @@ Primary references:
 ### CSS Scroll Snap
 
 - Spec area: CSS Scroll Snap Level 1 and CSSOM View scrolling.
-- Divergence: Quire's static scroll-snap model covers container/area geometry,
+- Divergence: Spindrift's static scroll-snap model covers container/area geometry,
   target navigation, root handling, and iframe subdocuments, but atomic inline
   and writing-mode replay still have two visual failures in the local
   non-script `css/css-scroll-snap/` WPT selection.
@@ -333,7 +333,7 @@ Primary references:
 
 ### CSS Overflow Level 5 scroll markers
 
-- Quire parses and materializes the static automatic-marker foundation, but it
+- Spindrift parses and materializes the static automatic-marker foundation, but it
   does not yet implement immutable explicit-link topology, flat-tree target
   ordering, the CSS Overflow 5 geometry-based active-marker algorithm, or its
   bounded state-dependent re-layout convergence. `:target-current` presently
@@ -584,7 +584,7 @@ Primary references:
   broader implicit-line combinations, writing-mode alignment, and fragmented
   grid cases remain incomplete.
 - Divergence: grid fragmentation in paged media is not implemented.
-- Divergence: Quire's static-PDF user-agent policy uses overlay scrollbars, so
+- Divergence: Spindrift's static-PDF user-agent policy uses overlay scrollbars, so
   scrollport geometry, clipping, intrinsic sizing, and final track space do
   not reserve or paint native scrollbar chrome. This applies to all scroll
   containers and the viewport; it is distinct from CSS Overflow clipping and
@@ -594,7 +594,7 @@ Primary references:
   scrollable.
 - Divergence: the legacy WPT reference for `display-inline-grid.html`
   distributes CSS table row heights rather than preserving the authored fixed
-  Grid tracks; Quire intentionally keeps Grid track sizing spec-conformant
+  Grid tracks; Spindrift intentionally keeps Grid track sizing spec-conformant
   instead of matching that reference behavior.
 - Divergence: unfragmented in-flow subgrids parse the full local
   `<line-name-list>` grammar (including name repeats). Their layout context
@@ -919,7 +919,7 @@ Primary references:
 - Divergence: OS/2 embedding permission failures are not exposed through a
   strict public PDF/A/PDF/UA render option.
 - Divergence: CSS 2.2 leaves the content-area metric unspecified when multiple
-  fonts are used. Quire consistently uses the primary metric face's em box for
+  fonts are used. Spindrift consistently uses the primary metric face's em box for
   non-replaced inline backgrounds, borders, and padding; other engines may
   choose a different multi-font measure. This policy is independent of
   `line-height`, as CSS 2.2 requires.
@@ -929,7 +929,7 @@ Primary references:
   zero-advance shaping context; remaining mismatches need separate coverage.
   <https://drafts.csswg.org/css-text-3/#boundary-shaping>
 - Divergence: CSS Text boundary shaping across a nonzero inline box edge in a
-  bidi-reordered Arabic run remains incomplete. Quire now preserves the
+  bidi-reordered Arabic run remains incomplete. Spindrift now preserves the
   one-sided shaping boundary for ordinary inline text, but does not yet place
   every virtual joining control and its margin/border/padding advance at the
   matching visual boundary (`boundary-shaping-009`).
@@ -1133,7 +1133,7 @@ Primary references:
   `rowgroup-page-break-inside-avoid-5-print-ref.html` as its reference. The
   test source has no table header, while that reference adds a `<thead>` with
   `page-break-after: always`; the resulting output cannot be made equivalent
-  by conforming pagination of the test input. Quire intentionally does not
+  by conforming pagination of the test input. Spindrift intentionally does not
   synthesize the reference's header or add a test-specific fragmentation
   exception.
 - Divergence: durable page-span records cover ordinary positioned and
@@ -1186,12 +1186,12 @@ Primary references:
   genuinely indefinite or interdependent orthogonal cross-axis constraints, so
   some center/middle distribution cases remain incorrect.
 - Divergence: CSS Page 3 leaves non-CSS2 properties, including
-  `writing-mode`, undefined in margin contexts. Quire preserves ordinary CSS
+  `writing-mode`, undefined in margin contexts. Spindrift preserves ordinary CSS
   Writing Modes rendering there; three imported page-margin reftests
   (`dimensions-004`, `dimensions-013`, and `dimensions-014`) expect a distinct
   compatibility behavior for vertical generated content. The WPT runner
   records their known visual differences through exact-path expected-difference
-  thresholds; this does not change Quire output.
+  thresholds; this does not change Spindrift output.
   <https://www.w3.org/TR/css-page-3/#page-properties>
 
 ### Bookmarks and PDF Outlines
@@ -1291,9 +1291,9 @@ Primary references:
   marker placement. SVG strokes in this subset are materialized as SVG-space
   stroked outlines before PDF painting.
   SVG `vector-effect: non-scaling-stroke` remains unsupported while `usvg`
-  discards the inherited property during normalization, before Quire receives
+  discards the inherited property during normalization, before Spindrift receives
   individual paths. SVG 2 requires transforming a path into host coordinates,
-  calculating its outline there, and transforming that outline back; Quire
+  calculating its outline there, and transforming that outline back; Spindrift
   deliberately does not add a source-ID or serialization side channel to
   approximate that missing normalized-tree state. This blocks
   `svg/painting/reftests/non-scaling-stroke-005.html` (uniform `viewBox`
@@ -1302,7 +1302,7 @@ Primary references:
   <https://www.w3.org/TR/SVG2/painting.html#VectorEffects>
   SVG text is laid out and flattened by upstream `usvg` using native system fonts.
   Its visual result is emitted as paths with one PDF `/ActualText` wrapper, not
-  Quire-selected native PDF text. Consequently SVG and HTML text can choose
+  Spindrift-selected native PDF text. Consequently SVG and HTML text can choose
   different fallback fonts; SVG `@font-face`, host-CSS SVG `text-shadow`, and
   exact font/feature parity with surrounding HTML are unsupported. Wasm has no
   system-font database and omits SVG text.
@@ -1355,13 +1355,13 @@ Primary references:
   a shared `object-position` model, and author-visible concrete-object
   overflow; non-visible overflow retains its content-edge crop. `<object>` selects its fallback
   subtree when its `data` resource is absent, unavailable, unsupported, or
-  not a decodable static image, but Quire does not implement live plugin or
+  not a decodable static image, but Spindrift does not implement live plugin or
   child-navigable `<object>` representations, loading-state transitions,
   transforms, opacity, compositing, or fragmentation for embedded content.
   <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element>
 - Divergence: static HTML `<picture>` selection supports direct `source`
   elements with `media`, supported `type`, `x`/`w` `srcset` candidates, and
-  `sizes`-based selection at Quire's configured output resolution. It does
+  `sizes`-based selection at Spindrift's configured output resolution. It does
   not model live image-request transitions, environment-driven reselection,
   or `sizes="auto"`, which depends on an element's concrete laid-out size.
   <https://html.spec.whatwg.org/multipage/images.html#the-picture-element>
@@ -1401,7 +1401,7 @@ Primary references:
   two-dimensional PDF shading representation is not yet implemented.
 - Divergence: unqualified linear, radial, and conic gradients use CSS Images
   Level 3 premultiplied sRGB interpolation. CSS Images Level 4 requires Oklab
-  when `in <color-space>` is omitted; Quire retains explicit Level 4
+  when `in <color-space>` is omitted; Spindrift retains explicit Level 4
   interpolation methods but does not yet apply that Level 4 default.
   <https://www.w3.org/TR/css-images-3/#coloring-gradient-line>
   <https://drafts.csswg.org/css-images-4/#coloring-gradient-line>
@@ -1664,9 +1664,9 @@ Primary references:
 
 - Spec area: CSS Color Adjustment Level 1 forced colors.
 - Divergence: script-driven forced-colors and backplate reftests are not
-  supported because Quire has no JavaScript runtime or platform text backplate
+  supported because Spindrift has no JavaScript runtime or platform text backplate
   compositor.
-- Divergence: `color-scheme` selects Quire's light/dark used scheme and drives
+- Divergence: `color-scheme` selects Spindrift's light/dark used scheme and drives
   `light-dark()`, but system-color palettes, form-control appearance,
   `print-color-adjust`, and the remaining CSS Color Adjustment used-value
   behavior are incomplete.

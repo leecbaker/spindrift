@@ -1,7 +1,7 @@
 # CSS Backgrounds WPT Parity
 
 The latest `css/css-backgrounds/` WPT run (2026-07-13) executes 568 renderable
-tests in the local runner. Quire passes 451/568 tests (79.4%).
+tests in the local runner. Spindrift passes 451/568 tests (79.4%).
 
 ## Implemented in this pass
 

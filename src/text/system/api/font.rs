@@ -90,7 +90,7 @@ impl FontSystem {
     /// Run one Parley shaping pass with layout storage retained for the next
     /// pass in this document.
     ///
-    /// Parley lines borrow their layout, while Quire converts them into owned
+    /// Parley lines borrow their layout, while Spindrift converts them into owned
     /// glyph runs before this closure returns. Taking the scratch out of
     /// [`FontSystem`] keeps those borrows separate from the mutable font
     /// system needed during conversion and guarantees restoration on every

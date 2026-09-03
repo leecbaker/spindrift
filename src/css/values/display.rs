@@ -31,7 +31,7 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
 
     let mut outer = None;
     let mut inner = None;
-    // CSS Display Level 4 adds `math` as an inner display type. Quire does
+    // CSS Display Level 4 adds `math` as an inner display type. Spindrift does
     // not implement MathML layout yet, but on non-MathML elements it computes
     // to `flow` while retaining the specified/default outer display type.
     // Keeping this distinction here makes `display: math` preserve an

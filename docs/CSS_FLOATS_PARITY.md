@@ -237,7 +237,7 @@ behavior where the specs leave implementation details ambiguous.
 ## CSS2 Float Benchmark
 
 On 2026-07-24, `css/CSS2/floats/` ran **62/67 passing (92.5%)**, with
-**5 raster failures**, **0 timeouts**, and **6.98s** total Quire render time.
+**5 raster failures**, **0 timeouts**, and **6.98s** total Spindrift render time.
 This improves on the 49/67 baseline and remains below its 9.15s render time.
 The former auto-height crashtest timeout completes without timing out. The
 remaining failures are `float-no-content-beside-001.html`, the two nowrap

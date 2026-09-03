@@ -1,11 +1,11 @@
-//! Benchmarks for Quire's bundled WeasyPrint-compatible sample documents.
+//! Benchmarks for Spindrift's bundled WeasyPrint-compatible sample documents.
 
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use quire::{Css, Html, PdfOptions, RenderOptions};
+use spindrift::{Css, Html, PdfOptions, RenderOptions};
 use tokio::runtime::Runtime;
 
 struct Sample {

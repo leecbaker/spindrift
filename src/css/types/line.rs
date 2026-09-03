@@ -7,7 +7,7 @@ use crate::units::LayoutLength;
 ///
 /// CSS 2.2 defines the computed value of `line-height` as `normal`, a number,
 /// or a length for length/percentage inputs; CSS Values defines font-metric
-/// units such as `ch` from the used font, so Quire keeps those components
+/// units such as `ch` from the used font, so Spindrift keeps those components
 /// unresolved until the selected font face is known:
 /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-line-height>.
 /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.

@@ -1,7 +1,7 @@
 use super::*;
 
 fn rects_with_fill(
-    page: &quire::Page,
+    page: &spindrift::Page,
     fill: CssColor,
 ) -> Vec<&crate::document::paint::shapes::RenderedRect> {
     page.rects()

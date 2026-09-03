@@ -8,7 +8,7 @@
 
 /// A lowercased `type/subtype` MIME essence.
 ///
-/// Parameters are intentionally omitted: Quire's current image decoders
+/// Parameters are intentionally omitted: Spindrift's current image decoders
 /// select solely on the MIME essence.
 /// <https://mimesniff.spec.whatwg.org/#mime-type-essence>
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

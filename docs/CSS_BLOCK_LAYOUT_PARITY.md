@@ -122,7 +122,7 @@ where block sizing interacts with margin collapse.
   set effective when the parent inline context normalizes its line paint
   anchor.
 - Raster image natural dimensions are represented as CSS pixels (including
-  HTML-validated EXIF density correction) before conversion to Quire's
+  HTML-validated EXIF density correction) before conversion to Spindrift's
   PDF-point layout unit for block replaced-element sizing.
 
 ## Remaining Gaps

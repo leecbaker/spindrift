@@ -207,7 +207,7 @@ impl FontSystem {
         ))
     }
 
-    /// Shape one source-neutral text request through Quire's document font
+    /// Shape one source-neutral text request through Spindrift's document font
     /// registry.
     ///
     /// This deliberately performs no HTML line-box construction. Callers

@@ -308,7 +308,7 @@ fn ruby_auto_overhang_allowance(
     }
 }
 
-/// Quire's deterministic `auto` policy: never borrow more than half an `ic`
+/// Spindrift's deterministic `auto` policy: never borrow more than half an `ic`
 /// from either immediate visual neighbor.
 pub(super) fn ruby_auto_overhang_offer(neighbor_inline_span: f32, half_ic: f32) -> f32 {
     neighbor_inline_span.max(0.0).min(half_ic.max(0.0))

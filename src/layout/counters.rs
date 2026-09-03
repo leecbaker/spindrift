@@ -900,7 +900,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(super) fn prepare_counter_plan(&mut self, events: &[box_tree::CounterEventNode<'_>]) {
         self.counter_plan = CounterPlanBuilder::build(events);
         log::trace!(
-            target: "quire::layout::counters",
+            target: "spindrift::layout::counters",
             "prepared {} unresolved reversed counter starts",
             self.counter_plan.reversed_initial_values.len()
         );
@@ -989,7 +989,7 @@ impl<'a> LayoutBuilder<'a> {
                 .cloned()
                 .unwrap_or(CounterValue::ZERO);
             log::trace!(
-                target: "quire::layout::counters",
+                target: "spindrift::layout::counters",
                 "resolved reversed counter {} at {:?} to {}",
                 reset.name,
                 key,

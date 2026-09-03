@@ -3,17 +3,19 @@ use std::collections::HashMap;
 use cssparser::{CowRcStr, Parser as CssParser, SourceLocation};
 use selectors::parser::{Parser as SelectorParser, SelectorParseErrorKind};
 
-use super::{CssAtom, LanguageRange, QuirePseudoClass, QuirePseudoElement, QuireSelectorImpl};
+use super::{
+    CssAtom, LanguageRange, SpindriftPseudoClass, SpindriftPseudoElement, SpindriftSelectorImpl,
+};
 use crate::css::types::Direction;
 
 #[derive(Debug, Clone, Default)]
-pub(in crate::css) struct QuireSelectorParser {
+pub(in crate::css) struct SpindriftSelectorParser {
     pub(in crate::css) default_namespace: Option<CssAtom>,
     pub(in crate::css) namespaces: HashMap<String, CssAtom>,
     allow_parent_selector: bool,
 }
 
-impl QuireSelectorParser {
+impl SpindriftSelectorParser {
     pub(in crate::css) fn new(
         default_namespace: Option<String>,
         namespaces: HashMap<String, String>,
@@ -34,8 +36,8 @@ impl QuireSelectorParser {
     }
 }
 
-impl<'i> SelectorParser<'i> for QuireSelectorParser {
-    type Impl = QuireSelectorImpl;
+impl<'i> SelectorParser<'i> for SpindriftSelectorParser {
+    type Impl = SpindriftSelectorImpl;
     type Error = SelectorParseErrorKind<'i>;
 
     fn parse_is_and_where(&self) -> bool {
@@ -70,54 +72,54 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
         &self,
         location: SourceLocation,
         name: CowRcStr<'i>,
-    ) -> Result<QuirePseudoClass, cssparser::ParseError<'i, Self::Error>> {
+    ) -> Result<SpindriftPseudoClass, cssparser::ParseError<'i, Self::Error>> {
         match name.as_ref().to_ascii_lowercase().as_str() {
-            "link" => Ok(QuirePseudoClass::Link),
-            "any-link" => Ok(QuirePseudoClass::AnyLink),
+            "link" => Ok(SpindriftPseudoClass::Link),
+            "any-link" => Ok(SpindriftPseudoClass::AnyLink),
             // Static documents derive their private visited state from a
             // deterministic self-link check during DOM preparation.
-            "visited" => Ok(QuirePseudoClass::Visited),
-            "target" => Ok(QuirePseudoClass::Target),
-            "target-within" => Ok(QuirePseudoClass::TargetWithin),
-            "target-current" => Ok(QuirePseudoClass::TargetCurrent),
-            "target-before" => Ok(QuirePseudoClass::TargetBefore),
-            "target-after" => Ok(QuirePseudoClass::TargetAfter),
-            "hover" => Ok(QuirePseudoClass::StaticFalse("hover")),
-            "active" => Ok(QuirePseudoClass::StaticFalse("active")),
-            "focus" => Ok(QuirePseudoClass::StaticFalse("focus")),
-            "focus-visible" => Ok(QuirePseudoClass::StaticFalse("focus-visible")),
-            "focus-within" => Ok(QuirePseudoClass::StaticFalse("focus-within")),
-            "playing" => Ok(QuirePseudoClass::StaticFalse("playing")),
-            "paused" => Ok(QuirePseudoClass::StaticFalse("paused")),
-            "seeking" => Ok(QuirePseudoClass::StaticFalse("seeking")),
-            "buffering" => Ok(QuirePseudoClass::StaticFalse("buffering")),
-            "stalled" => Ok(QuirePseudoClass::StaticFalse("stalled")),
-            "muted" => Ok(QuirePseudoClass::StaticFalse("muted")),
-            "volume-locked" => Ok(QuirePseudoClass::StaticFalse("volume-locked")),
-            "open" => Ok(QuirePseudoClass::Open),
-            "popover-open" => Ok(QuirePseudoClass::StaticFalse("popover-open")),
-            "modal" => Ok(QuirePseudoClass::StaticFalse("modal")),
-            "fullscreen" => Ok(QuirePseudoClass::StaticFalse("fullscreen")),
-            "picture-in-picture" => Ok(QuirePseudoClass::StaticFalse("picture-in-picture")),
-            "autofill" => Ok(QuirePseudoClass::StaticFalse("autofill")),
-            "default" => Ok(QuirePseudoClass::Default),
-            "unchecked" => Ok(QuirePseudoClass::Unchecked),
-            "placeholder-shown" => Ok(QuirePseudoClass::PlaceholderShown),
-            "valid" => Ok(QuirePseudoClass::Valid),
-            "invalid" => Ok(QuirePseudoClass::Invalid),
-            "in-range" => Ok(QuirePseudoClass::InRange),
-            "out-of-range" => Ok(QuirePseudoClass::OutOfRange),
-            "user-valid" => Ok(QuirePseudoClass::StaticFalse("user-valid")),
-            "user-invalid" => Ok(QuirePseudoClass::StaticFalse("user-invalid")),
-            "defined" => Ok(QuirePseudoClass::Defined),
-            "enabled" => Ok(QuirePseudoClass::Enabled),
-            "disabled" => Ok(QuirePseudoClass::Disabled),
-            "checked" => Ok(QuirePseudoClass::Checked),
-            "indeterminate" => Ok(QuirePseudoClass::Indeterminate),
-            "required" => Ok(QuirePseudoClass::Required),
-            "optional" => Ok(QuirePseudoClass::Optional),
-            "read-write" => Ok(QuirePseudoClass::ReadWrite),
-            "read-only" => Ok(QuirePseudoClass::ReadOnly),
+            "visited" => Ok(SpindriftPseudoClass::Visited),
+            "target" => Ok(SpindriftPseudoClass::Target),
+            "target-within" => Ok(SpindriftPseudoClass::TargetWithin),
+            "target-current" => Ok(SpindriftPseudoClass::TargetCurrent),
+            "target-before" => Ok(SpindriftPseudoClass::TargetBefore),
+            "target-after" => Ok(SpindriftPseudoClass::TargetAfter),
+            "hover" => Ok(SpindriftPseudoClass::StaticFalse("hover")),
+            "active" => Ok(SpindriftPseudoClass::StaticFalse("active")),
+            "focus" => Ok(SpindriftPseudoClass::StaticFalse("focus")),
+            "focus-visible" => Ok(SpindriftPseudoClass::StaticFalse("focus-visible")),
+            "focus-within" => Ok(SpindriftPseudoClass::StaticFalse("focus-within")),
+            "playing" => Ok(SpindriftPseudoClass::StaticFalse("playing")),
+            "paused" => Ok(SpindriftPseudoClass::StaticFalse("paused")),
+            "seeking" => Ok(SpindriftPseudoClass::StaticFalse("seeking")),
+            "buffering" => Ok(SpindriftPseudoClass::StaticFalse("buffering")),
+            "stalled" => Ok(SpindriftPseudoClass::StaticFalse("stalled")),
+            "muted" => Ok(SpindriftPseudoClass::StaticFalse("muted")),
+            "volume-locked" => Ok(SpindriftPseudoClass::StaticFalse("volume-locked")),
+            "open" => Ok(SpindriftPseudoClass::Open),
+            "popover-open" => Ok(SpindriftPseudoClass::StaticFalse("popover-open")),
+            "modal" => Ok(SpindriftPseudoClass::StaticFalse("modal")),
+            "fullscreen" => Ok(SpindriftPseudoClass::StaticFalse("fullscreen")),
+            "picture-in-picture" => Ok(SpindriftPseudoClass::StaticFalse("picture-in-picture")),
+            "autofill" => Ok(SpindriftPseudoClass::StaticFalse("autofill")),
+            "default" => Ok(SpindriftPseudoClass::Default),
+            "unchecked" => Ok(SpindriftPseudoClass::Unchecked),
+            "placeholder-shown" => Ok(SpindriftPseudoClass::PlaceholderShown),
+            "valid" => Ok(SpindriftPseudoClass::Valid),
+            "invalid" => Ok(SpindriftPseudoClass::Invalid),
+            "in-range" => Ok(SpindriftPseudoClass::InRange),
+            "out-of-range" => Ok(SpindriftPseudoClass::OutOfRange),
+            "user-valid" => Ok(SpindriftPseudoClass::StaticFalse("user-valid")),
+            "user-invalid" => Ok(SpindriftPseudoClass::StaticFalse("user-invalid")),
+            "defined" => Ok(SpindriftPseudoClass::Defined),
+            "enabled" => Ok(SpindriftPseudoClass::Enabled),
+            "disabled" => Ok(SpindriftPseudoClass::Disabled),
+            "checked" => Ok(SpindriftPseudoClass::Checked),
+            "indeterminate" => Ok(SpindriftPseudoClass::Indeterminate),
+            "required" => Ok(SpindriftPseudoClass::Required),
+            "optional" => Ok(SpindriftPseudoClass::Optional),
+            "read-write" => Ok(SpindriftPseudoClass::ReadWrite),
+            "read-only" => Ok(SpindriftPseudoClass::ReadOnly),
             _ => Err(location.new_custom_error(
                 SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
             )),
@@ -129,7 +131,7 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
         name: CowRcStr<'i>,
         parser: &mut CssParser<'i, 't>,
         _after_part: bool,
-    ) -> Result<QuirePseudoClass, cssparser::ParseError<'i, Self::Error>> {
+    ) -> Result<SpindriftPseudoClass, cssparser::ParseError<'i, Self::Error>> {
         if name.eq_ignore_ascii_case("lang") {
             let ranges = parser.parse_comma_separated(|parser| {
                 let argument = if let Ok(argument) = parser.try_parse(|parser| {
@@ -154,7 +156,7 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
                     SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
                 ));
             }
-            return Ok(QuirePseudoClass::Lang(ranges));
+            return Ok(SpindriftPseudoClass::Lang(ranges));
         }
         if !name.eq_ignore_ascii_case("dir") {
             return Err(parser.new_custom_error(
@@ -174,32 +176,32 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
             }
         };
         parser.expect_exhausted()?;
-        Ok(QuirePseudoClass::Dir(direction))
+        Ok(SpindriftPseudoClass::Dir(direction))
     }
 
     fn parse_pseudo_element(
         &self,
         location: SourceLocation,
         name: CowRcStr<'i>,
-    ) -> Result<QuirePseudoElement, cssparser::ParseError<'i, Self::Error>> {
+    ) -> Result<SpindriftPseudoElement, cssparser::ParseError<'i, Self::Error>> {
         if name.eq_ignore_ascii_case("before") {
-            Ok(QuirePseudoElement::Before)
+            Ok(SpindriftPseudoElement::Before)
         } else if name.eq_ignore_ascii_case("after") {
-            Ok(QuirePseudoElement::After)
+            Ok(SpindriftPseudoElement::After)
         } else if name.eq_ignore_ascii_case("scroll-marker") {
-            Ok(QuirePseudoElement::ScrollMarker)
+            Ok(SpindriftPseudoElement::ScrollMarker)
         } else if name.eq_ignore_ascii_case("scroll-marker-group") {
-            Ok(QuirePseudoElement::ScrollMarkerGroup)
+            Ok(SpindriftPseudoElement::ScrollMarkerGroup)
         } else if name.eq_ignore_ascii_case("footnote-call") {
-            Ok(QuirePseudoElement::FootnoteCall)
+            Ok(SpindriftPseudoElement::FootnoteCall)
         } else if name.eq_ignore_ascii_case("footnote-marker") {
-            Ok(QuirePseudoElement::FootnoteMarker)
+            Ok(SpindriftPseudoElement::FootnoteMarker)
         } else if name.eq_ignore_ascii_case("marker") {
-            Ok(QuirePseudoElement::Marker)
+            Ok(SpindriftPseudoElement::Marker)
         } else if name.eq_ignore_ascii_case("first-line") {
-            Ok(QuirePseudoElement::FirstLine)
+            Ok(SpindriftPseudoElement::FirstLine)
         } else if name.eq_ignore_ascii_case("first-letter") {
-            Ok(QuirePseudoElement::FirstLetter)
+            Ok(SpindriftPseudoElement::FirstLetter)
         } else {
             Err(
                 location.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(

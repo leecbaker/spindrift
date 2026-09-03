@@ -336,7 +336,7 @@ impl<'a> LayoutBuilder<'a> {
     ///
     /// CSS 2.2 makes an inline positioned ancestor establish the absolute
     /// containing block from its padding boxes. For a split segment containing
-    /// only a block-level child, Quire has no inline line fragment to measure,
+    /// only a block-level child, Spindrift has no inline line fragment to measure,
     /// so the single-line fragment is represented by the inline padding box at
     /// the current block-flow cursor:
     /// <https://www.w3.org/TR/CSS22/visudet.html#containing-block-details>.

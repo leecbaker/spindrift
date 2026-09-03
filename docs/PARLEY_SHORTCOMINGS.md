@@ -20,7 +20,7 @@ construction must consume those bytes directly, while `Locale` remains the
 separate BCP-47 input. That preserves both CSS language semantics and raw
 OpenType language-system semantics without an application-side workaround.
 
-Quire preserves authored tag case and maps the WPT's lower-case `"trk"`
+Spindrift preserves authored tag case and maps the WPT's lower-case `"trk"`
 through Parley's BCP-47 `trk` locale. HarfBuzz maps that locale to no OpenType
 language-system tag, so `css/css-fonts/font-language-override-03.html` passes.
 That compatibility case is not a general solution: a font-defined arbitrary

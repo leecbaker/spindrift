@@ -24,7 +24,7 @@ type GradientPair = (GradientCoordinates, GradientCoordinates, CssColorSpace);
 ///
 /// CSS CssColor 4 defers conversion until an output boundary. Raster images need
 /// the same distinction: source RGB samples may carry an embedded ICC profile,
-/// while generated samples use one of Quire's built-in CSS spaces.
+/// while generated samples use one of Spindrift's built-in CSS spaces.
 /// <https://www.w3.org/TR/css-color-4/#color-conversion>
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum RasterColorSpace {
@@ -40,7 +40,7 @@ impl RasterColorSpace {
 ///
 /// PDF image XObjects use the profile's component count to interpret samples
 /// (ISO 32000-2:2020, 8.9.5.5). This milestone accepts only RGB profiles,
-/// because Quire's PNG/JPEG raster path materializes three RGB components.
+/// because Spindrift's PNG/JPEG raster path materializes three RGB components.
 pub(crate) fn embedded_rgb_profile(bytes: Vec<u8>) -> Option<RasterColorSpace> {
     let profile = ColorProfile::new_from_slice(&bytes).ok()?;
     if profile.color_space != DataColorSpace::Rgb {
@@ -67,7 +67,7 @@ pub(crate) fn embedded_rgb_profile(bytes: Vec<u8>) -> Option<RasterColorSpace> {
 /// PNG stores chromaticity coordinates and the reciprocal of the samples'
 /// decoding exponent. ICC parametric curve type 0 expresses that decoding
 /// exponent directly, so this is a lossless representation of this PNG color
-/// encoding at Quire's raster/PDF boundary.
+/// encoding at Spindrift's raster/PDF boundary.
 /// <https://www.w3.org/TR/png-3/#11gAMA>
 /// <https://www.w3.org/TR/png-3/#11cHRM>
 pub(crate) fn png_gamma_chromaticities_profile(

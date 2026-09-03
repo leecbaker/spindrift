@@ -28,7 +28,7 @@ impl FontSystem {
                 continue;
             };
 
-            // CSS absolute units use 96 px per inch while Quire paint space
+            // CSS absolute units use 96 px per inch while Spindrift paint space
             // uses points, so one CSS px is 0.75 paint points.
             let requested_ppem = (run.font_size * (96.0 / 72.0))
                 .round()
@@ -182,7 +182,7 @@ fn decode_png_raster_glyph(
     // PNG's largest source representation has four 16-bit components. Bound
     // decoder intermediates to the declared strike while retaining a small
     // metadata allowance for valid ICC and text chunks, and never exceed
-    // Quire's document-image ceiling for malformed font data.
+    // Spindrift's document-image ceiling for malformed font data.
     const MAX_PNG_GLYPH_DECODER_BYTES: usize = 512 * 1024 * 1024;
     const PNG_GLYPH_METADATA_ALLOWANCE: usize = 1024 * 1024;
     let allocation_limit = usize::try_from(expected_width)

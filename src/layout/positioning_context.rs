@@ -3,7 +3,7 @@ use super::*;
 /// Page-local containing block for positioned descendants.
 ///
 /// CSS Positioned Layout resolves absolute and fixed offsets against a
-/// containing block. Quire stores that box in physical page coordinates using
+/// containing block. Spindrift stores that box in physical page coordinates using
 /// a top edge (`top_y`) because layout cursors advance downward, while the
 /// `height` remains the physical block extent used for percentage resolution:
 /// <https://www.w3.org/TR/css-position-3/#def-cb>.

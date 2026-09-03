@@ -2,7 +2,7 @@
 
 ## Current foundation
 
-Quire recognizes the CSS Display ruby values (`ruby`, `ruby-base`,
+Spindrift recognizes the CSS Display ruby values (`ruby`, `ruby-base`,
 `ruby-text`, `ruby-base-container`, and `ruby-text-container`) and preserves
 them in computed display values. The HTML user-agent stylesheet maps the
 semantic ruby elements to those roles, applies the Level 1 annotation font and
@@ -53,7 +53,7 @@ overhang against its immediate *visual* neighbors. The resulting placement is
 attached only to the selected inline atom, never to the reusable normalized
 ruby source. `ruby-overhang: spaces` (and legacy `none`, which aliases it)
 borrows preserved spaces or tabs, U+00A0 and Unicode `Zs` separators, plus the
-applicable untrimmed fullwidth punctuation share. `auto` uses Quire's
+applicable untrimmed fullwidth punctuation share. `auto` uses Spindrift's
 documented deterministic UA policy: it may borrow at most `0.5ic` on each
 logical side from an immediately adjacent non-atomic visual text item. Any
 unborrowed annotation excess remains in the ruby's normal-flow advance. Paint

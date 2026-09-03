@@ -53,7 +53,7 @@ impl<'a> LayoutBuilder<'a> {
     ///
     /// Text transform is applied exactly once while normalizing `InlineItem`s
     /// into graph runs. Unicode break opportunities come from the existing
-    /// ICU/Parley-backed text helpers; Quire records CSS policy metadata
+    /// ICU/Parley-backed text helpers; Spindrift records CSS policy metadata
     /// on the resulting boundaries so later line selection does not repeat
     /// whitespace, hyphenation, and atomic-inline decisions:
     /// <https://www.w3.org/TR/css-text-3/#text-transform-property>,

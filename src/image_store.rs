@@ -67,7 +67,7 @@ pub(crate) enum MimeSupport {
     Unsupported,
 }
 
-/// Classify a CSS `type()` descriptor against Quire's actual image decoders.
+/// Classify a CSS `type()` descriptor against Spindrift's actual image decoders.
 pub(crate) fn image_mime_support(mime_type: &str) -> MimeSupport {
     let Some(mime_type) = parse_valid_mime_type_essence(mime_type) else {
         return MimeSupport::Unsupported;
@@ -842,7 +842,7 @@ fn decode_webp_first_frame(bytes: &[u8]) -> Option<(image::DynamicImage, Orienta
     Some((decoded, orientation))
 }
 
-/// Convert a decoded image into Quire's interleaved RGB and optional opacity
+/// Convert a decoded image into Spindrift's interleaved RGB and optional opacity
 /// planes without widening 8-bit input. JPEG XL's integration decoder exposes
 /// integer images as the matching `image` depth, and float/HDR images as
 /// `Rgb32F`/`Rgba32F`; the latter have no lossless PDF image representation.
@@ -998,7 +998,7 @@ fn exif_resolution_matches(
         == u128::from(preferred_dimension) * u128::from(resolution.num)
 }
 
-/// Native-depth PNG samples before they enter Quire's shared raster-image
+/// Native-depth PNG samples before they enter Spindrift's shared raster-image
 /// pipeline.
 pub(crate) struct DecodedPngSamples {
     pub(crate) width: u32,
@@ -1008,7 +1008,7 @@ pub(crate) struct DecodedPngSamples {
     pub(crate) alpha: Option<Vec<u8>>,
 }
 
-/// Decode one PNG into Quire's RGB-plus-optional-alpha sample representation.
+/// Decode one PNG into Spindrift's RGB-plus-optional-alpha sample representation.
 ///
 /// PNG's native decoder validates chunk ordering and checksums while retaining
 /// 8- or 16-bit sample precision. PNG and PDF both store 16-bit components in

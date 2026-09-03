@@ -562,7 +562,7 @@ impl<'a> LayoutBuilder<'a> {
             );
             let static_area = static_position.rectangle.area;
             log::trace!(
-                target: "quire::layout::inline_static_verbose",
+                target: "spindrift::layout::inline_static_verbose",
                 "checkpoint=deferred-replay element={:?} source=inline marker={:?} static_axes=({:?},{:?}) rect=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
                 element.id,
                 static_position_source,
@@ -729,7 +729,7 @@ impl<'a> LayoutBuilder<'a> {
                 }
             });
         log::trace!(
-            target: "quire::layout::static_position",
+            target: "spindrift::layout::static_position",
             "checkpoint=capture element={:?} source=block hypothetical=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) static_axes=({:?},{:?}) rect=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) buffered_block_offset={:.2} containing_inline={:?}",
             element.id,
             placeholder_box.x(),
@@ -932,7 +932,7 @@ impl<'a> LayoutBuilder<'a> {
         let containing_block = containing_block_edges.to_containing_block();
         let containing_rect = containing_block.rect;
         log::trace!(
-            target: "quire::layout::static_position",
+            target: "spindrift::layout::static_position",
             "checkpoint=positioned-inline-containing-block source={:?} axes=({:?},{:?}) start=(x:{:.2},y:{:.2}) end=(x:{:.2},y:{:.2}) containing_block=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
             source.id,
             source.style.writing_mode,

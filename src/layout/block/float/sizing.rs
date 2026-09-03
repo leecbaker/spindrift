@@ -51,7 +51,7 @@ impl FloatLogicalContentSize {
 /// Freeze a float's temporary replay style to the used inline size.
 ///
 /// CSS 2.2 resolves a float's used width from its original containing block,
-/// then lays out the float's contents in that used box. Quire replays the
+/// then lays out the float's contents in that used box. Spindrift replays the
 /// floated element in an isolated temporary containing block, so percentage
 /// widths and constraints must not resolve a second time against the replay
 /// block:

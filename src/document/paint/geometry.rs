@@ -118,7 +118,7 @@ impl PaintTransform {
     /// Build a paint-space translation transform.
     ///
     /// CSS Transforms applies translation functions in the element's current
-    /// painting coordinate system; by this point Quire has already projected
+    /// painting coordinate system; by this point Spindrift has already projected
     /// layout geometry into [`PaintSpace`]:
     /// <https://www.w3.org/TR/css-transforms-1/#transform-functions>.
     pub(crate) fn translate(offset: PaintTranslation) -> Self {

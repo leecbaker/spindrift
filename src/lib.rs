@@ -7,10 +7,10 @@
 //! Load a local HTML document and write its PDF to a local file:
 //!
 //! ```no_run
-//! use quire::{Html, PdfOptions, RenderOptions};
+//! use spindrift::{Html, PdfOptions, RenderOptions};
 //! use std::fs::File;
 //!
-//! # async fn convert() -> quire::Result<()> {
+//! # async fn convert() -> spindrift::Result<()> {
 //! let mut output = File::create("document.pdf")?;
 //! Html::from_file("document.html")
 //!     .await?
@@ -32,13 +32,13 @@
 //! choose its PDF output settings:
 //!
 //! ```no_run
-//! use quire::{
+//! use spindrift::{
 //!     Css, FetchErrorPolicy, Html, HttpRequestTimeout, PdfOptions, RenderOptions,
 //!     ResourcePolicy,
 //! };
 //! use std::{fs::File, time::Duration};
 //!
-//! # async fn render_report() -> quire::Result<()> {
+//! # async fn render_report() -> spindrift::Result<()> {
 //! let resource_policy = ResourcePolicy {
 //!     follow_http_redirects: false,
 //!     http_timeout: HttpRequestTimeout::try_from(Duration::from_secs(5))
@@ -107,7 +107,7 @@ pub(crate) use units::LayoutSize;
 /// A parsed URL used as an HTML or stylesheet source.
 ///
 /// ```no_run
-/// use quire::{Html, PdfOptions, RenderOptions, Url};
+/// use spindrift::{Html, PdfOptions, RenderOptions, Url};
 /// use std::fs::File;
 ///
 /// # async fn render() -> Result<(), Box<dyn std::error::Error>> {
