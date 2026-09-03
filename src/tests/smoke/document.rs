@@ -3542,10 +3542,10 @@ async fn positioned_auto_height_measurement_ignores_breaks_and_nested_positioned
 #[tokio::test]
 #[ignore]
 async fn book_sample_companion_stylesheet_preserves_right_page_breaks() {
-    let stylesheet = Css::from_file("weasyprint-samples/book/book.css")
+    let stylesheet = Css::from_file("third_party/examples/weasyprint-samples/book/book.css")
         .await
         .unwrap();
-    let document = Html::from_file("weasyprint-samples/book/book.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/book/book.html")
         .await
         .unwrap()
         .with_stylesheet(stylesheet)
@@ -3735,7 +3735,7 @@ async fn normal_generated_target_references_converge_with_target_page_and_counte
 
 #[tokio::test]
 async fn report_sample_cover_preserves_page_height_flex_line_packing() {
-    let document = Html::from_file("weasyprint-samples/report/report.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/report/report.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -3808,7 +3808,7 @@ async fn left_page_break_uses_next_left_page_without_blank() {
 
 #[tokio::test]
 async fn page_margin_boxes_inherit_page_font_properties() {
-    let document = Html::from_file("weasyprint-samples/invoice/invoice.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/invoice/invoice.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())

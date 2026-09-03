@@ -138,6 +138,54 @@ pub(in crate::layout) struct InheritedAdjoiningStartMargin {
     parent_start_clearance_hypothesis: ParentStartClearanceHypothesis,
 }
 
+/// Lexically scoped adjoining start-margin state owned by one layout element.
+///
+/// A propagated parent/first-child margin remains available while the target
+/// element decides whether its own first in-flow child continues the adjoining
+/// chain. It must not be observed by later sibling subtrees laid out before the
+/// target element returns.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[derive(Debug, Default)]
+pub(in crate::layout) struct InheritedAdjoiningStartMarginScopes {
+    scopes: Vec<InheritedAdjoiningStartMarginScope>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InheritedAdjoiningStartMarginScope {
+    owner: ElementId,
+    margin: InheritedAdjoiningStartMargin,
+}
+
+impl InheritedAdjoiningStartMarginScopes {
+    pub(in crate::layout) fn push_for(
+        &mut self,
+        owner: ElementId,
+        margin: InheritedAdjoiningStartMargin,
+    ) {
+        self.scopes
+            .push(InheritedAdjoiningStartMarginScope { owner, margin });
+    }
+
+    pub(in crate::layout) fn current_for(
+        &self,
+        owner: ElementId,
+    ) -> Option<InheritedAdjoiningStartMargin> {
+        self.scopes
+            .last()
+            .filter(|scope| scope.owner == owner)
+            .map(|scope| scope.margin)
+    }
+
+    pub(in crate::layout) fn pop_for(&mut self, owner: ElementId) {
+        let popped = self.scopes.pop();
+        debug_assert_eq!(
+            popped.map(|scope| scope.owner),
+            Some(owner),
+            "adjoining start-margin scopes must be popped by their owning element"
+        );
+    }
+}
+
 impl InheritedAdjoiningStartMargin {
     /// Preserve the earliest parent edge in one transparent adjoining chain.
     /// Replacing it at each wrapper would make a deeply nested cleared box
@@ -280,5 +328,44 @@ mod tests {
         outer.merge(inner);
 
         assert_eq!(outer.collapsed(), layout_pt(10.0));
+    }
+
+    fn inherited_margin() -> InheritedAdjoiningStartMargin {
+        InheritedAdjoiningStartMargin::with_parent_start_hypothesis(
+            layout_pt(12.0),
+            ParentStartClearanceHypothesis::new(PageTopBlockPosition::new(40.0)),
+        )
+    }
+
+    #[test]
+    fn inherited_adjoining_margin_scope_is_visible_only_to_its_owner() {
+        let owner = ElementId::next();
+        let sibling = ElementId::next();
+        let mut scopes = InheritedAdjoiningStartMarginScopes::default();
+        scopes.push_for(owner, inherited_margin());
+
+        assert_eq!(
+            scopes
+                .current_for(owner)
+                .map(|margin| margin.complete_margin()),
+            Some(layout_pt(12.0))
+        );
+        assert!(scopes.current_for(sibling).is_none());
+
+        scopes.pop_for(owner);
+        assert!(scopes.current_for(owner).is_none());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "adjoining start-margin scopes must be popped by their owning element"
+    )]
+    fn inherited_adjoining_margin_scope_rejects_mismatched_pop() {
+        let owner = ElementId::next();
+        let sibling = ElementId::next();
+        let mut scopes = InheritedAdjoiningStartMarginScopes::default();
+        scopes.push_for(owner, inherited_margin());
+
+        scopes.pop_for(sibling);
     }
 }

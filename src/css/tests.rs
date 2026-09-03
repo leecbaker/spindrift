@@ -760,7 +760,7 @@ async fn invalid_page_selector_lists_are_not_partially_accepted() {
 #[tokio::test]
 async fn parses_invoice_page_margin_boxes_through_main_at_rule_parser() {
     let stylesheet = parse_stylesheet(
-        &Css::from_file("weasyprint-samples/invoice/invoice.css")
+        &Css::from_file("third_party/examples/weasyprint-samples/invoice/invoice.css")
             .await
             .unwrap(),
     );
@@ -19074,7 +19074,7 @@ async fn expands_deep_nested_invoice_table_cell_selectors() {
 
 #[tokio::test]
 async fn invoice_nested_aside_margin_uses_three_value_shorthand() {
-    let css = Css::from_file("weasyprint-samples/invoice/invoice.css")
+    let css = Css::from_file("third_party/examples/weasyprint-samples/invoice/invoice.css")
         .await
         .unwrap();
     let stylesheet = parse_stylesheet(&css);

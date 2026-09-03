@@ -521,10 +521,10 @@ pub(in crate::layout) struct LayoutBuilder<'a> {
     /// its own isolated measurement. This second stack prevents the estimator
     /// from recursively invoking itself through an intervening floated child.
     pub(in crate::layout) active_auto_float_measurement_fallbacks: Vec<ElementId>,
-    /// Complete adjoining block-start margin sets handed from a parent flow
+    /// Element-owned adjoining block-start margin scopes handed from a parent
     /// traversal to the child currently being laid out, including the
     /// clear:none parent-start edge needed for CSS2 clearance.
-    pub(in crate::layout) inherited_adjoining_start_margins: Vec<InheritedAdjoiningStartMargin>,
+    pub(in crate::layout) inherited_adjoining_start_margins: InheritedAdjoiningStartMarginScopes,
     /// Lexically scoped resolved clearance edges inherited by descendants in
     /// the same float formatting context while adjoining-float placement is
     /// being captured for a possible replay.

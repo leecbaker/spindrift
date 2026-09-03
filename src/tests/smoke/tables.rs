@@ -2840,7 +2840,7 @@ async fn collapsed_table_wrapper_block_insets_use_top_and_bottom_grid_edges() {
 
 #[tokio::test]
 async fn invoice_sample_generated_metadata_terms_do_not_wrap() {
-    let document = Html::from_file("weasyprint-samples/invoice/invoice.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/invoice/invoice.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -8407,7 +8407,7 @@ async fn static_positioned_collapsed_table_background_uses_wrapper_border_box() 
 
 #[tokio::test]
 async fn invoice_total_background_covers_its_collapsed_wrapper_border_box() {
-    let document = Html::from_file("weasyprint-samples/invoice/invoice.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/invoice/invoice.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())

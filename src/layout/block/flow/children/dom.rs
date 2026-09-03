@@ -611,8 +611,7 @@ impl<'a> LayoutBuilder<'a> {
                     };
                     let parent_start_hypothesis = self
                         .inherited_adjoining_start_margins
-                        .last()
-                        .copied()
+                        .current_for(element.id)
                         .map(InheritedAdjoiningStartMargin::parent_start_clearance_hypothesis)
                         .unwrap_or_else(|| {
                             ParentStartClearanceHypothesis::new(PageTopBlockPosition::new(
@@ -1037,7 +1036,8 @@ impl<'a> LayoutBuilder<'a> {
                         );
                     }
                     if let Some(margin) = inherited_adjoining_start_margin {
-                        self.inherited_adjoining_start_margins.push(margin);
+                        self.inherited_adjoining_start_margins
+                            .push_for(child_element.id, margin);
                     }
                     let previous_direct_block_layout_constraint = self
                         .replace_direct_block_layout_constraint(
@@ -1053,7 +1053,8 @@ impl<'a> LayoutBuilder<'a> {
                         previous_direct_block_layout_constraint,
                     );
                     if inherited_adjoining_start_margin.is_some() {
-                        self.inherited_adjoining_start_margins.pop();
+                        self.inherited_adjoining_start_margins
+                            .pop_for(child_element.id);
                     }
                     if let Some(previous) = previous_block_static_position_y_offset {
                         self.block_static_position_y_offset = previous;

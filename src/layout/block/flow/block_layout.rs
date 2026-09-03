@@ -904,13 +904,23 @@ impl<'a> LayoutBuilder<'a> {
         // delta after an ancestor consumed part of a larger adjoining start
         // margin set. Its own first child must compare against that complete
         // set, or the descendant contribution is applied a second time.
-        let inherited_adjoining_start_margin =
-            self.inherited_adjoining_start_margins.last().copied();
+        let inherited_adjoining_start_margin = self
+            .inherited_adjoining_start_margins
+            .current_for(element.id);
         let inherited_float_replay_clearance_boundary =
             self.current_float_replay_clearance_boundary();
         let mut introduced_float_replay_clearance_boundary = None;
+        // The inherited value is the complete adjoining margin set, not a
+        // margin that has already survived destination-fragmentainer
+        // truncation. A transparent wrapper can propagate that set after an
+        // avoided ancestor moves to a fresh fragmentainer. Apply the same
+        // page-start rule as the wrapper's own margin before handing the set
+        // to its first child, or each nested wrapper subtracts the discarded
+        // source-fragment margin again and pulls the child above the page area.
+        // <https://www.w3.org/TR/css-break-3/#break-margins>
         let descendant_applied_start_margin = inherited_adjoining_start_margin
             .map(InheritedAdjoiningStartMargin::complete_margin)
+            .map(|margin| page_start_margin(margin, starts_at_page_top))
             .unwrap_or(applied_start_margin);
         let margin_edge_top = self.cursor_y;
         self.cursor_y -= applied_start_margin.points();

@@ -274,7 +274,7 @@ async fn static_flex_item_abspos_descendant_paints_after_item_background() {
 
 #[tokio::test]
 async fn ticket_definition_list_pdf_retains_later_description_borders() {
-    let document = Html::from_file("weasyprint-samples/ticket/ticket.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/ticket/ticket.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -2499,7 +2499,9 @@ async fn pdf_font_size_uses_pango_css_pixel_quantization() {
 
 #[test]
 fn pdf_font_embedding_prunes_unused_fonts_and_merges_byte_identical_font_plans() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_b = face.glyph_index('B').unwrap().0;
@@ -2597,7 +2599,9 @@ fn pdf_font_deduplication_keeps_distinct_same_length_programs_separate() {
 
 #[test]
 fn pdf_font_embedding_uses_only_visible_text_glyphs() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_b = face.glyph_index('B').unwrap().0;
@@ -2631,7 +2635,9 @@ fn pdf_font_embedding_uses_only_visible_text_glyphs() {
 
 #[test]
 fn pdf_font_embedding_subsets_ttf_with_compact_cids() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let blob = FontiqueBlob::new(Arc::new(font_bytes.clone()));
@@ -2732,7 +2738,9 @@ fn pdf_font_embedding_materializes_a_static_variable_instance() {
 
 #[test]
 fn pdf_full_font_embedding_uses_original_ttf_identity_cids_and_full_cmap() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_b = face.glyph_index('B').unwrap().0;
@@ -2780,8 +2788,9 @@ fn pdf_full_font_embedding_uses_original_ttf_identity_cids_and_full_cmap() {
 
 #[test]
 fn pdf_font_embedding_subsets_cff_with_compact_cids() {
-    let font_bytes = std::fs::read("weasyprint-samples/ticket/barlowcondensed-regular.otf")
-        .expect("local CFF regression font");
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/ticket/barlowcondensed-regular.otf")
+            .expect("local CFF regression font");
     let face = ttf_parser::Face::parse(&font_bytes, 0).expect("CFF fixture parses");
     let source_cff_len = face
         .raw_face()
@@ -2824,8 +2833,9 @@ fn pdf_font_embedding_subsets_cff_with_compact_cids() {
 
 #[test]
 fn pdfa_cff_subset_fallback_embeds_the_full_cff_program() {
-    let font_bytes = std::fs::read("weasyprint-samples/ticket/barlowcondensed-regular.otf")
-        .expect("local CFF regression font");
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/ticket/barlowcondensed-regular.otf")
+            .expect("local CFF regression font");
     let face = ttf_parser::Face::parse(&font_bytes, 0).expect("CFF fixture parses");
     let source_cff = face
         .raw_face()
@@ -2891,8 +2901,9 @@ fn pdfa_cff_subset_fallback_embeds_the_full_cff_program() {
 
 #[test]
 fn pdf_full_font_embedding_uses_original_cff_program_and_identity_cids() {
-    let font_bytes = std::fs::read("weasyprint-samples/ticket/barlowcondensed-regular.otf")
-        .expect("local CFF regression font");
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/ticket/barlowcondensed-regular.otf")
+            .expect("local CFF regression font");
     let face = ttf_parser::Face::parse(&font_bytes, 0).expect("CFF fixture parses");
     let source_cff = face
         .raw_face()
@@ -2940,7 +2951,9 @@ fn pdf_full_font_embedding_uses_original_cff_program_and_identity_cids() {
 
 #[test]
 fn pdf_subset_font_names_use_six_uppercase_prefix() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
@@ -2974,7 +2987,9 @@ fn pdf_subset_font_names_use_six_uppercase_prefix() {
 
 #[test]
 fn pdf_font_embedding_errors_when_a_standalone_font_has_an_invalid_face_index() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
@@ -3001,7 +3016,9 @@ fn pdf_font_embedding_errors_when_a_standalone_font_has_an_invalid_face_index() 
 
 #[test]
 fn pdf_cid_font_writes_default_width_and_real_font_bbox() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let notdef_width = face.glyph_hor_advance(ttf_parser::GlyphId(0)).unwrap();
@@ -3042,7 +3059,9 @@ fn pdf_cid_font_writes_default_width_and_real_font_bbox() {
 
 #[test]
 fn pdf_cid_width_entries_use_the_planned_pdf_width_map() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
@@ -3069,7 +3088,9 @@ fn pdf_cid_width_entries_use_the_planned_pdf_width_map() {
 
 #[test]
 fn pdf_font_plan_pdfa_includes_cid_set_bits_for_used_cids() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
@@ -3100,7 +3121,9 @@ fn pdf_font_plan_pdfa_includes_cid_set_bits_for_used_cids() {
 #[test]
 fn pdfa_font_embedding_uses_full_font_when_subsetting_is_forbidden_and_errors_without_outline_rights()
  {
-    let source = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let source =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let glyph_a = ttf_parser::Face::parse(&source, 0)
         .unwrap()
         .glyph_index('A')
@@ -3135,7 +3158,9 @@ fn pdfa_font_embedding_uses_full_font_when_subsetting_is_forbidden_and_errors_wi
 
 #[test]
 fn pdfa_font_embedding_errors_for_painted_glyphs_without_unicode_mapping() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
@@ -3160,7 +3185,9 @@ fn pdfa_font_embedding_errors_for_painted_glyphs_without_unicode_mapping() {
 
 #[test]
 fn pdfa_font_embedding_accepts_empty_glyph_summary_covered_by_actual_text() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
@@ -3205,7 +3232,9 @@ fn pdfa_font_embedding_accepts_empty_glyph_summary_covered_by_actual_text() {
 
 #[test]
 fn pdf_font_embedding_keeps_shaped_ligature_glyphs_or_falls_back() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let Some(ligature) = face.glyph_index('\u{FB03}') else {
         eprintln!("SourceSans3 fixture does not expose an ffi ligature glyph");
@@ -3248,7 +3277,7 @@ async fn pdf_ligature_runs_emit_actual_text_when_cluster_summaries_drop_source_c
             @font-face {
                 font-family: FiraLigatureProbe;
                 font-weight: 300;
-                src: url("weasyprint-samples/report/FiraSans-Light.ttf");
+                src: url("third_party/examples/weasyprint-samples/report/FiraSans-Light.ttf");
             }
             p { font-family: FiraLigatureProbe; font-size: 16pt; font-weight: 300; }
         </style><p>first</p>"#,
@@ -3276,7 +3305,7 @@ async fn pdf_non_ligature_runs_do_not_emit_unnecessary_actual_text() {
             @font-face {
                 font-family: FiraLigatureProbe;
                 font-weight: 300;
-                src: url("weasyprint-samples/report/FiraSans-Light.ttf");
+                src: url("third_party/examples/weasyprint-samples/report/FiraSans-Light.ttf");
             }
             p {
                 font-family: FiraLigatureProbe;
@@ -3305,7 +3334,7 @@ async fn pdf_non_ligature_runs_do_not_emit_unnecessary_actual_text() {
 #[tokio::test]
 #[ignore = "renders the full report sample; run explicitly with --ignored"]
 async fn report_sample_ligatures_retain_authored_pdf_extraction_text() {
-    let document = Html::from_file("weasyprint-samples/report/report.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/report/report.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -3331,7 +3360,9 @@ async fn report_sample_ligatures_retain_authored_pdf_extraction_text() {
 
 #[test]
 fn pdf_text_runs_emit_positioned_show_for_advance_adjustments() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_v = face.glyph_index('V').unwrap().0;
@@ -3382,7 +3413,9 @@ fn pdf_text_runs_emit_positioned_show_for_advance_adjustments() {
 
 #[test]
 fn pdf_text_runs_preserve_subcentipoint_advance_adjustments() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_v = face.glyph_index('V').unwrap().0;
@@ -3435,7 +3468,9 @@ fn pdf_text_runs_preserve_subcentipoint_advance_adjustments() {
 
 #[test]
 fn pdf_text_runs_apply_per_glyph_origins_without_changing_advances() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_b = face.glyph_index('B').unwrap().0;
@@ -3498,7 +3533,9 @@ fn pdf_text_runs_apply_per_glyph_origins_without_changing_advances() {
 
 #[test]
 fn pdf_text_runs_transform_per_glyph_origins_with_the_run_matrix() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_b = face.glyph_index('B').unwrap().0;
@@ -3555,7 +3592,9 @@ fn pdf_text_runs_transform_per_glyph_origins_with_the_run_matrix() {
 
 #[test]
 fn pdf_advance_only_separator_is_not_subset_or_painted_and_preserves_actual_text() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
@@ -3621,7 +3660,9 @@ fn pdf_advance_only_separator_is_not_subset_or_painted_and_preserves_actual_text
 
 #[test]
 fn pdf_vector_path_glyph_is_invisible_but_retains_text_extraction() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
@@ -3680,7 +3721,9 @@ fn pdf_vector_path_glyph_is_invisible_but_retains_text_extraction() {
 
 #[test]
 fn pdf_fully_covered_actual_text_run_is_invisible_and_retains_marked_content() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
@@ -3766,7 +3809,9 @@ fn pdf_fully_covered_actual_text_run_is_invisible_and_retains_marked_content() {
 
 #[test]
 fn pdf_fully_covered_line_is_invisible_but_retains_text_extraction() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
@@ -3834,7 +3879,9 @@ fn pdf_fully_covered_line_is_invisible_but_retains_text_extraction() {
 
 #[test]
 fn pdf_text_runs_emit_selected_text_matrix_and_offsets() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
@@ -3878,7 +3925,9 @@ fn pdf_text_runs_emit_selected_text_matrix_and_offsets() {
 
 #[test]
 fn pdf_identity_text_runs_reuse_text_state_with_relative_positioning() {
-    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_b = face.glyph_index('B').unwrap().0;
@@ -4011,7 +4060,9 @@ fn variable_test_document_font(id: usize, bytes: Vec<u8>, weight: f32) -> Docume
 /// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
 #[test]
 fn synthetic_bold_is_a_per_document_font_pdf_paint_state() {
-    let bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let bytes =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
     let glyph_a = face.glyph_index('A').unwrap().0;
     let glyph_b = face.glyph_index('B').unwrap().0;

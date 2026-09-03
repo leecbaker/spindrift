@@ -76,32 +76,32 @@ const GRID_DIAGNOSTIC_WORKLOADS: &[GridDiagnosticWorkload] = &[
 const SAMPLES: &[Sample] = &[
     Sample {
         name: "book",
-        path: "weasyprint-samples/book/book.html",
-        stylesheets: &["weasyprint-samples/book/book.css"],
+        path: "third_party/examples/weasyprint-samples/book/book.html",
+        stylesheets: &["third_party/examples/weasyprint-samples/book/book.css"],
     },
     Sample {
         name: "invoice",
-        path: "weasyprint-samples/invoice/invoice.html",
+        path: "third_party/examples/weasyprint-samples/invoice/invoice.html",
         stylesheets: &[],
     },
     Sample {
         name: "letter",
-        path: "weasyprint-samples/letter/letter.html",
+        path: "third_party/examples/weasyprint-samples/letter/letter.html",
         stylesheets: &[],
     },
     Sample {
         name: "poster",
-        path: "weasyprint-samples/poster/poster.html",
-        stylesheets: &["weasyprint-samples/poster/poster.css"],
+        path: "third_party/examples/weasyprint-samples/poster/poster.html",
+        stylesheets: &["third_party/examples/weasyprint-samples/poster/poster.css"],
     },
     Sample {
         name: "report",
-        path: "weasyprint-samples/report/report.html",
+        path: "third_party/examples/weasyprint-samples/report/report.html",
         stylesheets: &[],
     },
     Sample {
         name: "ticket",
-        path: "weasyprint-samples/ticket/ticket.html",
+        path: "third_party/examples/weasyprint-samples/ticket/ticket.html",
         stylesheets: &[],
     },
 ];

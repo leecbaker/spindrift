@@ -110,7 +110,7 @@ impl<'a> LayoutBuilder<'a> {
             speculative_auto_float_margin_box_heights: HashMap::new(),
             active_auto_float_measurements: Vec::new(),
             active_auto_float_measurement_fallbacks: Vec::new(),
-            inherited_adjoining_start_margins: Vec::new(),
+            inherited_adjoining_start_margins: InheritedAdjoiningStartMarginScopes::default(),
             float_replay_clearance_scopes: Vec::new(),
             cursor_y: page_context.top(),
             content_left: page_context.left(),

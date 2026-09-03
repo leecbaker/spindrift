@@ -116,10 +116,10 @@ async fn root_auto_height_flow_uses_in_flow_endpoint_after_near_page_end_flex() 
 
 #[tokio::test]
 async fn poster_sample_fragments_address_when_the_page_area_is_exhausted() {
-    let stylesheet = Css::from_file("weasyprint-samples/poster/poster.css")
+    let stylesheet = Css::from_file("third_party/examples/weasyprint-samples/poster/poster.css")
         .await
         .unwrap();
-    let document = Html::from_file("weasyprint-samples/poster/poster.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/poster/poster.html")
         .await
         .unwrap()
         .with_stylesheet(stylesheet)
@@ -2691,6 +2691,40 @@ async fn collapses_first_descendant_top_margin_through_transparent_wrappers() {
 }
 
 #[tokio::test]
+async fn inherited_first_child_margin_does_not_leak_into_later_sibling_subtrees() {
+    let style = "<style>@page { size: 200pt 200pt; margin: 0 } html, body { margin: 0 } .first { height: 10pt; margin-top: 15pt } .prior { width: 75pt; height: 10pt; margin-bottom: 4.125pt; background: red } .inner { width: 75pt; height: 10pt; margin-top: 11.25pt; background: blue }</style>";
+
+    for (case, normalization_trigger) in [
+        ("DOM block flow", ""),
+        ("normalized formatting-box flow", "<span><div></div></span>"),
+    ] {
+        let document = Html::from_string(format!(
+            "{style}<div><div class=\"first\"></div><div class=\"prior\"></div><div><div class=\"inner\"></div></div>{normalization_trigger}</div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let page = &document.pages[0];
+        let red = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+            .unwrap_or_else(|| panic!("{case}: prior block should paint: {:?}", page.rects()));
+        let blue = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+            .unwrap_or_else(|| panic!("{case}: nested block should paint: {:?}", page.rects()));
+        let gap = red.y() - (blue.y() + blue.height());
+
+        assert!(
+            (gap - 11.25).abs() < 0.01,
+            "{case}: the later subtree should use its own collapsed margin set; gap was {gap}pt"
+        );
+    }
+}
+
+#[tokio::test]
 async fn document_canvas_margin_collapses_through_transparent_wrapper() {
     let style = "<style>p { margin: 1em 0; font-size: 10pt; line-height: 10pt }</style>";
     let direct = Html::from_string(format!("{style}<p>Text</p>"))
@@ -3063,6 +3097,41 @@ async fn discards_collapsed_top_margin_after_avoid_break_to_page_top() {
     assert!(
         (moved_top - 90.0).abs() < 1.0,
         "expected collapsed top margin to be discarded at page top, got line top {moved_top:.4}"
+    );
+}
+
+#[tokio::test]
+async fn discards_nested_collapsed_top_margin_after_avoid_prebreak_to_page_top() {
+    let document = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 10pt } html, body { margin: 0 } .spacer { height: 60pt; background: #eee } .keep { page-break-inside: avoid } p { margin: 20pt 0 0 0; font-size: 10pt; line-height: 10pt } td { height: 20pt }</style><div class=\"spacer\"></div><div class=\"keep\"><div><div><p>Moved</p><table><tr><td>Cell</td></tr></table></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let moved = document.pages[1]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Moved")
+        .unwrap();
+    let moved_top = rendered_line_baseline_top(&document, moved);
+
+    assert_eq!(document.pages.len(), 2);
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .all(|line| line.text != "Moved" && line.text != "Cell")
+    );
+    assert!(
+        document.pages[1]
+            .lines()
+            .iter()
+            .any(|line| line.text == "Cell")
+    );
+    assert!(
+        (moved_top - 90.0).abs() < 1.0,
+        "expected the complete nested margin set to be discarded at page top, got line top {moved_top:.4}"
     );
 }
 
@@ -5587,6 +5656,11 @@ async fn nested_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
             .iter()
             .all(|line| (line.x() - first_page_x).abs() < 0.01),
         "avoid retry must retain the default body canvas inset: {page_lines:?}"
+    );
+    assert_line_baseline_at_top(
+        &document,
+        &document.pages[1].lines()[0],
+        document.pages[1].height() - 36.0,
     );
     let blue = CssColor::new(0, 0, 255);
     let blue_origins = |page: &spindrift::Page| {

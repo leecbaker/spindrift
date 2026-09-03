@@ -19,7 +19,7 @@ Prefer the following resources for implementation:
 
 - Relevant HTML, CSS, W3 specs.
 - Weasyprint source code is checked out at `Weasyprint/`
-- Weasyprint examples at `weasyprint-samples`
+- Weasyprint examples at `third_party/examples/weasyprint-samples`
 - Weasyprint is installed locally via homebrew, you can run it.
 
 Note that we aim to be much more spec compliant and performant than weasyprint. Use it only as a source of checking how they think about things, but don't necessarily copy behaviour without determining it to be the best solution.

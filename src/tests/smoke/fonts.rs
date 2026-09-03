@@ -487,7 +487,9 @@ async fn supports_generic_system_font_families() {
 
 #[tokio::test]
 async fn supports_font_face_data_uri_fonts() {
-    let font_data = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_data =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let font_data = base64::engine::general_purpose::STANDARD.encode(font_data);
     let html = format!(
         "<style>@font-face {{ font-family: SmokeFace; src: url(data:font/ttf;base64,{font_data}) format('truetype') }} p {{ font-family: SmokeFace }}</style><p>Font face</p>"
@@ -514,7 +516,9 @@ async fn supports_font_face_data_uri_fonts() {
 
 #[tokio::test]
 async fn font_face_data_uri_falls_back_after_a_malformed_data_source() {
-    let font_data = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let font_data =
+        std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap();
     let font_data = base64::engine::general_purpose::STANDARD.encode(font_data);
     let html = format!(
         "<style>@font-face {{ font-family: DataFallback; src: url(data:font/ttf;base64,%%%) format('truetype'), url(data:font/ttf;base64,{font_data}) format('truetype') }} p {{ font-family: DataFallback }}</style><p>Font face</p>"
@@ -540,7 +544,8 @@ async fn font_face_data_uri_falls_back_after_a_malformed_data_source() {
 #[tokio::test]
 async fn supports_font_face_data_uri_woff1_fonts() {
     let font_data = woff1_from_sfnt(
-        &std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap(),
+        &std::fs::read("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf")
+            .unwrap(),
     );
     let font_data = base64::engine::general_purpose::STANDARD.encode(font_data);
     let html = format!(
@@ -566,7 +571,7 @@ async fn supports_font_face_data_uri_woff1_fonts() {
 
 #[tokio::test]
 async fn supports_font_face_opentype_cff_fonts() {
-    let document = Html::from_file("weasyprint-samples/ticket/ticket.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/ticket/ticket.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -595,7 +600,7 @@ async fn async_font_seed_loads_local_font_face_sources() {
         r#"<style>
             @font-face {
                 font-family: AsyncLocalFace;
-                src: url("weasyprint-samples/invoice/SourceSans3-Regular.ttf");
+                src: url("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf");
             }
             p { font-family: AsyncLocalFace }
         </style><p>Local font face</p>"#,
@@ -760,7 +765,7 @@ async fn ttc_face_index_survives_query_shaping_and_embedding_when_available() {
 
 #[tokio::test]
 async fn ticket_airplane_fallback_prefers_visible_unicode_text_font() {
-    let document = Html::from_file("weasyprint-samples/ticket/ticket.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/ticket/ticket.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -796,7 +801,7 @@ async fn ticket_airplane_fallback_prefers_visible_unicode_text_font() {
 
 #[tokio::test]
 async fn ticket_pdf_prunes_unused_and_duplicate_embedded_fonts() {
-    let pdf = Html::from_file("weasyprint-samples/ticket/ticket.html")
+    let pdf = Html::from_file("third_party/examples/weasyprint-samples/ticket/ticket.html")
         .await
         .unwrap()
         .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
@@ -1364,8 +1369,8 @@ async fn uses_later_font_family_for_missing_glyph_runs() {
 
 #[tokio::test]
 async fn explicit_line_height_baseline_ignores_fallback_font_runs() {
-    let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
-    let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
+    let primary = "third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf";
+    let fallback = "third_party/examples/weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
     let primary_data = std::fs::read(primary).unwrap();
     let fallback_data = std::fs::read(fallback).unwrap();
     let primary_face = ttf_parser::Face::parse(&primary_data, 0).unwrap();
@@ -1463,8 +1468,8 @@ async fn explicit_line_height_baseline_ignores_fallback_font_runs() {
 /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
 #[tokio::test]
 async fn normal_line_height_inline_block_includes_selected_fallback_metrics() {
-    let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
-    let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
+    let primary = "third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf";
+    let fallback = "third_party/examples/weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
     let html = format!(
         r#"
         <style>
@@ -1530,8 +1535,8 @@ async fn normal_line_height_inline_block_includes_selected_fallback_metrics() {
 /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>
 #[tokio::test]
 async fn forced_empty_line_retains_parent_strut_without_selected_font_run() {
-    let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
-    let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
+    let primary = "third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf";
+    let fallback = "third_party/examples/weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
     let html = format!(
         r#"
         <style>
@@ -1596,8 +1601,8 @@ async fn forced_empty_line_retains_parent_strut_without_selected_font_run() {
 
 #[tokio::test]
 async fn css2_explicit_line_height_baseline_wpt_overlay_hides_fallback_probe() {
-    let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
-    let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
+    let primary = "third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf";
+    let fallback = "third_party/examples/weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
     let primary_data = std::fs::read(primary).unwrap();
     let fallback_data = std::fs::read(fallback).unwrap();
     let primary_face = ttf_parser::Face::parse(&primary_data, 0).unwrap();

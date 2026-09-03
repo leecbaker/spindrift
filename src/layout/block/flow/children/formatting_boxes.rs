@@ -806,8 +806,7 @@ impl<'a> LayoutBuilder<'a> {
                     };
                     let parent_start_hypothesis = self
                         .inherited_adjoining_start_margins
-                        .last()
-                        .copied()
+                        .current_for(element.id)
                         .map(InheritedAdjoiningStartMargin::parent_start_clearance_hypothesis)
                         .unwrap_or_else(|| {
                             ParentStartClearanceHypothesis::new(PageTopBlockPosition::new(
@@ -1094,7 +1093,8 @@ impl<'a> LayoutBuilder<'a> {
                 .map(|context| context.shapes.len())
                 .unwrap_or(0);
             if let Some(margin) = inherited_adjoining_start_margin {
-                self.inherited_adjoining_start_margins.push(margin);
+                self.inherited_adjoining_start_margins
+                    .push_for(child_element.id, margin);
             }
             // `layout_block` normalizes a fieldset into a frozen child list
             // with its selected rendered legend at index zero.  Keep the
@@ -1440,7 +1440,8 @@ impl<'a> LayoutBuilder<'a> {
                     self.block_static_position_y_offset = previous;
                 }
                 if inherited_adjoining_start_margin.is_some() {
-                    self.inherited_adjoining_start_margins.pop();
+                    self.inherited_adjoining_start_margins
+                        .pop_for(child_element.id);
                 }
                 if rendered_fieldset_legend
                     && self.pages.len() == fieldset_legend_page_index

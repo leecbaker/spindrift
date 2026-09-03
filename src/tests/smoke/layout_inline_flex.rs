@@ -12982,7 +12982,7 @@ async fn nested_column_flex_item_uses_intrinsic_auto_width() {
 
 #[tokio::test]
 async fn flex_auto_basis_preserves_non_growing_item_content_width() {
-    let document = Html::from_file("weasyprint-samples/invoice/invoice.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/invoice/invoice.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -13015,7 +13015,7 @@ async fn flex_auto_basis_preserves_non_growing_item_content_width() {
 
 #[tokio::test]
 async fn flex_auto_basis_border_box_includes_padding_and_border() {
-    let document = Html::from_file("weasyprint-samples/ticket/ticket.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/ticket/ticket.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -13042,7 +13042,7 @@ async fn flex_auto_basis_border_box_includes_padding_and_border() {
 
 #[tokio::test]
 async fn shrink_to_fit_inline_block_uses_exact_graph_max_content_width() {
-    let document = Html::from_file("weasyprint-samples/ticket/ticket.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/ticket/ticket.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -13059,7 +13059,7 @@ async fn shrink_to_fit_inline_block_uses_exact_graph_max_content_width() {
 
 #[tokio::test]
 async fn flex_item_text_line_fit_uses_sequence_backed_max_content_width() {
-    let document = Html::from_file("weasyprint-samples/ticket/ticket.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/ticket/ticket.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())
@@ -13076,7 +13076,7 @@ async fn flex_item_text_line_fit_uses_sequence_backed_max_content_width() {
 
 #[tokio::test]
 async fn inline_origin_abspos_uses_inline_static_position() {
-    let document = Html::from_file("weasyprint-samples/ticket/ticket.html")
+    let document = Html::from_file("third_party/examples/weasyprint-samples/ticket/ticket.html")
         .await
         .unwrap()
         .render(&RenderOptions::default())

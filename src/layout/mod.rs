@@ -125,9 +125,9 @@ pub(crate) fn generated_radial_gradient_raster_color_space(
 mod block;
 #[allow(unused_imports)]
 pub(in crate::layout) use self::block::flow::{
-    AdjoiningBlockStartMargin, InheritedAdjoiningStartMargin, can_collapse_block_end_margin,
-    can_collapse_block_start_margin, can_collapse_own_block_margins, collapse_margin_set,
-    collapse_margins, collapsed_margin_delta, collapsed_start_margin_delta,
+    AdjoiningBlockStartMargin, InheritedAdjoiningStartMargin, InheritedAdjoiningStartMarginScopes,
+    can_collapse_block_end_margin, can_collapse_block_start_margin, can_collapse_own_block_margins,
+    collapse_margin_set, collapse_margins, collapsed_margin_delta, collapsed_start_margin_delta,
     collapsible_first_child_start_margin_dom_with_font_metrics,
     collapsible_first_child_start_margin_dom_with_resolver,
     collapsible_first_child_start_margin_from_boxes, collapsible_start_margin_dom_with_resolver,

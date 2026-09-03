@@ -56,6 +56,12 @@ where block sizing interacts with margin collapse.
 - `break-inside: avoid` retries preserve the root/body canvas's inline insets
   on their destination page, so the kept subtree shares the same containing
   block origin as an ordinary in-flow page continuation.
+- Complete adjoining block-start margin sets propagated through transparent
+  wrappers are resolved through the destination fragmentainer's page-start
+  truncation rule before being handed to the first child, including when an
+  avoided ancestor moves to a fresh page. Their lexical scopes are owned by
+  the target element, so inherited first-child state cannot leak into a later
+  sibling subtree while the transparent ancestor remains on the stack.
 - Block sibling `break-before: avoid` and `break-after: avoid` rollback runs
   use the shared adjacent-box fragmentation decision to arm candidate starts,
   recognize current avoid boundaries through target-aware committed break

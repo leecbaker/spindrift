@@ -528,12 +528,12 @@ mod tests {
             &crate::css::Css::from_string(
                 r#"@font-face {
                     font-family: HighOnly;
-                    src: url("weasyprint-samples/invoice/SourceSans3-Regular.ttf");
+                    src: url("third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf");
                     unicode-range: U+0020, U+0061;
                 }
                 @font-face {
                     font-family: DeepOnly;
-                    src: url("weasyprint-samples/invoice/pacifico.ttf");
+                    src: url("third_party/examples/weasyprint-samples/invoice/pacifico.ttf");
                     unicode-range: U+0020, U+0062;
                 }"#,
             )

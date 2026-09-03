@@ -210,12 +210,12 @@ async fn normal_line_height_includes_selected_fallback_metrics() {
     let fonts_dir = dir.join("fonts");
     std::fs::create_dir_all(&fonts_dir).unwrap();
     std::fs::copy(
-        "weasyprint-samples/invoice/SourceSans3-Regular.ttf",
+        "third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf",
         fonts_dir.join("high.ttf"),
     )
     .unwrap();
     std::fs::copy(
-        "weasyprint-samples/invoice/pacifico.ttf",
+        "third_party/examples/weasyprint-samples/invoice/pacifico.ttf",
         fonts_dir.join("deep.ttf"),
     )
     .unwrap();
@@ -2086,7 +2086,7 @@ async fn loads_root_relative_font_face_urls_from_base_url() {
     let css_path = root_fonts.join("fonts.css");
     let font_path = root_fonts.join("RootFont.ttf");
     std::fs::copy(
-        "weasyprint-samples/invoice/SourceSans3-Regular.ttf",
+        "third_party/examples/weasyprint-samples/invoice/SourceSans3-Regular.ttf",
         &font_path,
     )
     .unwrap();
