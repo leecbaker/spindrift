@@ -119,10 +119,6 @@ fn pdf_profiles_round_trip_and_select_their_writer_metadata() {
     let profiles = [
         ("pdf", PdfProfile::Pdf, (1, 4), None),
         ("pdf/a-1b", PdfProfile::PdfA1B, (1, 4), Some((1, "B"))),
-        ("pdf/a-2b", PdfProfile::PdfA2B, (1, 7), Some((2, "B"))),
-        ("pdf/a-3b", PdfProfile::PdfA3B, (1, 7), Some((3, "B"))),
-        ("pdf/a-2u", PdfProfile::PdfA2U, (1, 7), Some((2, "U"))),
-        ("pdf/a-3u", PdfProfile::PdfA3U, (1, 7), Some((3, "U"))),
     ];
 
     assert_eq!(PdfProfile::default(), PdfProfile::Pdf);
@@ -857,7 +853,7 @@ async fn pdfa_converts_tagged_jpegs_instead_of_passing_them_through() {
     .write_pdf_bytes(
         &RenderOptions::default(),
         &crate::PdfOptions {
-            profile: PdfProfile::PdfA2B,
+            profile: PdfProfile::PdfA1B,
             ..crate::PdfOptions::default()
         },
     )
@@ -1014,16 +1010,16 @@ fn pdf_metadata_stream_mirrors_document_info_dictionary() {
 fn pdf_metadata_stream_uses_selected_pdfa_profile_identification() {
     let document = metadata_test_document(DocumentMetadata::default());
     let options = PdfOptions {
-        profile: PdfProfile::PdfA2U,
+        profile: PdfProfile::PdfA1B,
         ..PdfOptions::default()
     };
 
     let pdf = document.write_pdf_bytes(&options).unwrap();
     let xmp = first_xml_metadata_stream(&pdf).expect("catalog XMP metadata stream");
 
-    assert!(pdf.starts_with(b"%PDF-1.7"));
-    assert!(xmp.contains(r#"pdfaid:part="2""#));
-    assert!(xmp.contains(r#"pdfaid:conformance="U""#));
+    assert!(pdf.starts_with(b"%PDF-1.4"));
+    assert!(xmp.contains(r#"pdfaid:part="1""#));
+    assert!(xmp.contains(r#"pdfaid:conformance="B""#));
 }
 
 #[test]
@@ -1082,7 +1078,7 @@ fn blank_pdfa_keeps_required_document_resources_without_page_resources() {
     let document = metadata_test_document(DocumentMetadata::default());
     let pdf = document
         .write_pdf_bytes(&PdfOptions {
-            profile: PdfProfile::PdfA2U,
+            profile: PdfProfile::PdfA1B,
             ..PdfOptions::default()
         })
         .unwrap();
@@ -1271,6 +1267,91 @@ async fn inline_and_first_letter_opacity_emit_transparency_groups() {
 }
 
 #[tokio::test]
+async fn first_line_opacity_emits_one_group_for_the_complete_pseudo_box() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 120pt 100pt; margin: 0 } body, p { margin: 0 }\
+         p::first-line { opacity: 0.5; background: red }</style>\
+         <p><span>First</span><span style=\"display:inline-block\"> line</span><br>Second</p>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert_transparency_group(&rendered);
+    assert_eq!(rendered.matches("/GSalpha500 gs").count(), 1, "{rendered}");
+}
+
+#[tokio::test]
+async fn first_line_opacity_remains_distinct_from_equal_originating_opacity() {
+    let explicit_pseudo_pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, p { margin: 0 }\
+         p { opacity: 0.5 } p::first-line { opacity: 0.5 }</style><p>First<br>Second</p>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let inherited_only_pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, p { margin: 0 }\
+         p { opacity: 0.5 } p::first-line { color: red }</style><p>First<br>Second</p>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let explicit_pseudo = pdf_searchable_text(&explicit_pseudo_pdf);
+    let inherited_only = pdf_searchable_text(&inherited_only_pdf);
+
+    let explicit_count = explicit_pseudo.matches("/GSalpha500 gs").count();
+    let inherited_count = inherited_only.matches("/GSalpha500 gs").count();
+    assert!(
+        explicit_count > inherited_count,
+        "an explicitly equal pseudo opacity must add a distinct group: explicit={explicit_count}, inherited={inherited_count}"
+    );
+    assert!(inherited_count > 0);
+}
+
+#[tokio::test]
+async fn first_letter_opacity_remains_nested_under_first_line_opacity() {
+    let first_line_only_pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, p { margin: 0 }\
+         p::first-line { opacity: 0.5 }</style><p>First<br>Second</p>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let nested_pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, p { margin: 0 }\
+         p::first-line { opacity: 0.5 } p::first-letter { opacity: 0.5 }</style>\
+         <p>First<br>Second</p>",
+    )
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let first_line_only = pdf_searchable_text(&first_line_only_pdf);
+    let nested = pdf_searchable_text(&nested_pdf);
+
+    assert!(
+        nested.matches("/GSalpha500 gs").count()
+            > first_line_only.matches("/GSalpha500 gs").count(),
+        "first-letter opacity should remain a descendant group inside first-line opacity"
+    );
+}
+
+#[tokio::test]
+async fn zero_opacity_first_line_keeps_link_annotation() {
+    let document = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body, p { margin: 0 }\
+         p::first-line { opacity: 0 }</style>\
+         <p><a href=\"#target\">First</a><br>Second</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages[0].links.len(), 1);
+}
+
+#[tokio::test]
 async fn nested_transparency_forms_have_unique_scoped_resources() {
     let pdf = Html::from_string(
         "<style>@page { size: 100pt 100pt; margin: 0 } body { margin: 0 }\
@@ -1304,7 +1385,7 @@ fn resolved_document_program_serializes_deterministically() {
     });
     let options = PdfOptions {
         compression: PdfCompression::Uncompressed,
-        profile: PdfProfile::PdfA2U,
+        profile: PdfProfile::PdfA1B,
         ..PdfOptions::default()
     };
 
@@ -2134,7 +2215,7 @@ async fn long_repeating_css_gradient_domains_use_one_periodic_function_per_color
 
 #[tokio::test]
 async fn repeating_css_gradient_hints_hard_stops_and_alpha_remain_vector() {
-    for profile in [PdfProfile::Pdf, PdfProfile::PdfA2B] {
+    for profile in [PdfProfile::Pdf, PdfProfile::PdfA1B] {
         let options = crate::PdfOptions {
             profile,
             compression: crate::PdfCompression::Uncompressed,
@@ -3045,7 +3126,7 @@ fn pdfa_font_embedding_uses_full_font_when_subsetting_is_forbidden_and_errors_wi
     let rejected_document = document_with_single_glyph_font(no_outline, glyph_a);
     assert!(matches!(
         rejected_document.write_pdf_bytes(&PdfOptions {
-            profile: PdfProfile::PdfA2B,
+            profile: PdfProfile::PdfA1B,
             ..PdfOptions::default()
         }),
         Err(Error::FontEmbedding { .. })
@@ -3070,7 +3151,7 @@ fn pdfa_font_embedding_errors_for_painted_glyphs_without_unicode_mapping() {
     };
     assert!(matches!(
         document.write_pdf_bytes(&PdfOptions {
-            profile: PdfProfile::PdfA2B,
+            profile: PdfProfile::PdfA1B,
             ..PdfOptions::default()
         }),
         Err(Error::FontEmbedding { .. })

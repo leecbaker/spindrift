@@ -1815,8 +1815,11 @@ impl<'a> LayoutBuilder<'a> {
                         || (child_style.box_values.inset_top.is_auto()
                             && child_style.box_values.inset_bottom.is_auto());
                 let positioning_containing_block =
-                    PositionedContainingBlockMode::for_element(element, style)
-                        .zip(self.containing_blocks.last().copied());
+                    PositionedContainingBlockMode::for_element(element, style).zip(
+                        self.containing_blocks
+                            .last()
+                            .map(|context| context.geometry),
+                    );
                 let source_static_rect = if static_position_depends_on_final_column {
                     PositionedChildStaticRect::new(
                         self.content_left,

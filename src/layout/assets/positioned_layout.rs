@@ -12,7 +12,8 @@ fn equivalent_positioned_layer(left: &PositionedPaintLayer, right: &PositionedPa
         && left.stack_level == right.stack_level
         && left_context == right_context
         && left.links == right.links
-        && left.escaped_atom_translation == right.escaped_atom_translation
+        && left.escaped_atom_replay == right.escaped_atom_replay
+        && left.overflow_clip_containing_block == right.overflow_clip_containing_block
 }
 
 fn element_contains(element: &Element, target: crate::dom::ElementId) -> bool {
@@ -23,6 +24,30 @@ fn element_contains(element: &Element, target: crate::dom::ElementId) -> bool {
                 NodeKind::Element(descendant) if element_contains(descendant, target)
             )
         })
+}
+
+/// Resolve an escaped positioned descendant's hypothetical source in the
+/// coordinate space that owns its actual containing block.
+///
+/// An atom-owned containing block consumes the ordinary static rectangle
+/// captured by that atom's block traversal. A page-owned containing block
+/// instead receives the atom-local logical source projected into page-owned
+/// geometry; escaped-layer replay later carries only automatic axes to the
+/// atom's final placement.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+fn resolve_escaped_atom_static_position(
+    context: EscapedAtomPositioningContext,
+    containing_block: PositionedContainingBlockContext,
+    active_space: AtomicInlineCoordinateSpaceId,
+) -> AbsoluteStaticPosition {
+    match containing_block.coordinate_space {
+        PositionedCoordinateSpace::AtomicInline(space) if space == active_space => {
+            context.static_position.in_atomic_space()
+        }
+        PositionedCoordinateSpace::Page | PositionedCoordinateSpace::AtomicInline(_) => context
+            .static_position
+            .in_page_owned_containing_block(containing_block.geometry),
+    }
 }
 
 /// Whether resolving an abspos box's physical height requires laying out its
@@ -362,21 +387,28 @@ impl<'a> LayoutBuilder<'a> {
         let uses_escaped_atom_outer_containing_block = style.position == Position::Absolute
             && self.containing_blocks.is_empty()
             && escaped_atom_positioning_context.is_some();
-        let source_containing_block = if style.position == Position::Fixed {
-            locally_contained_fixed_block.unwrap_or_else(|| self.page_containing_block())
+        let source_containing_block_context = if style.position == Position::Fixed {
+            locally_contained_fixed_block.unwrap_or_else(|| {
+                PositionedContainingBlockContext::page(self.page_containing_block())
+            })
         } else {
             self.containing_blocks
                 .last()
                 .cloned()
                 .or_else(|| {
                     uses_escaped_atom_outer_containing_block.then(|| {
-                        escaped_atom_positioning_context
-                            .expect("escaped atom context was checked above")
-                            .actual_containing_block
+                        PositionedContainingBlockContext::page(
+                            escaped_atom_positioning_context
+                                .expect("escaped atom context was checked above")
+                                .actual_containing_block,
+                        )
                     })
                 })
-                .unwrap_or_else(|| self.page_containing_block())
+                .unwrap_or_else(|| {
+                    PositionedContainingBlockContext::page(self.page_containing_block())
+                })
         };
+        let source_containing_block = source_containing_block_context.geometry;
         let uses_initial_page_containing_block =
             matches!(style.position, Position::Absolute | Position::Fixed)
                 && self.containing_blocks.is_empty()
@@ -394,9 +426,15 @@ impl<'a> LayoutBuilder<'a> {
         // positioned Grid children receive a Grid static rectangle.
         // <https://www.w3.org/TR/css-grid-1/#abspos> and
         // <https://www.w3.org/TR/css-position-3/#staticpos-rect>
-        let containing_block = grid_descendant_containing_block
-            .map(|context| context.containing_block)
-            .unwrap_or(source_containing_block);
+        let containing_block_context = grid_descendant_containing_block
+            .map(|context| {
+                PositionedContainingBlockContext::in_space(
+                    context.containing_block,
+                    source_containing_block_context.coordinate_space,
+                )
+            })
+            .unwrap_or(source_containing_block_context);
+        let containing_block = containing_block_context.geometry;
         let containing_block_fragment_origin_page_index = containing_block
             .origin_page_index
             .unwrap_or(paint_page_index);
@@ -616,7 +654,32 @@ impl<'a> LayoutBuilder<'a> {
         // actual containing block still resolves the final inset equation.
         // <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
         // <https://drafts.csswg.org/css-align-3/#abspos-sizing>
-        let mut absolute_static_position = self.absolute_static_position;
+        let active_atomic_space = escaped_atom_positioning_context.map(|_| {
+            self.active_atomic_inline_coordinate_spaces
+                .last()
+                .copied()
+                .expect("escaped atomic positioning has an active coordinate space")
+        });
+        let resolved_escaped_atom_static_position = escaped_atom_positioning_context
+            .zip(active_atomic_space)
+            .map(|(context, active_space)| {
+                resolve_escaped_atom_static_position(
+                    context,
+                    containing_block_context,
+                    active_space,
+                )
+            });
+        let containing_block_is_active_atom = active_atomic_space.is_some_and(|active_space| {
+            containing_block_context.coordinate_space
+                == PositionedCoordinateSpace::AtomicInline(active_space)
+        });
+        let mut absolute_static_position =
+            if escaped_atom_positioning_context.is_some() && !containing_block_is_active_atom {
+                resolved_escaped_atom_static_position
+            } else {
+                self.absolute_static_position
+                    .or(resolved_escaped_atom_static_position)
+            };
         let horizontal_insets_are_auto_for_available =
             used_inset_left(&used_style, containing_block).is_none()
                 && used_inset_right(&used_style, containing_block).is_none();
@@ -718,16 +781,16 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
         let static_source_left = previous_left;
         let static_source_right = previous_right;
-        let source_static_position = escaped_atom_positioning_context
-            .map(|context| context.static_position)
-            .unwrap_or_else(|| {
-                AbsoluteStaticPosition::from_page_rect_with_horizontal_outside(
-                    static_source_left,
-                    static_source_right,
-                    previous_cursor_y,
-                    true,
-                )
-            });
+        let source_static_position = if escaped_atom_positioning_context.is_some() {
+            absolute_static_position.expect("escaped atom has a resolved static position")
+        } else {
+            AbsoluteStaticPosition::from_page_rect_with_horizontal_outside(
+                static_source_left,
+                static_source_right,
+                previous_cursor_y,
+                true,
+            )
+        };
         // The static-position rectangle is an alignment container derived
         // from the formatting context the box would have joined, not the
         // actual absolute-position containing block. For ordinary block flow
@@ -864,16 +927,7 @@ impl<'a> LayoutBuilder<'a> {
         let inline_auto_static_x =
             style.abspos_static_source.is_inline_level() && horizontal_insets_are_auto;
         let mut static_horizontal_position =
-            if horizontal_insets_are_auto && escaped_atom_positioning_context.is_some() {
-                // The escaped atom is laid out in a local scratch coordinate
-                // system but resolves explicit insets against its outer
-                // containing block. With automatic horizontal insets, its
-                // hypothetical block instead starts at the atom-local content
-                // edge; an outer inline static rectangle must not be replayed
-                // and then translated by the atom a second time.
-                // <https://www.w3.org/TR/css-position-3/#static-position>
-                PhysicalStaticAxisFallback::new(0.0, containing_block.width())
-            } else if horizontal_insets_are_auto && let Some(position) = absolute_static_position {
+            if horizontal_insets_are_auto && let Some(position) = absolute_static_position {
                 position.horizontal_position(containing_block)
             } else {
                 inline_auto_static_x
@@ -1009,7 +1063,6 @@ impl<'a> LayoutBuilder<'a> {
         .unwrap_or(auto_or_intrinsic_width)
             + horizontal_non_content;
         if horizontal_insets_are_auto
-            && escaped_atom_positioning_context.is_none()
             && let Some(static_alignment) =
                 absolute_static_position.and_then(AbsoluteStaticPosition::static_alignment)
         {
@@ -1497,7 +1550,7 @@ impl<'a> LayoutBuilder<'a> {
         // never this transport style.
         flow_style.effective_zoom = css::EffectiveZoom::NORMAL;
         let positioned_containing_block_top = self.cursor_y - positioned_border_widths.top;
-        self.containing_blocks.push(
+        let positioned_containing_block = self.positioned_containing_block_context(
             ContainingBlock::from_page_top_rect(PageTopRect::new(
                 self.content_left + positioned_border_widths.left,
                 positioned_containing_block_top,
@@ -1506,6 +1559,7 @@ impl<'a> LayoutBuilder<'a> {
             ))
             .on_page(positioned_origin_page_index),
         );
+        self.containing_blocks.push(positioned_containing_block);
         // A statically positioned absolute box can fragment its contents
         // through later page contexts. An explicitly block-start-pinned
         // absolute box, and every fixed box, instead belongs to one resolved
@@ -1620,21 +1674,20 @@ impl<'a> LayoutBuilder<'a> {
                     .paint_clip();
                     let positioned_containing_block_top =
                         self.cursor_y - positioned_border_widths.top;
-                    *self
-                        .containing_blocks
+                    self.containing_blocks
                         .last_mut()
-                        .expect("positioned flow owns its containing block") =
-                        ContainingBlock::from_page_top_rect(PageTopRect::new(
-                            self.content_left + positioned_border_widths.left,
-                            positioned_containing_block_top,
-                            positioned_content_width
-                                + flow_style.padding.left
-                                + flow_style.padding.right,
-                            positioned_content_height
-                                + flow_style.padding.top
-                                + flow_style.padding.bottom,
-                        ))
-                        .on_page(positioned_origin_page_index);
+                        .expect("positioned flow owns its containing block")
+                        .geometry = ContainingBlock::from_page_top_rect(PageTopRect::new(
+                        self.content_left + positioned_border_widths.left,
+                        positioned_containing_block_top,
+                        positioned_content_width
+                            + flow_style.padding.left
+                            + flow_style.padding.right,
+                        positioned_content_height
+                            + flow_style.padding.top
+                            + flow_style.padding.bottom,
+                    ))
+                    .on_page(positioned_origin_page_index);
                 }
             }
         }
@@ -2189,28 +2242,24 @@ impl<'a> LayoutBuilder<'a> {
                 // decoration, which lies outside the contents clip.
                 policy.effects.clear_overflow_clip_effects();
             }
-            let escaped_atom_translation = if self.escaped_atom_positioning_depth > 0 {
-                let containing_block_is_atom_local =
-                    self.escaped_atom_containing_block == Some(containing_block);
-                EscapedAtomTranslation::from_positioned_static_axes(
+            let escaped_atom_replay = if self.escaped_atom_positioning_depth > 0 {
+                let containing_block_is_atom_local = self
+                    .active_atomic_inline_coordinate_spaces
+                    .last()
+                    .is_some_and(|space| {
+                        containing_block_context.coordinate_space
+                            == PositionedCoordinateSpace::AtomicInline(*space)
+                    });
+                EscapedAtomReplay::for_positioned_box(
                     containing_block,
-                    containing_block_is_atom_local
-                        || (horizontal_insets_are_auto && absolute_static_position.is_some()),
-                    containing_block_is_atom_local
-                        || (vertical_insets_are_auto
-                            && absolute_static_position
-                                .is_some_and(AbsoluteStaticPosition::has_vertical_position)),
-                    // Static-position resolution first yields a page-space
-                    // position against the outer containing block. An
-                    // escaped atom replays that layer in its local scratch
-                    // coordinates, so normalize every static horizontal axis
-                    // before applying the atom's final translation. Explicit
-                    // insets never select this translation axis.
-                    // <https://www.w3.org/TR/css-position-3/#static-position>
-                    !containing_block_is_atom_local,
+                    containing_block_is_atom_local,
+                    horizontal_insets_are_auto && absolute_static_position.is_some(),
+                    vertical_insets_are_auto
+                        && absolute_static_position
+                            .is_some_and(AbsoluteStaticPosition::has_vertical_position),
                 )
             } else {
-                EscapedAtomTranslation::none()
+                EscapedAtomReplay::none()
             };
             // Overflow clipping is not itself a stacking context, but it is
             // nevertheless an isolation boundary for the clipped contents.
@@ -2256,6 +2305,10 @@ impl<'a> LayoutBuilder<'a> {
             let has_positioned_paint =
                 !positioned_fragment.is_empty() || !child_contexts.is_empty();
             if has_positioned_paint {
+                let positioned_source_box = self
+                    .positioned_generated_source
+                    .and_then(|source| source.box_source_for_element(element.id))
+                    .unwrap_or(InlineStaticPositionBoxSource::Principal);
                 if captures_multicol_positioned_principal {
                     // Source layout still runs to materialize anonymous
                     // columns and resolve intrinsic geometry, but the paint
@@ -2277,7 +2330,7 @@ impl<'a> LayoutBuilder<'a> {
                             bounds,
                             child_contexts,
                             links,
-                            escaped_atom_translation,
+                            escaped_atom_replay,
                         },
                     );
                     // Intrinsic and auto-size measurement can visit a
@@ -2294,12 +2347,13 @@ impl<'a> LayoutBuilder<'a> {
                     self.fixed_layers.push(layer);
                     continue;
                 }
-                let layer = positioned_fragment
+                let mut layer = positioned_fragment
                     .into_page_local_layer(
                         PositionedPaintIdentity {
                             source_element: Some(element.id),
                             source_style: source_style.clone(),
                             source_style_identity: source_style as *const ComputedStyle as usize,
+                            source_box: positioned_source_box,
                         },
                         PositionedStackingMetadata {
                             transaction_depth: self.positioned_paint_transaction_depth,
@@ -2310,16 +2364,23 @@ impl<'a> LayoutBuilder<'a> {
                             bounds,
                             child_contexts,
                             links,
-                            escaped_atom_translation,
+                            escaped_atom_replay,
                         },
                     )
                     .into_layer();
+                layer.overflow_clip_containing_block = Some(if style.position == Position::Fixed {
+                    PositionedContainingBlockScopeDepth::Fixed(self.fixed_containing_blocks.len())
+                } else {
+                    PositionedContainingBlockScopeDepth::Absolute(self.containing_blocks.len())
+                });
                 // A block formatting retry can revisit this box after its
                 // final static position is known. Replace the provisional
                 // capture for that element/page before committing its final
                 // layer.
                 self.positioned_layers.retain(|existing| {
-                    existing.source_element != Some(element.id) || existing.page_index != page_index
+                    existing.source_element != Some(element.id)
+                        || existing.source_box != positioned_source_box
+                        || existing.page_index != page_index
                 });
                 // Captured positioned paint can be reached again when an
                 // enclosing layout pass replays its final fragmentainer.
@@ -2358,7 +2419,13 @@ impl<'a> LayoutBuilder<'a> {
             && let Some(target) = principal_page_span_target
         {
             self.positioned_layers.retain(|layer| {
-                layer.source_element != Some(element.id) || layer.page_index <= target
+                layer.source_element != Some(element.id)
+                    || layer.source_box
+                        != self
+                            .positioned_generated_source
+                            .and_then(|source| source.box_source_for_element(element.id))
+                            .unwrap_or(InlineStaticPositionBoxSource::Principal)
+                    || layer.page_index <= target
             });
         }
     }

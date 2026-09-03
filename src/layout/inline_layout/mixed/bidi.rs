@@ -426,17 +426,17 @@ pub(in crate::layout) fn mixed_inline_atom_participates_in_bidi_ordering(
     atom: &InlineAtom,
 ) -> bool {
     match atom.content() {
-        // A positioned inline's start/end marker is geometry, not an
-        // ordinary paint edge. It must nevertheless stay attached to its
-        // source location when a nested ruby level establishes a bidi
-        // isolate; treating it as UAX #9-transparent moves a zero-width
-        // containing block to the start of the visual line.
+        // Inline start/end markers are structural source boundaries, not
+        // atomic inline participants. Their explicit prepared visual
+        // placement keeps positioning identity attached across bidi and ruby
+        // scopes without introducing a neutral U+FFFC that can split or move
+        // the surrounding text run.
         // <https://www.w3.org/TR/css-position-3/#def-cb>
         // <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>
-        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
-            edge.positioning_containing_block_id.is_some()
-        }
-        InlineAtomContent::Leader(_) | InlineAtomContent::InlineEdge(_) => false,
+        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_)) => false,
+        InlineAtomContent::StaticPositionHypothetical { .. }
+        | InlineAtomContent::Leader(_)
+        | InlineAtomContent::InlineEdge(_) => false,
         _ => true,
     }
 }
@@ -574,7 +574,7 @@ pub(in crate::layout) fn transparent_inline_edge_precedes_visual_content(
         | InlineAtomContent::Image(_)
         | InlineAtomContent::Gradient { .. }
         | InlineAtomContent::Svg { .. }
-        | InlineAtomContent::StaticPositionPlaceholder(_)
+        | InlineAtomContent::StaticPositionHypothetical { .. }
         | InlineAtomContent::InlineBox { .. }
         | InlineAtomContent::Ruby { .. }
         | InlineAtomContent::TextCombineUpright { .. }
@@ -975,5 +975,42 @@ mod tests {
             transparent_inline_edge_precedes_visual_content(&item, ResolvedBidiDirection::Rtl),
             Some(false)
         );
+    }
+
+    #[test]
+    fn structural_positioning_markers_are_not_bidi_replacement_objects() {
+        let style = ComputedStyle::initial();
+        let atom = |content| {
+            InlineAtom::new(
+                content,
+                style.clone(),
+                None,
+                InlineSize::new(0.0, style.line_height),
+                style.font_size,
+                0.0,
+                None,
+                None,
+            )
+        };
+        let edge = atom(InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(
+            InlineBoxEdgeFragment {
+                logical_edge: InlineLogicalEdge::Start,
+                physical_side: PhysicalSide::Left,
+                positioning_containing_block_id: Some(InlinePositioningContainingBlockId(3)),
+                advance: 0.0,
+                paint_extent: 0.0,
+            },
+        )));
+        let hypothetical = atom(InlineAtomContent::StaticPositionHypothetical {
+            source: InlineStaticPositionSourceId::Block,
+            boundary: StaticPositionHypotheticalBoundary::Transparent,
+        });
+        let canvas = atom(InlineAtomContent::Canvas);
+
+        assert!(!mixed_inline_atom_participates_in_bidi_ordering(&edge));
+        assert!(!mixed_inline_atom_participates_in_bidi_ordering(
+            &hypothetical
+        ));
+        assert!(mixed_inline_atom_participates_in_bidi_ordering(&canvas));
     }
 }

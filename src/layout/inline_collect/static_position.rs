@@ -1,13 +1,16 @@
 use super::*;
 use crate::layout::inline_layout::InlineLineStackCursor;
 
-fn static_position_placeholder_has_marker(
+fn static_position_hypothetical_has_source(
     content: &InlineAtomContent,
-    marker: InlineStaticPositionMarkerId,
+    source: InlineStaticPositionSourceId,
 ) -> bool {
     matches!(
         content,
-        InlineAtomContent::StaticPositionPlaceholder(candidate) if *candidate == marker
+        InlineAtomContent::StaticPositionHypothetical {
+            source: candidate,
+            ..
+        } if *candidate == source
     )
 }
 
@@ -29,6 +32,32 @@ pub(in crate::layout) enum BlockStaticPositionPlaceholderGeometry {
 }
 
 impl BlockStaticPositionPlaceholderGeometry {
+    /// Place a vertical hypothetical margin box at the containing flow's
+    /// logical block-start edge.
+    fn vertical_margin_box_inline_span_at_block_start(
+        self,
+        block_start_x: f32,
+        writing_mode: WritingMode,
+    ) -> PageInlineSpan {
+        let Self::Vertical {
+            physical_margin_box_block_extent,
+        } = self
+        else {
+            unreachable!("a horizontal static placeholder has no physical block span");
+        };
+        let width = physical_margin_box_block_extent.points();
+        let left = match WritingModeAxes::new(writing_mode, Direction::Ltr)
+            .physical_side(LogicalSide::BlockStart)
+        {
+            PhysicalSide::Left => block_start_x,
+            PhysicalSide::Right => block_start_x - width,
+            PhysicalSide::Top | PhysicalSide::Bottom => {
+                unreachable!("a vertical writing mode has a horizontal block axis")
+            }
+        };
+        PageInlineSpan::new(left, width)
+    }
+
     /// Recover the vertical source's physical margin-box span from the
     /// zero-footprint line marker at its logical block-end.
     ///
@@ -247,31 +276,13 @@ impl<'a> LayoutBuilder<'a> {
             .unwrap_or(output.len())
             .min(output.len());
         let preceding_items = &output[..static_position_index];
-        // An inline edge with zero advance is omitted from ordinary line
-        // selection, but its own line-height still separates the split
-        // inline's start fragment from a following block box. Preserve that
-        // replacement extent while selecting the hypothetical block start.
-        // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
-        let zero_advance_edge_line_height = preceding_items
-            .iter()
-            .map(|item| match item {
-                InlineItem::Atom(atom)
-                    if atom.content().is_inline_edge() && atom.size.width.abs() <= f32::EPSILON =>
-                {
-                    Some(atom.size.height)
-                }
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(|heights| heights.into_iter().reduce(f32::max));
         let has_buffered_content = preceding_items.iter().any(|item| match item {
             InlineItem::Word(_) => !inline_item_is_collapsible_space(item),
-            InlineItem::Atom(atom) => {
-                !atom.content().is_inline_edge() || atom.size.width > 0.0 || atom.size.height > 0.0
-            }
-            InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => {
-                false
-            }
+            InlineItem::Atom(atom) => !inline_layout::inline_atom_is_phantom(atom),
+            InlineItem::StaticPositionSourceMarker(_)
+            | InlineItem::Float(_)
+            | InlineItem::PageScopeStart(_)
+            | InlineItem::PageScopeEnd => false,
             // A forced line break has no inline advance, but it does create
             // a line box. Its hypothetical block position is therefore part
             // of the static-position rectangle for a following block-level
@@ -280,7 +291,32 @@ impl<'a> LayoutBuilder<'a> {
             InlineItem::Break(_) => true,
         });
         if !has_buffered_content {
-            return Some(PageTopRect::new(self.content_left, self.cursor_y, 0.0, 0.0));
+            return Some(match block_style.writing_mode {
+                WritingMode::HorizontalTb => {
+                    PageTopRect::new(self.content_left, self.cursor_y, 0.0, 0.0)
+                }
+                WritingMode::VerticalRl
+                | WritingMode::VerticalLr
+                | WritingMode::SidewaysRl
+                | WritingMode::SidewaysLr => {
+                    let axes = WritingModeAxes::new(
+                        block_style.writing_mode,
+                        block_style.used_direction(),
+                    );
+                    let block_start_x = match axes.physical_side(LogicalSide::BlockStart) {
+                        PhysicalSide::Left => self.content_left,
+                        PhysicalSide::Right => self.content_right,
+                        PhysicalSide::Top | PhysicalSide::Bottom => {
+                            unreachable!("a vertical writing mode has a horizontal block axis")
+                        }
+                    };
+                    let span = geometry.vertical_margin_box_inline_span_at_block_start(
+                        block_start_x,
+                        block_style.writing_mode,
+                    );
+                    PageTopRect::new(span.left_x(), self.cursor_y, span.width(), 0.0)
+                }
+            });
         }
         let available_width = self.current_content_logical_inline_size().max(1.0);
         // CSS Positioned Layout removes the abspos from flow, but CSS 2.2
@@ -332,7 +368,7 @@ impl<'a> LayoutBuilder<'a> {
                     matches!(
                         &item.item,
                         InlineLineItem::Atom(atom)
-                            if matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder(_))
+                            if matches!(atom.content(), InlineAtomContent::StaticPositionHypothetical { .. })
                     )
                 })
             });
@@ -343,13 +379,13 @@ impl<'a> LayoutBuilder<'a> {
                 let placeholder_box =
                     self.prepare_inline_line_record(record, context)
                         .and_then(|prepared| {
-                            prepared.paint_items.iter().find_map(|item| {
+                            prepared.find_map_paint_leaf(|item| {
                                 let PreparedInlinePaintItem::Atom(atom) = item else {
                                     return None;
                                 };
                                 matches!(
                                     atom.atom.content(),
-                                    InlineAtomContent::StaticPositionPlaceholder(_)
+                                    InlineAtomContent::StaticPositionHypothetical { .. }
                                 )
                                 .then_some(
                                     match block_style.writing_mode {
@@ -364,13 +400,7 @@ impl<'a> LayoutBuilder<'a> {
                                             // <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height>
                                             PageTopRect::new(
                                                 self.content_left,
-                                                split_boundary_cursor
-                                                    - zero_advance_edge_line_height
-                                                        .map(|height| {
-                                                            (height - block_style.line_height)
-                                                                .max(0.0)
-                                                        })
-                                                        .unwrap_or(0.0),
+                                                split_boundary_cursor,
                                                 0.0,
                                                 0.0,
                                             )
@@ -406,7 +436,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.restore(replay_snapshot);
                 return placeholder_box;
             }
-            stack.advance(record.height());
+            stack.advance(record.block_advance());
         }
         self.restore(replay_snapshot);
         None
@@ -432,7 +462,10 @@ impl<'a> LayoutBuilder<'a> {
         inline_size: f32,
     ) -> InlineAtom {
         InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder(InlineStaticPositionMarkerId::Block),
+            InlineAtomContent::StaticPositionHypothetical {
+                source: InlineStaticPositionSourceId::Block,
+                boundary: StaticPositionHypotheticalBoundary::Transparent,
+            },
             block_style.clone(),
             None,
             InlineSize::new(inline_size.max(0.0), block_style.line_height),
@@ -454,25 +487,24 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         block_style: &ComputedStyle,
-        marker: InlineStaticPositionMarkerId,
-        fallback_static_position_index: Option<usize>,
+        marker: InlineStaticPositionSourceId,
+        allow_standalone_source: bool,
         output: &[InlineItem],
     ) -> StaticPositionCapture {
-        let has_source_marker = output.iter().any(|item| {
-            matches!(item, InlineItem::Atom(atom) if static_position_placeholder_has_marker(atom.content(), marker))
-        });
         let mut hypothetical_items = output.to_vec();
-        let static_position_index = if has_source_marker {
-            // Normal deferred replay consumes the marker inserted by normal
-            // inline collection. The source stream, not replay, owns the
-            // selected-line participant.
-            output.len()
-        } else {
-            // Direct legacy callers have no collected source stream yet.
-            // Keep the old synthetic path as a deliberately narrow fallback.
-            let insertion_index = fallback_static_position_index
-                .unwrap_or(output.len())
-                .min(output.len());
+        let marker_indices = output
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                matches!(item, InlineItem::StaticPositionSourceMarker(candidate) if *candidate == marker)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        debug_assert!(
+            allow_standalone_source || marker_indices.len() == 1,
+            "a collected inline static-position source must have exactly one marker"
+        );
+        let static_position_index = if let Some(&index) = marker_indices.first() {
             let placeholder = self.inline_static_position_placeholder_atom(
                 element,
                 style,
@@ -481,8 +513,23 @@ impl<'a> LayoutBuilder<'a> {
                 table_fragment,
                 marker,
             );
-            hypothetical_items.insert(insertion_index, InlineItem::Atom(Box::new(placeholder)));
-            insertion_index
+            hypothetical_items[index] = InlineItem::Atom(Box::new(placeholder));
+            index
+        } else {
+            assert!(
+                allow_standalone_source,
+                "deferred inline static-position source marker was lost"
+            );
+            let placeholder = self.inline_static_position_placeholder_atom(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                marker,
+            );
+            hypothetical_items.push(InlineItem::Atom(Box::new(placeholder)));
+            output.len()
         };
         let available_width = self.current_content_logical_inline_size().max(1.0);
         log::trace!(
@@ -574,12 +621,14 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-        marker: InlineStaticPositionMarkerId,
+        marker: InlineStaticPositionSourceId,
     ) -> InlineAtom {
         let available_width = (self.content_right - self.content_left).max(style.font_size);
         let mut hypothetical =
             StaticHypotheticalBox::from_positioned(self.style_with_current_viewport_lengths(style));
         let placeholder_style = &mut hypothetical.style;
+        let is_non_atomic_inline_source =
+            !style.abspos_static_source.is_atomic_inline() && !style.display.is_atomic_inline();
         // A static-position rectangle is selected from a hypothetical
         // in-flow box. Its positioning, float, and clear values are reset,
         // while normal-flow margins remain part of the hypothetical box.
@@ -597,6 +646,22 @@ impl<'a> LayoutBuilder<'a> {
             placeholder_style,
             self.current_content_logical_inline_percentage_basis(),
         );
+        if is_non_atomic_inline_source {
+            // A non-atomic out-of-flow inline leaves a source boundary, not
+            // an in-flow shrink-to-fit payload. Its carrier must select the
+            // line at that boundary without migrating across a soft wrap.
+            // Inline-axis margins belong to final positioned layout and are
+            // therefore excluded here as well; retaining them in both places
+            // applies the authored margin twice.
+            // <https://drafts.csswg.org/css-position-3/#static-position>
+            if placeholder_style.writing_mode.has_vertical_lines() {
+                placeholder_style.margin.top = 0.0;
+                placeholder_style.margin.bottom = 0.0;
+            } else {
+                placeholder_style.margin.left = 0.0;
+                placeholder_style.margin.right = 0.0;
+            }
+        }
         let horizontal_non_content = placeholder_style.padding.left
             + placeholder_style.padding.right
             + horizontal_border_width(placeholder_style);
@@ -682,6 +747,13 @@ impl<'a> LayoutBuilder<'a> {
             }
         };
         let mut atom_size = geometry.margin_box_inline_size(placeholder_style);
+        if is_non_atomic_inline_source {
+            if placeholder_style.writing_mode.has_vertical_lines() {
+                atom_size.height = 0.0;
+            } else {
+                atom_size.width = 0.0;
+            }
+        }
         if !placeholder_style.writing_mode.has_vertical_lines() {
             // Inline-axis margins reserve advance, but block-axis margins of
             // an inline-level hypothetical box do not enlarge the line box
@@ -709,7 +781,14 @@ impl<'a> LayoutBuilder<'a> {
         };
 
         InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder(marker),
+            InlineAtomContent::StaticPositionHypothetical {
+                source: marker,
+                boundary: if is_non_atomic_inline_source {
+                    StaticPositionHypotheticalBoundary::Transparent
+                } else {
+                    StaticPositionHypotheticalBoundary::Atomic
+                },
+            },
             placeholder_style.clone(),
             None,
             atom_size,
@@ -723,7 +802,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn inline_static_position_from_placeholder_sequence(
         &mut self,
         element: &Element,
-        marker: InlineStaticPositionMarkerId,
+        marker: InlineStaticPositionSourceId,
         sequence: &inline_layout::InlineLineSequence,
         block_style: &ComputedStyle,
     ) -> Option<StaticPositionCapture> {
@@ -762,7 +841,7 @@ impl<'a> LayoutBuilder<'a> {
                     matches!(
                         &item.item,
                             InlineLineItem::Atom(atom)
-                            if static_position_placeholder_has_marker(atom.content(), marker)
+                            if static_position_hypothetical_has_source(atom.content(), marker)
                     )
                 })
             {
@@ -791,15 +870,18 @@ impl<'a> LayoutBuilder<'a> {
                         // border geometry: leading and font metrics can make
                         // that a different coordinate.
                         let baseline_y = self.cursor_y - prepared.metrics.baseline_offset;
-                        prepared.paint_items.iter().find_map(|item| {
+                        prepared.find_map_paint_leaf(|item| {
                             let PreparedInlinePaintItem::Atom(atom) = item else {
                                 return None;
                             };
                             let horizontal_rtl = !block_style.writing_mode.has_vertical_lines()
                                 && block_style.used_direction() == Direction::Rtl;
+                            let logical_inline_start_margin =
+                                inline_atom_logical_inline_start_margin(&atom.atom, block_style);
                             let logical_inline_start_x = if horizontal_rtl {
                                 atom.border_box.x()
                                     + atom.border_box.width()
+                                    + logical_inline_start_margin
                                     + rtl_placeholder_left_float_width.unwrap_or(0.0)
                             } else {
                                 // The inline static-position rectangle is
@@ -811,6 +893,7 @@ impl<'a> LayoutBuilder<'a> {
                                 // apply inline-start non-content twice.
                                 // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
                                 atom.border_box.x()
+                                    - logical_inline_start_margin
                                     - atom.atom.style().padding.left
                                     - used_border_widths(atom.atom.style()).left
                             };
@@ -860,7 +943,7 @@ impl<'a> LayoutBuilder<'a> {
                             } else {
                                 logical_inline_start_x
                             };
-                            let is_static_placeholder = static_position_placeholder_has_marker(
+                            let is_static_placeholder = static_position_hypothetical_has_source(
                                 atom.atom.content(),
                                 marker,
                             );
@@ -957,17 +1040,54 @@ mod tests {
 
     #[test]
     fn static_position_marker_selects_its_source_without_source_order() {
-        let first = InlineStaticPositionMarkerId::Element(crate::dom::ElementId::next());
-        let second = InlineStaticPositionMarkerId::Element(crate::dom::ElementId::next());
+        let first = InlineStaticPositionSourceId::Element {
+            element: crate::dom::ElementId::next(),
+            source: InlineStaticPositionBoxSource::Principal,
+        };
+        let second = InlineStaticPositionSourceId::Element {
+            element: crate::dom::ElementId::next(),
+            source: InlineStaticPositionBoxSource::Principal,
+        };
 
-        assert!(static_position_placeholder_has_marker(
-            &InlineAtomContent::StaticPositionPlaceholder(first),
+        assert!(static_position_hypothetical_has_source(
+            &InlineAtomContent::StaticPositionHypothetical {
+                source: first,
+                boundary: StaticPositionHypotheticalBoundary::Transparent,
+            },
             first,
         ));
-        assert!(!static_position_placeholder_has_marker(
-            &InlineAtomContent::StaticPositionPlaceholder(second),
+        assert!(!static_position_hypothetical_has_source(
+            &InlineAtomContent::StaticPositionHypothetical {
+                source: second,
+                boundary: StaticPositionHypotheticalBoundary::Transparent,
+            },
             first,
         ));
+    }
+
+    #[test]
+    fn static_position_sources_distinguish_principal_and_generated_boxes() {
+        let element = crate::dom::ElementId::next();
+        let principal = InlineStaticPositionSourceId::Element {
+            element,
+            source: InlineStaticPositionBoxSource::Principal,
+        };
+        let before = InlineStaticPositionSourceId::Element {
+            element,
+            source: InlineStaticPositionBoxSource::GeneratedPseudo(
+                box_tree::GeneratedPseudoKind::Before,
+            ),
+        };
+        let after = InlineStaticPositionSourceId::Element {
+            element,
+            source: InlineStaticPositionBoxSource::GeneratedPseudo(
+                box_tree::GeneratedPseudoKind::After,
+            ),
+        };
+
+        assert_ne!(principal, before);
+        assert_ne!(principal, after);
+        assert_ne!(before, after);
     }
 
     #[test]

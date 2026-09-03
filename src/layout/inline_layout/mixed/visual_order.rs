@@ -20,8 +20,8 @@ enum VisualTrackingUnitKind {
 struct VisualTrackingUnit {
     kind: VisualTrackingUnitKind,
     first_item: usize,
-    first_scope: Rc<InlineTrackingScope>,
-    last_scope: Rc<InlineTrackingScope>,
+    first_used_spacing: UsedLetterSpacing,
+    last_used_spacing: UsedLetterSpacing,
     text_allows_gap_before: bool,
     text_allows_gap_after: bool,
     starts_visual_fragment: bool,
@@ -44,10 +44,7 @@ fn apply_visual_tracking_boundary(
     if !permits_gap {
         return;
     }
-    let advance = InlineBoundaryAdvance::between(
-        UsedLetterSpacing::new(left.last_scope.letter_spacing()),
-        UsedLetterSpacing::new(right.first_scope.letter_spacing()),
-    );
+    let advance = InlineBoundaryAdvance::between(left.last_used_spacing, right.first_used_spacing);
     if advance.points() == 0.0 {
         return;
     }
@@ -165,8 +162,14 @@ pub(in crate::layout) struct InlineTextBoxMetrics {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct InlineBaselineExtents {
-    baseline_offset: f32,
-    descent: f32,
+    pub(in crate::layout) baseline_offset: f32,
+    pub(in crate::layout) descent: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct ResolvedTextCombineSquareGeometry {
+    pub(in crate::layout) baseline_extents: InlineBaselineExtents,
+    pub(in crate::layout) paint_placement_baseline_offset: f32,
 }
 
 /// The parent text box's over/under baselines measured from its alphabetic
@@ -178,38 +181,30 @@ pub(in crate::layout) struct InlineBaselineExtents {
 /// line box's leading makes it impossible to accidentally center the square
 /// around the alphabetic baseline instead.
 /// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
-#[derive(Debug, Clone, Copy)]
-struct ParentTextOverUnderBaselines {
-    over_from_alphabetic_baseline: f32,
-    under_from_alphabetic_baseline: f32,
-}
-
-impl ParentTextOverUnderBaselines {
-    fn from_metrics(metrics: InlineTextBoxMetrics) -> Self {
-        Self {
-            over_from_alphabetic_baseline: metrics.content_baseline_offset,
-            under_from_alphabetic_baseline: metrics.content_block_size
-                - metrics.content_baseline_offset,
-        }
-    }
-
+impl TextCombineSquareGeometry {
     /// Return a composition square's signed line extents after aligning its
     /// central baseline to the parent text's central baseline.
-    fn text_combine_upright_square_extents(
+    pub(in crate::layout) fn resolve(
         self,
-        square_block_size: f32,
+        parent_metrics: InlineTextBoxMetrics,
         baseline_shift: f32,
-    ) -> InlineBaselineExtents {
+    ) -> ResolvedTextCombineSquareGeometry {
+        let square_block_size = self.points();
         debug_assert!(square_block_size >= 0.0);
-        let parent_central_baseline_from_alphabetic =
-            (self.over_from_alphabetic_baseline - self.under_from_alphabetic_baseline) / 2.0;
+        let parent_over = parent_metrics.content_baseline_offset;
+        let parent_under = parent_metrics.content_block_size - parent_over;
+        let parent_central_baseline_from_alphabetic = (parent_over - parent_under) / 2.0;
         let composition_baseline_offset =
             parent_central_baseline_from_alphabetic + square_block_size / 2.0;
-        InlineBaselineExtents::from_shifted_baseline_and_block_size(
+        let baseline_extents = InlineBaselineExtents::from_shifted_baseline_and_block_size(
             composition_baseline_offset,
             square_block_size,
             baseline_shift,
-        )
+        );
+        ResolvedTextCombineSquareGeometry {
+            paint_placement_baseline_offset: baseline_extents.baseline_offset,
+            baseline_extents,
+        }
     }
 }
 
@@ -566,6 +561,41 @@ impl<'a> LayoutBuilder<'a> {
                 fragment.mark_starts_visual_fragment();
             }
         }
+        // UAX #9 removes formatting controls and can consequently leave a
+        // zero-width positioned marker inside an empty isolate without a
+        // visual range boundary. Retain that structural marker so provisional
+        // containing-block measurement and final descendant replay use the
+        // same selected line, without introducing a neutral object into bidi
+        // resolution or changing its advance. A non-marker atom is retained
+        // here only when all of its escaped paint already uses page coordinates;
+        // atom-relative replay still requires an exact visual boundary.
+        // <https://www.unicode.org/reports/tr9/#X9>
+        // <https://drafts.csswg.org/css-position-3/#def-cb>
+        for (index, ranged) in ranged_items.iter().enumerate() {
+            if emitted[index] {
+                continue;
+            }
+            let InlineLineItem::Atom(atom) = &ranged.item.item else {
+                continue;
+            };
+            let is_positioning_marker = matches!(
+                atom.content(),
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
+                    if edge.is_positioning_marker()
+            );
+            let retains_page_coordinates = atom.escaped_positioned_layers().is_some_and(|layers| {
+                !layers.is_empty()
+                    && layers.iter().all(|layer| {
+                        matches!(
+                            layer.escaped_atom_replay,
+                            EscapedAtomReplay::RetainPageCoordinates
+                        )
+                    })
+            });
+            if is_positioning_marker || retains_page_coordinates {
+                output.push(ranged.item.clone());
+            }
+        }
         let mut output = if output.is_empty() {
             items
                 .iter()
@@ -863,7 +893,7 @@ impl<'a> LayoutBuilder<'a> {
                     InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
                 ) =>
             {
-                let metrics = self.inline_text_box_metrics(atom.style(), atom.baseline_shift);
+                let metrics = self.inline_text_box_metrics(atom.style(), atom.baseline_shift());
                 if !matches!(atom.style().text_box_trim, TextBoxTrim::None)
                     || !matches!(atom.style().line_fit_edge, LineFitEdge::Leading)
                 {
@@ -875,24 +905,27 @@ impl<'a> LayoutBuilder<'a> {
                     // <https://drafts.csswg.org/css-inline-3/#text-box-trim>
                     self.inline_text_edge_baseline_extents(
                         atom.style(),
-                        atom.baseline_shift,
+                        atom.baseline_shift(),
                         metrics,
                     )
                 } else {
-                    self.inline_style_line_extents(atom.style(), atom.baseline_shift)
+                    self.inline_style_line_extents(atom.style(), atom.baseline_shift())
                 }
             }
             InlineLineItem::Atom(atom)
                 if matches!(atom.content(), InlineAtomContent::TextCombineUpright { .. })
                     && block_style.writing_mode.has_vertical_lines() =>
             {
-                let parent_text_baselines = ParentTextOverUnderBaselines::from_metrics(
-                    self.inline_text_box_metrics(block_style, 0.0),
-                );
-                parent_text_baselines.text_combine_upright_square_extents(
-                    inline_atom_logical_block_size(atom, block_style),
-                    atom.baseline_shift,
-                )
+                let InlineAtomContent::TextCombineUpright { composition } = atom.content() else {
+                    unreachable!("text-combine atom matched above")
+                };
+                composition
+                    .square
+                    .resolve(
+                        self.inline_text_box_metrics(block_style, 0.0),
+                        atom.baseline_shift(),
+                    )
+                    .baseline_extents
             }
             InlineLineItem::Atom(atom) => {
                 Self::inline_atom_line_baseline_extents(atom, block_style)
@@ -1033,7 +1066,7 @@ impl<'a> LayoutBuilder<'a> {
             _ => inline_atom_logical_margin_box_baseline_offset(atom, containing_style).points(),
         };
         InlineBaselineExtents::from_baseline_and_block_size(
-            unshifted_baseline + atom.baseline_shift,
+            unshifted_baseline + atom.baseline_shift(),
             block_size,
         )
     }
@@ -1353,11 +1386,21 @@ pub(in crate::layout) fn apply_visual_tracking_boundaries(items: &mut [MeasuredI
                 fragment
                     .tracking_scope()
                     .cloned()
-                    .map(|scope| VisualTrackingUnit {
+                    .map(|_scope| VisualTrackingUnit {
                         kind: VisualTrackingUnitKind::Text,
                         first_item: item_index,
-                        first_scope: Rc::clone(&scope),
-                        last_scope: scope,
+                        first_used_spacing: UsedLetterSpacing::new(
+                            fragment
+                                .tracking_scope()
+                                .expect("scope was cloned above")
+                                .letter_spacing(),
+                        ),
+                        last_used_spacing: UsedLetterSpacing::new(
+                            fragment
+                                .tracking_scope()
+                                .expect("scope was cloned above")
+                                .letter_spacing(),
+                        ),
                         // A preserved tab's used advance already reaches a
                         // stop whose numeric period includes letter spacing.
                         // It therefore cannot also receive a deferred
@@ -1375,7 +1418,7 @@ pub(in crate::layout) fn apply_visual_tracking_boundaries(items: &mut [MeasuredI
             InlineLineItem::Atom(atom) if inline_atom_is_inter_character_unit(atom) => atom
                 .tracking_scope()
                 .cloned()
-                .map(|scope| VisualTrackingUnit {
+                .map(|_scope| VisualTrackingUnit {
                     // Ruby columns retain the typographic units of their base
                     // text. Unlike replaced/atomic siblings, adjacent columns
                     // therefore do not collapse into one atomic run for
@@ -1389,8 +1432,24 @@ pub(in crate::layout) fn apply_visual_tracking_boundaries(items: &mut [MeasuredI
                         VisualTrackingUnitKind::AtomicRun
                     },
                     first_item: item_index,
-                    first_scope: Rc::clone(&scope),
-                    last_scope: scope,
+                    first_used_spacing: if atom.content().ignores_boundary_letter_spacing() {
+                        UsedLetterSpacing::new(layout_pt(0.0))
+                    } else {
+                        UsedLetterSpacing::new(
+                            atom.tracking_scope()
+                                .expect("scope was cloned above")
+                                .letter_spacing(),
+                        )
+                    },
+                    last_used_spacing: if atom.content().ignores_boundary_letter_spacing() {
+                        UsedLetterSpacing::new(layout_pt(0.0))
+                    } else {
+                        UsedLetterSpacing::new(
+                            atom.tracking_scope()
+                                .expect("scope was cloned above")
+                                .letter_spacing(),
+                        )
+                    },
                     text_allows_gap_before: false,
                     text_allows_gap_after: false,
                     starts_visual_fragment: false,
@@ -1419,7 +1478,7 @@ pub(in crate::layout) fn apply_visual_tracking_boundaries(items: &mut [MeasuredI
             previous_unit
                 .as_mut()
                 .expect("checked atomic run")
-                .last_scope = current.last_scope;
+                .last_used_spacing = current.last_used_spacing;
         } else {
             if let Some(previous) = &previous_unit {
                 apply_visual_tracking_boundary(items, previous, &current);
@@ -1474,6 +1533,38 @@ mod tests {
             None,
             None,
         )
+        .with_synthesized_margin_box_block_end_baseline()
+        .with_tracking_scope(scope)
+    }
+
+    fn tracked_text_combine_atom(
+        style: ComputedStyle,
+        scope: Rc<InlineTrackingScope>,
+    ) -> InlineAtom {
+        InlineAtom::new(
+            InlineAtomContent::TextCombineUpright {
+                composition: Box::new(TextCombineComposition {
+                    source: TextCombineSource {
+                        boundary_text: "12".into(),
+                        style: Box::new(style.clone()),
+                    },
+                    layout: TextCombineLayout {
+                        sequence: InlineLineSequence::default(),
+                        horizontal_style: Box::new(style.clone()),
+                        inline_scale: 1.0,
+                    },
+                    square: TextCombineSquareGeometry::new(layout_pt(20.0)),
+                }),
+            },
+            style,
+            None,
+            InlineSize::new(20.0, 20.0),
+            0.0,
+            0.0,
+            None,
+            None,
+        )
+        .with_text_combine_parent_central_baseline()
         .with_tracking_scope(scope)
     }
 
@@ -1543,6 +1634,29 @@ mod tests {
     }
 
     #[test]
+    fn text_combine_keeps_lexical_scope_but_uses_zero_outgoing_tracking() {
+        let style = tracked_style(10.0);
+        let scope = InlineTrackingScope::root(&style);
+        let mut items = vec![
+            measured_fragment(
+                tracked_fragment("A", style.clone(), Rc::clone(&scope)),
+                10.0,
+            ),
+            MeasuredInlineItem::new(
+                InlineLineItem::Atom(tracked_text_combine_atom(style.clone(), Rc::clone(&scope))),
+                20.0,
+                None,
+            ),
+            measured_fragment(tracked_fragment("B", style, scope), 10.0),
+        ];
+
+        apply_visual_tracking_boundaries(&mut items);
+
+        assert_eq!(items[1].advance.boundary_before().points(), 10.0);
+        assert_eq!(items[2].advance.boundary_before().points(), 0.0);
+    }
+
+    #[test]
     fn positive_baseline_shift_raises_text_extents() {
         let extents = InlineBaselineExtents::from_shifted_baseline_and_block_size(12.0, 20.0, 5.0);
 
@@ -1552,17 +1666,17 @@ mod tests {
 
     #[test]
     fn tcy_square_uses_the_parent_text_central_baseline() {
-        let parent_text_baselines =
-            ParentTextOverUnderBaselines::from_metrics(InlineTextBoxMetrics {
-                content_block_size: 60.0,
-                content_baseline_offset: 48.0,
-                line_block_size: 60.0,
-                block_start_leading: 0.0,
-                block_end_leading: 0.0,
-                line_baseline_offset: 48.0,
-            });
+        let metrics = InlineTextBoxMetrics {
+            content_block_size: 60.0,
+            content_baseline_offset: 48.0,
+            line_block_size: 60.0,
+            block_start_leading: 0.0,
+            block_end_leading: 0.0,
+            line_baseline_offset: 48.0,
+        };
 
-        let extents = parent_text_baselines.text_combine_upright_square_extents(60.0, 0.0);
+        let resolved = TextCombineSquareGeometry::new(layout_pt(60.0)).resolve(metrics, 0.0);
+        let extents = resolved.baseline_extents;
 
         // The parent central baseline lies 18pt above its alphabetic
         // baseline. Aligning a 60pt composition square to it preserves the
@@ -1570,19 +1684,26 @@ mod tests {
         // the line with a symmetric 30pt / 30pt extent.
         assert_eq!(extents.baseline_offset, 48.0);
         assert_eq!(extents.descent, 12.0);
+        assert_eq!(resolved.paint_placement_baseline_offset, 48.0);
     }
 
     #[test]
     fn tcy_square_applies_baseline_shift_after_central_alignment() {
-        let parent_text_baselines = ParentTextOverUnderBaselines {
-            over_from_alphabetic_baseline: 48.0,
-            under_from_alphabetic_baseline: 12.0,
+        let metrics = InlineTextBoxMetrics {
+            content_block_size: 60.0,
+            content_baseline_offset: 48.0,
+            line_block_size: 60.0,
+            block_start_leading: 0.0,
+            block_end_leading: 0.0,
+            line_baseline_offset: 48.0,
         };
 
-        let extents = parent_text_baselines.text_combine_upright_square_extents(60.0, 5.0);
+        let extents = TextCombineSquareGeometry::new(layout_pt(60.0))
+            .resolve(metrics, -7.0)
+            .baseline_extents;
 
-        assert_eq!(extents.baseline_offset, 53.0);
-        assert_eq!(extents.descent, 7.0);
+        assert_eq!(extents.baseline_offset, 41.0);
+        assert_eq!(extents.descent, 19.0);
     }
 
     #[test]
@@ -1953,7 +2074,10 @@ mod tests {
         let style = tracked_style(11.0);
         let scope = InlineTrackingScope::root(&style);
         let transparent = InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder(InlineStaticPositionMarkerId::Block),
+            InlineAtomContent::StaticPositionHypothetical {
+                source: InlineStaticPositionSourceId::Block,
+                boundary: StaticPositionHypotheticalBoundary::Transparent,
+            },
             style.clone(),
             None,
             InlineSize::new(0.0, 0.0),

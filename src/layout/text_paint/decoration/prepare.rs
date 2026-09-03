@@ -416,10 +416,14 @@ pub(in crate::layout) fn apply_inline_fragment_edge_painting(
 pub(in crate::layout) fn inline_fragment_text_summary<F: InlineFragmentAccess>(
     fragments: &[F],
     preserve_leading_summary_space: bool,
+    synthesize_leading_summary_space: bool,
 ) -> String {
     let mut summary = String::new();
     for (index, fragment) in fragments.iter().enumerate() {
-        if index == 0
+        if index == 0 && synthesize_leading_summary_space {
+            summary.push(' ');
+            summary.push_str(fragment.text());
+        } else if index == 0
             && !preserve_leading_summary_space
             && fragment.style().white_space.collapses_spaces()
         {

@@ -459,8 +459,18 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-position-3/#static-position>
         self.inline_static_position = None;
         self.truncate_page_start_margins = false;
+        let atomic_static_position = AtomicInlineStaticPosition::new(
+            PageTopRect::new(
+                inner_x,
+                content_top,
+                inner_width,
+                total_content_height.max(0.0),
+            ),
+            WritingModeAxes::new(style.writing_mode, style.used_direction()),
+        );
+        let atomic_formatting_context_scope =
+            self.begin_atomic_inline_formatting_context(style, atomic_static_position.content_rect);
 
-        let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
         let previous_escaped_atom_positioning_context = self.escaped_atom_positioning_context;
         let previous_block_static_position_y_offset = self.block_static_position_y_offset;
         let previous_absolute_static_position = self.absolute_static_position;
@@ -470,12 +480,10 @@ impl<'a> LayoutBuilder<'a> {
         // inline-block capture.
         // <https://www.w3.org/TR/css-position-3/#static-position-rectangle>
         self.block_static_position_y_offset = Some(0.0);
-        let escaped_atom_static_position =
-            AbsoluteStaticPosition::from_page_rect(inner_x, inner_x + inner_width, content_top);
-        self.absolute_static_position = Some(escaped_atom_static_position);
+        self.absolute_static_position = Some(atomic_static_position.in_atomic_space());
         self.escaped_atom_positioning_context = Some(EscapedAtomPositioningContext {
             actual_containing_block: escaped_atom_actual_containing_block,
-            static_position: escaped_atom_static_position,
+            static_position: atomic_static_position,
         });
         self.escaped_atom_positioning_depth += 1;
 
@@ -489,7 +497,6 @@ impl<'a> LayoutBuilder<'a> {
                     total_content_height + style.padding.top + style.padding.bottom,
                 ));
                 let scope = self.push_positioned_containing_block(mode, containing_block);
-                self.escaped_atom_containing_block = Some(containing_block);
                 Some(scope)
             } else {
                 None
@@ -593,7 +600,7 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(scope) = positioned_containing_block_scope {
             self.pop_positioned_containing_block(scope);
         }
-        self.escaped_atom_containing_block = previous_escaped_atom_containing_block;
+        self.end_atomic_inline_formatting_context(atomic_formatting_context_scope);
         let atom_bounds = PaintClip::from_paint_rect(paint_space_rect(
             0.0,
             top - border_box_height_points,
@@ -644,6 +651,8 @@ impl<'a> LayoutBuilder<'a> {
         // Outer margins still participate only in the parent line's
         // margin-box placement.
         let scratch_border_box_origin = PaintPoint::new(0.0, top - border_box_height_points);
+        let capture_frame =
+            AtomicInlineCaptureFrame::for_scratch_border_box(scratch_border_box_origin);
         fragment = fragment.translated(PaintTranslation::new(
             -scratch_border_box_origin.x,
             -scratch_border_box_origin.y,
@@ -651,11 +660,10 @@ impl<'a> LayoutBuilder<'a> {
         let replay_coordinates = AtomicInlineFragmentReplayCoordinates::border_box_local();
         let escaped_positioned_layers = escaped_positioned_layers
             .into_iter()
-            .map(|layer| {
-                let offset = layer
-                    .escaped_atom_translation
-                    .escape_offset(-scratch_border_box_origin.y);
-                layer.translated(offset)
+            .map(|mut layer| {
+                layer.escaped_atom_replay =
+                    capture_frame.resolve_positioned_replay(layer.escaped_atom_replay);
+                layer
             })
             .collect::<Vec<_>>();
         let escaped_positioned_layers = (!escaped_positioned_layers.is_empty())

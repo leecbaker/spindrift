@@ -86,7 +86,8 @@ pub(in crate::layout) struct SpeculativeLayoutState {
     pub(in crate::layout) grid_positioning_scopes: Vec<grid::GridPositioningScope>,
     pub(in crate::layout) pending_subgrid_contexts: Vec<Option<grid::ResolvedSubgridContext>>,
     pub(in crate::layout) escaped_atom_positioning_depth: usize,
-    pub(in crate::layout) escaped_atom_containing_block: Option<ContainingBlock>,
+    pub(in crate::layout) active_atomic_inline_coordinate_spaces:
+        Vec<AtomicInlineCoordinateSpaceId>,
     pub(in crate::layout) escaped_atom_positioning_context: Option<EscapedAtomPositioningContext>,
     pub(in crate::layout) containing_block_direction: Direction,
     pub(in crate::layout) containing_block_writing_mode: WritingMode,
@@ -107,8 +108,9 @@ pub(in crate::layout) struct SpeculativeLayoutState {
     pub(in crate::layout) layout_pass_kind: LayoutPassKind,
     pub(in crate::layout) execution_purpose: LayoutExecutionPurpose,
     pub(in crate::layout) element_side_effect_suppression_depth: usize,
-    pub(in crate::layout) containing_blocks: Vec<ContainingBlock>,
-    pub(in crate::layout) fixed_containing_blocks: Vec<ContainingBlock>,
+    pub(in crate::layout) positioned_generated_source: Option<InlineStaticPositionSourceId>,
+    pub(in crate::layout) containing_blocks: Vec<PositionedContainingBlockContext>,
+    pub(in crate::layout) fixed_containing_blocks: Vec<PositionedContainingBlockContext>,
     pub(in crate::layout) active_multicol_positioned_containing_block_spans: Vec<u64>,
     pub(in crate::layout) counter_set: CounterSet,
     pub(in crate::layout) counter_plan: CounterPlan,
@@ -326,7 +328,9 @@ impl<'a> LayoutBuilder<'a> {
                 grid_positioning_scopes: self.grid_positioning_scopes.clone(),
                 pending_subgrid_contexts: self.pending_subgrid_contexts.clone(),
                 escaped_atom_positioning_depth: self.escaped_atom_positioning_depth,
-                escaped_atom_containing_block: self.escaped_atom_containing_block,
+                active_atomic_inline_coordinate_spaces: self
+                    .active_atomic_inline_coordinate_spaces
+                    .clone(),
                 escaped_atom_positioning_context: self.escaped_atom_positioning_context,
                 containing_block_direction: self.containing_block_direction,
                 containing_block_writing_mode: self.containing_block_writing_mode,
@@ -351,6 +355,7 @@ impl<'a> LayoutBuilder<'a> {
                 layout_pass_kind: self.layout_pass_kind,
                 execution_purpose: self.execution_purpose,
                 element_side_effect_suppression_depth: self.element_side_effect_suppression_depth,
+                positioned_generated_source: self.positioned_generated_source,
                 containing_blocks: self.containing_blocks.clone(),
                 fixed_containing_blocks: self.fixed_containing_blocks.clone(),
                 active_multicol_positioned_containing_block_spans: self
@@ -478,7 +483,8 @@ impl<'a> LayoutBuilder<'a> {
         self.grid_positioning_scopes = snapshot.grid_positioning_scopes;
         self.pending_subgrid_contexts = snapshot.pending_subgrid_contexts;
         self.escaped_atom_positioning_depth = snapshot.escaped_atom_positioning_depth;
-        self.escaped_atom_containing_block = snapshot.escaped_atom_containing_block;
+        self.active_atomic_inline_coordinate_spaces =
+            snapshot.active_atomic_inline_coordinate_spaces;
         self.escaped_atom_positioning_context = snapshot.escaped_atom_positioning_context;
         self.containing_block_direction = snapshot.containing_block_direction;
         self.containing_block_writing_mode = snapshot.containing_block_writing_mode;
@@ -508,6 +514,7 @@ impl<'a> LayoutBuilder<'a> {
         self.counter_set = snapshot.counter_set;
         self.counter_plan = snapshot.counter_plan;
         self.quote_depth = snapshot.quote_depth;
+        self.positioned_generated_source = snapshot.positioned_generated_source;
         self.current_page_named_strings = snapshot.current_page_named_strings;
         self.current_page_running_elements = snapshot.current_page_running_elements;
         self.next_assignment_id = snapshot.next_assignment_id;

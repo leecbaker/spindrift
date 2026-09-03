@@ -80,7 +80,7 @@ use crate::text::{
     character_is_unicode_mark, character_is_unicode_punctuation, character_is_unicode_symbol,
     character_preserves_word_boundary_context, character_receives_text_emphasis_mark,
     contains_bidi_text, css_text_rendering_text, is_css_collapsible_whitespace,
-    plaintext_direction_for_text, text_with_hyphenation_controls,
+    plaintext_direction_for_text, resolve_bidi_visual_ranges, text_with_hyphenation_controls,
     text_without_bidi_format_controls,
 };
 use crate::timing::DebugTimer;
@@ -91,8 +91,9 @@ use crate::units::{
     PercentageBasis, RasterPixelSize, SemanticLengthExt, atomic_inline_baseline_source_pt,
     atomic_inline_margin_box_baseline_pt, atomic_inline_paint_placement_baseline_pt, border_box_pt,
     border_box_to_content_box_length, content_box_pt, content_box_size_pt,
-    content_box_to_border_box_length, content_box_to_border_box_size, layout_points, layout_pt,
-    margin_box_pt, margin_box_size_pt, non_content_pt,
+    content_box_to_border_box_length, content_box_to_border_box_size,
+    glyph_baseline_displacement_pt, layout_points, layout_pt, margin_box_pt, margin_box_size_pt,
+    non_content_pt,
 };
 
 pub(crate) mod asset_helpers;

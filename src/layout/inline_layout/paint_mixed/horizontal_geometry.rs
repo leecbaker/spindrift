@@ -111,10 +111,10 @@ pub(in crate::layout) fn inline_edge_horizontal_content_y(
     match atom.style().vertical_align.baseline_shift {
         BaselineShift::Top => {
             line_top - metrics.block_start_leading - metrics.content_block_size
-                + atom.baseline_shift
+                + atom.baseline_shift()
         }
         BaselineShift::Bottom => {
-            line_top - line_height + metrics.block_end_leading + atom.baseline_shift
+            line_top - line_height + metrics.block_end_leading + atom.baseline_shift()
         }
         BaselineShift::Center => centered_content_bottom_y(
             line_top,
@@ -122,7 +122,7 @@ pub(in crate::layout) fn inline_edge_horizontal_content_y(
             metrics.content_block_size,
             0.0,
             0.0,
-            atom.baseline_shift,
+            atom.baseline_shift(),
         ),
         BaselineShift::LengthPercentage(_) | BaselineShift::Sub | BaselineShift::Super => {
             match atom.style().vertical_align.alignment_baseline {
@@ -146,7 +146,7 @@ pub(in crate::layout) fn inline_edge_horizontal_content_y(
                     | BaselineMetric::Hanging,
                 ) => {
                     line_top - line_baseline_offset
-                        + atom.baseline_shift
+                        + atom.baseline_shift()
                         + metrics.content_baseline_offset
                         - metrics.content_block_size
                 }
@@ -213,17 +213,28 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
     containing_style: &ComputedStyle,
     placement: InlineAtomHorizontalPlacement,
 ) -> f32 {
+    if atom.line_relative_alignment().is_none()
+        && let InlineAtomContent::TextCombineUpright { composition } = atom.content()
+    {
+        let resolved = composition
+            .square
+            .resolve(placement.parent_metrics, atom.baseline_shift());
+        return placement.line_top - placement.line_baseline_offset
+            + resolved.paint_placement_baseline_offset
+            - placement.content_block_size
+            - placement.line_rendered_baseline_shift;
+    }
     match atom.line_relative_alignment() {
         Some(InlineScopeLineRelativeAlignment::Top) => {
             placement.line_top
                 - inline_atom_logical_block_start_margin(atom, containing_style)
                 - placement.content_block_size
-                + atom.baseline_shift
+                + atom.baseline_shift()
         }
         Some(InlineScopeLineRelativeAlignment::Bottom) => {
             placement.line_top - placement.line_height
                 + inline_atom_logical_block_end_margin(atom, containing_style)
-                + atom.baseline_shift
+                + atom.baseline_shift()
         }
         None => match atom.style().vertical_align.baseline_shift {
             BaselineShift::Center => centered_content_bottom_y(
@@ -232,7 +243,7 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
                 placement.content_block_size,
                 inline_atom_logical_block_start_margin(atom, containing_style),
                 inline_atom_logical_block_end_margin(atom, containing_style),
-                atom.baseline_shift,
+                atom.baseline_shift(),
             ),
             BaselineShift::LengthPercentage(_)
             | BaselineShift::Sub
@@ -268,7 +279,7 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
                     .points();
                     placement.line_top - placement.line_baseline_offset + baseline
                         - placement.content_block_size
-                        + atom.baseline_shift
+                        + atom.baseline_shift()
                         - placement.line_rendered_baseline_shift
                 }
             },
@@ -343,7 +354,8 @@ mod tests {
             0.0,
             None,
             None,
-        );
+        )
+        .with_synthesized_margin_box_block_end_baseline();
         let parent_metrics = InlineTextBoxMetrics {
             content_block_size: 16.0,
             content_baseline_offset: 12.0,

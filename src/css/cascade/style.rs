@@ -791,6 +791,8 @@ fn style_for_element_with_signature_inner(
             .map(inherited_base_style)
             .unwrap_or_else(ComputedStyle::initial)
     };
+    style.longhand_provenance.current_source =
+        u16::try_from(ancestors.len().saturating_add(1)).unwrap_or(u16::MAX);
     style.registered_custom_properties = Arc::new(stylesheets.registered_custom_properties());
     let resolved_language = current
         .attrs
@@ -963,7 +965,7 @@ fn style_for_element_with_signature_inner(
             &mut cascade,
             pseudo_parent_ch_advance,
         );
-        suppress_generated_pseudos_for_html_replaced_control(&mut style, &current);
+        suppress_inapplicable_pseudos_for_html_replaced_control(&mut style, &current);
     }
     finalize_text_decoration_layers(&mut style);
     apply_forced_color_used_values(&mut style, &current, parent, stylesheets);
@@ -2853,19 +2855,20 @@ pub(crate) fn apply_pseudo_rules_with_parent_ch_advance(
 ) {
     let mut cascade = ElementCascadeContext::new(current, stylesheets, ancestors);
     apply_pseudo_rules_with_context(style, stylesheets, &mut cascade, parent_ch_advance);
-    suppress_generated_pseudos_for_html_replaced_control(style, current);
+    suppress_inapplicable_pseudos_for_html_replaced_control(style, current);
 }
 
-/// Suppress generated-content pseudo-elements on HTML controls rendered as
+/// Suppress pseudo-elements that do not apply to HTML controls rendered as
 /// replaced elements.
 ///
 /// HTML's rendering rules treat `input` and `textarea` as replaced for CSS
-/// rendering. CSS Pseudo-Elements therefore suppresses their `::before` and
-/// `::after` boxes, even when selectors and the cascade would otherwise
-/// produce generated content:
+/// rendering. CSS Pseudo-Elements therefore suppresses their generated
+/// `::before`/`::after` boxes, and their internal rendered value is not a
+/// first formatted line of the replaced principal box:
 /// <https://html.spec.whatwg.org/multipage/dom.html#rendering>
 /// <https://drafts.csswg.org/css-pseudo-4/#generated-content>
-fn suppress_generated_pseudos_for_html_replaced_control(
+/// <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+fn suppress_inapplicable_pseudos_for_html_replaced_control(
     style: &mut ComputedStyle,
     current: &ElementSignature,
 ) {
@@ -2874,6 +2877,9 @@ fn suppress_generated_pseudos_for_html_replaced_control(
     if is_html_element && matches!(current.tag.as_str(), "input" | "textarea") {
         style.before_style = None;
         style.after_style = None;
+        style.first_line_style = None;
+        style.first_line_overrides = ModeledLonghandSet::empty();
+        style.first_letter_style = None;
     }
 }
 
@@ -3155,24 +3161,30 @@ fn apply_typographic_pseudo_rules_with_context<'a>(
     cascade: &mut ElementCascadeContext<'a>,
     parent_ch_advance: LayoutLength,
 ) {
-    style.first_line_style = typographic_pseudo_style_with_context(
+    let first_line = typographic_pseudo_style_with_context(
         style,
         stylesheets,
         cascade,
         |stylesheet| &stylesheet.first_line_rules,
         is_first_line_allowed_property,
+        true,
         parent_ch_advance,
-    )
-    .map(Box::new);
+    );
+    style.first_line_overrides = first_line
+        .as_ref()
+        .map(|(_, overrides)| overrides.clone())
+        .unwrap_or_default();
+    style.first_line_style = first_line.map(|(pseudo, _)| Box::new(pseudo));
     style.first_letter_style = typographic_pseudo_style_with_context(
         style,
         stylesheets,
         cascade,
         |stylesheet| &stylesheet.first_letter_rules,
         is_first_letter_allowed_property,
+        false,
         parent_ch_advance,
     )
-    .map(Box::new);
+    .map(|(pseudo, _)| Box::new(pseudo));
 }
 
 fn typographic_pseudo_style_with_context<'a>(
@@ -3181,8 +3193,9 @@ fn typographic_pseudo_style_with_context<'a>(
     cascade: &mut ElementCascadeContext<'a>,
     rule_set: fn(&Stylesheet) -> &[StyleRule],
     allows_property: fn(&str) -> bool,
+    collect_first_line_overrides: bool,
     parent_ch_advance: LayoutLength,
-) -> Option<ComputedStyle> {
+) -> Option<(ComputedStyle, ModeledLonghandSet)> {
     cascade.collect_matching_rules(stylesheets, rule_set);
     if cascade.matching_rules.is_empty() {
         return None;
@@ -3218,10 +3231,23 @@ fn typographic_pseudo_style_with_context<'a>(
         false,
         stylesheets.color_scheme_preference(),
     );
+    let mut overrides = ModeledLonghandSet::empty();
+    if collect_first_line_overrides {
+        // Source ownership is assigned by the ordinary cascade only after
+        // variable substitution, shorthand expansion, CSS-wide resolution,
+        // and logical-to-physical mapping. A pseudo-owned canonical longhand
+        // is therefore exactly a winning, computed first-line overlay entry.
+        for longhand in all_modeled_longhands().filter(|longhand| {
+            longhand.is_first_line_allowed()
+                && !modeled_longhand_has_same_source(&pseudo_style, originating_style, *longhand)
+        }) {
+            overrides.insert(longhand);
+        }
+    }
     pseudo_style
         .quotes
         .resolve_auto_language(originating_style.language.as_deref());
-    Some(pseudo_style)
+    Some((pseudo_style, overrides))
 }
 
 /// CSS Pseudo-Elements 4 restricts `::first-line` to font, color/background,
@@ -3230,41 +3256,15 @@ fn typographic_pseudo_style_with_context<'a>(
 ///
 /// <https://www.w3.org/TR/css-pseudo-4/#first-line-styling>
 fn is_first_line_allowed_property(name: &str) -> bool {
-    name.starts_with("font")
-        || name.starts_with("background")
-        || matches!(
-            name,
-            "color"
-                | "letter-spacing"
-                | "line-height"
-                | "opacity"
-                | "tab-size"
-                | "text-decoration"
-                | "text-decoration-line"
-                | "text-decoration-style"
-                | "text-decoration-color"
-                | "text-decoration-thickness"
-                | "text-decoration-inset"
-                | "text-decoration-skip"
-                | "text-decoration-skip-ink"
-                | "text-decoration-skip-self"
-                | "text-decoration-skip-box"
-                | "text-decoration-skip-spaces"
-                | "text-underline-offset"
-                | "text-underline-position"
-                | "text-emphasis"
-                | "text-emphasis-color"
-                | "text-emphasis-style"
-                | "text-emphasis-position"
-                | "text-emphasis-skip"
-                | "text-shadow"
-                | "text-transform"
-                | "vertical-align"
-                | "word-spacing"
-                | "ruby-position"
-                | "ruby-align"
-                | "ruby-overhang"
-        )
+    ModeledProperty::parse(name).is_some_and(|property| {
+        let mut targets = property
+            .resolve_targets(Direction::Ltr, WritingMode::HorizontalTb)
+            .into_iter();
+        let Some(first) = targets.next() else {
+            return false;
+        };
+        first.is_first_line_allowed() && targets.all(ModeledLonghand::is_first_line_allowed)
+    })
 }
 
 /// CSS Pseudo-Elements 4 restricts `::first-letter` to first-line properties

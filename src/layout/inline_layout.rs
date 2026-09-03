@@ -16,8 +16,9 @@ pub(in crate::layout) use graph::{
     build_inline_opportunity_graph,
 };
 pub(in crate::layout) use items::{
-    InlineLayoutOutcome, InlineLineRecord, InlineLineSequence, InlineLineStackCursor,
-    InlineLineTermination, inline_line_fragment_is_phantom,
+    InlineLayoutOutcome, InlineLineKind, InlineLineRecord, InlineLineSequence,
+    InlineLineStackCursor, InlineLineTermination, inline_atom_is_phantom,
+    inline_line_fragment_is_phantom, inline_line_item_additional_block_extent,
 };
 #[cfg(test)]
 pub(in crate::layout) use mixed::{

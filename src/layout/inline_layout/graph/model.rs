@@ -447,7 +447,7 @@ pub(in crate::layout) enum SelectedLineEndCondition {
 }
 
 impl SelectedLineEndCondition {
-    pub(super) fn pre_wrap_hanging_width(
+    pub(in crate::layout) fn pre_wrap_hanging_width(
         self,
         suffix_width: f32,
         untrimmed_width: f32,
@@ -624,7 +624,7 @@ pub(in crate::layout) fn resolve_materialized_line_leaders(
         let fragment = InlineFragment::new(
             text,
             atom.style().clone(),
-            atom.baseline_shift,
+            atom.baseline_shift(),
             atom.link_target().map(ToOwned::to_owned),
             false,
             InlineTextSource::Normal,

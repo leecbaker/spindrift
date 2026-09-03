@@ -1,9 +1,5 @@
 //! A from-scratch Rust HTML/CSS to PDF renderer inspired by WeasyPrint.
 //!
-//! The public API covers source loading, rendering, PDF serialization, and
-//! read-only semantic inspection of rendered documents. Layout, paint, font,
-//! and PDF-writer records remain crate implementation details.
-//!
 //! # Examples
 //!
 //! ## Convert an HTML file to a PDF

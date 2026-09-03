@@ -9466,6 +9466,93 @@ div > div { margin: .5em; padding: .5em; background: yellow; }
         4,
         "each logical inline float should paint its yellow background"
     );
+    let mut unmatched_yellow_backgrounds = document
+        .pages
+        .iter()
+        .flat_map(|page| page.rects())
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
+        .collect::<Vec<_>>();
+    for label in ["Inline-start", "Inline-end"] {
+        let matching_lines = document
+            .pages
+            .iter()
+            .flat_map(|page| page.lines())
+            .filter(|line| line.text.contains(label))
+            .collect::<Vec<_>>();
+        assert_eq!(matching_lines.len(), 2, "both directions paint {label}");
+        for line in matching_lines {
+            let matching_background = unmatched_yellow_backgrounds
+                .iter()
+                .position(|background| {
+                    line.x() >= background.x() - 0.01
+                        && line.x() <= background.x() + background.width() + 0.01
+                        && line.y() >= background.y() - 0.01
+                        && line.y() <= background.y() + background.height() + 0.01
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label} line origin must lie inside its own unmatched yellow float background: line={line:?}, backgrounds={unmatched_yellow_backgrounds:?}"
+                    )
+                });
+            unmatched_yellow_backgrounds.remove(matching_background);
+        }
+    }
+    assert!(
+        unmatched_yellow_backgrounds.is_empty(),
+        "every yellow float background must own exactly one label"
+    );
+}
+
+#[tokio::test]
+async fn vertical_float_replay_projects_ordinary_and_positioned_contents_once() {
+    for (writing_mode, direction, origin) in [
+        ("vertical-rl", "rtl", "bottom"),
+        ("vertical-lr", "rtl", "bottom"),
+        ("sideways-rl", "rtl", "bottom"),
+        ("sideways-lr", "ltr", "bottom"),
+        ("vertical-rl", "ltr", "top"),
+        ("vertical-lr", "ltr", "top"),
+        ("sideways-rl", "ltr", "top"),
+        ("sideways-lr", "rtl", "top"),
+    ] {
+        let document = Html::from_string(format!(
+            "<style>@page {{ size: 180pt 180pt; margin: 10pt }} html, body {{ margin: 0; writing-mode: {writing_mode}; direction: {direction}; font: 10pt/12pt sans-serif }} .float {{ float: inline-start; position: relative; width: 70pt; height: 60pt; padding: 6pt; background: yellow }} .positioned {{ position: absolute; left: 4pt; bottom: 4pt; width: 8pt; height: 8pt; background: red }}</style><div class=\"float\">Float label<div class=\"positioned\"></div></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let yellow = document.pages[0]
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
+            .expect("float background should paint");
+        let red = document.pages[0]
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+            .expect("positioned float child should paint");
+        let line = document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text.contains("Float label"))
+            .expect("ordinary float text should paint");
+
+        assert!(
+            line.x() >= yellow.x() - 0.01
+                && line.x() <= yellow.x() + yellow.width() + 0.01
+                && line.y() >= yellow.y() - 0.01
+                && line.y() <= yellow.y() + yellow.height() + 0.01,
+            "ordinary {origin}-origin {writing_mode} {direction} float content must share the projected background: yellow={yellow:?}, line={line:?}"
+        );
+        assert!(
+            red.x() >= yellow.x() - 0.01
+                && red.x() + red.width() <= yellow.x() + yellow.width() + 0.01
+                && red.y() >= yellow.y() - 0.01
+                && red.y() + red.height() <= yellow.y() + yellow.height() + 0.01,
+            "positioned {origin}-origin {writing_mode} {direction} float content must receive the same single projection: yellow={yellow:?}, red={red:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -13211,6 +13298,159 @@ async fn inline_block_explicit_absolute_child_keeps_page_resolved_insets() {
         (green.x() - 15.0).abs() < 0.01,
         "20px page margin should place left:0 at 15pt: {green:?}"
     );
+}
+
+#[tokio::test]
+async fn nested_absolute_children_follow_their_atomic_inline_coordinate_space() {
+    for (writing_mode, direction) in [
+        ("horizontal-tb", "ltr"),
+        ("horizontal-tb", "rtl"),
+        ("sideways-rl", "ltr"),
+        ("sideways-rl", "rtl"),
+        ("sideways-lr", "ltr"),
+        ("sideways-lr", "rtl"),
+    ] {
+        let document = Html::from_string(format!(
+            "<style>\
+             @page {{ size: 320px 240px; margin: 0 }}\
+             body {{ margin: 0; font-size: 0; line-height: 0 }}\
+             .spacer, .atom {{ display: inline-block; vertical-align: top; width: 80px; height: 80px }}\
+             .atom {{ position: relative; writing-mode: {writing_mode}; direction: {direction}; background: blue }}\
+             .parent {{ position: absolute; padding: 7px; margin: 5px; inline-size: auto; text-indent: 11px }}\
+             .child {{ position: absolute; inset-inline-start: 0; inset-block-start: 0; width: 20px; height: 20px }}\
+             .red {{ background: red }} .green {{ background: green }}\
+             </style>\
+             <div class=\"spacer\"></div><div class=\"atom\"><div class=\"parent\"><div class=\"child red\"></div><div class=\"child green\"></div></div></div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let atom = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+            .unwrap();
+        let red = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+            .unwrap();
+        let green = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+            .unwrap();
+        assert!(
+            (red.x() - green.x()).abs() < 0.01 && (red.y() - green.y()).abs() < 0.01,
+            "nested absolute siblings must share their atom-local containing block in {writing_mode} {direction}: red={red:?}, green={green:?}"
+        );
+        assert!(
+            green.x() >= atom.x() - 1.0
+                && green.y() >= atom.y() - 1.0
+                && green.x() + green.width() <= atom.x() + atom.width() + 1.0
+                && green.y() + green.height() <= atom.y() + atom.height() + 1.0,
+            "nested absolute descendants must replay inside their final atom in {writing_mode} {direction}: atom={atom:?}, green={green:?}"
+        );
+    }
+}
+
+async fn atom_owned_parent_and_child_x(
+    atom_display: &str,
+    writing_mode: &str,
+    direction: &str,
+    parent_left: f32,
+    child_left: Option<f32>,
+) -> (f32, f32) {
+    let child_left = child_left
+        .map(|left| format!("left: {left}px;"))
+        .unwrap_or_default();
+    let document = Html::from_string(format!(
+        "<style>\
+         @page {{ size: 320px 240px; margin: 0 }}\
+         body {{ margin: 0; font-size: 0; line-height: 0 }}\
+         .spacer {{ display: inline-block; vertical-align: top; width: 80px; height: 80px }}\
+         .atom {{ display: {atom_display}; vertical-align: top; width: 80px; height: 80px; position: relative; writing-mode: {writing_mode}; direction: {direction}; background: blue }}\
+         .parent {{ position: absolute; left: {parent_left}px; padding: 7px; background: red }}\
+         .child {{ position: absolute; {child_left} width: 20px; height: 20px; background: green }}\
+         </style>\
+         <div class=spacer></div><div class=atom><div class=parent><div class=child></div></div></div>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let page = &document.pages[0];
+    let parent = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .expect("positioned parent background should paint");
+    let child = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+        .expect("positioned child background should paint");
+    (parent.x(), child.x())
+}
+
+#[tokio::test]
+async fn atom_owned_auto_child_preserves_positioned_parent_displacement() {
+    for atom_display in ["inline-block", "inline-flex"] {
+        for (writing_mode, direction) in [
+            ("horizontal-tb", "ltr"),
+            ("horizontal-tb", "rtl"),
+            ("sideways-rl", "ltr"),
+            ("sideways-rl", "rtl"),
+            ("sideways-lr", "ltr"),
+            ("sideways-lr", "rtl"),
+        ] {
+            let (auto_parent_start, auto_child_start) =
+                atom_owned_parent_and_child_x(atom_display, writing_mode, direction, 0.0, None)
+                    .await;
+            let (auto_parent_end, auto_child_end) =
+                atom_owned_parent_and_child_x(atom_display, writing_mode, direction, 20.0, None)
+                    .await;
+            let (explicit_parent_start, explicit_child_start) = atom_owned_parent_and_child_x(
+                atom_display,
+                writing_mode,
+                direction,
+                0.0,
+                Some(0.0),
+            )
+            .await;
+            let (explicit_parent_end, explicit_child_end) = atom_owned_parent_and_child_x(
+                atom_display,
+                writing_mode,
+                direction,
+                20.0,
+                Some(0.0),
+            )
+            .await;
+
+            for (label, parent_delta, child_delta) in [
+                (
+                    "automatic child",
+                    auto_parent_end - auto_parent_start,
+                    auto_child_end - auto_child_start,
+                ),
+                (
+                    "explicit child control",
+                    explicit_parent_end - explicit_parent_start,
+                    explicit_child_end - explicit_child_start,
+                ),
+            ] {
+                assert!(
+                    (parent_delta - 15.0).abs() < 0.01,
+                    "{atom_display} {writing_mode} {direction} {label}: parent delta"
+                );
+                assert!(
+                    (child_delta - parent_delta).abs() < 0.01,
+                    "{atom_display} {writing_mode} {direction} {label} must retain its atom-owned parent's displacement: parent_delta={parent_delta}, child_delta={child_delta}",
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

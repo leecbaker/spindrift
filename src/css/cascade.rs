@@ -42,6 +42,11 @@ pub(in crate::css) use declarations::{
 };
 pub(in crate::css) use properties::is_modeled_property_name;
 use properties::*;
+pub(crate) use properties::{
+    ModeledLonghand, ModeledLonghandSet, copy_modeled_longhand,
+    inherit_modeled_longhand_provenance, mark_modeled_longhand_specified,
+    modeled_longhand_has_same_source,
+};
 pub(crate) use style::{
     SvgPresentationAttributeDeclarations, anonymous_block_style, anonymous_text_style,
     apply_pseudo_rules_with_parent_ch_advance, default_display_is_block_level_for_tag,

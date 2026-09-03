@@ -22,8 +22,17 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         debug_assert!(line.metrics.height.is_finite());
         let decoration_geometries = self.prepared_line_text_decoration_geometries(line);
+        self.paint_prepared_inline_items(&line.paint_items, text_source, &decoration_geometries);
+    }
+
+    fn paint_prepared_inline_items(
+        &mut self,
+        items: &[PreparedInlinePaintItem],
+        text_source: Option<RenderedLineSource>,
+        decoration_geometries: &[TextDecorationOriginLineGeometry],
+    ) {
         let mut phaseable_text_groups = Vec::new();
-        for item in &line.paint_items {
+        for item in items {
             match item {
                 PreparedInlinePaintItem::FragmentBackground(fragment) => {
                     self.paint_inline_fragment_background(
@@ -42,7 +51,7 @@ impl<'a> LayoutBuilder<'a> {
                             self.paint_prepared_inline_text_groups_in_phases(
                                 &phaseable_text_groups,
                                 text_source,
-                                &decoration_geometries,
+                                decoration_geometries,
                             );
                             phaseable_text_groups.clear();
                         }
@@ -50,12 +59,12 @@ impl<'a> LayoutBuilder<'a> {
                             self.paint_prepared_inline_text_group_with_source_and_decoration_geometries(
                                 group,
                                 source,
-                                &decoration_geometries,
+                                decoration_geometries,
                             );
                         } else {
                             self.paint_prepared_inline_text_group_with_decoration_geometries(
                                 group,
-                                &decoration_geometries,
+                                decoration_geometries,
                             );
                         }
                     } else {
@@ -67,11 +76,22 @@ impl<'a> LayoutBuilder<'a> {
                         self.paint_prepared_inline_text_groups_in_phases(
                             &phaseable_text_groups,
                             text_source,
-                            &decoration_geometries,
+                            decoration_geometries,
                         );
                         phaseable_text_groups.clear();
                     }
                     self.paint_prepared_inline_atom(atom);
+                }
+                PreparedInlinePaintItem::Scope(scope) => {
+                    if !phaseable_text_groups.is_empty() {
+                        self.paint_prepared_inline_text_groups_in_phases(
+                            &phaseable_text_groups,
+                            text_source,
+                            decoration_geometries,
+                        );
+                        phaseable_text_groups.clear();
+                    }
+                    self.paint_prepared_inline_scope(scope, text_source, decoration_geometries);
                 }
             }
         }
@@ -79,7 +99,55 @@ impl<'a> LayoutBuilder<'a> {
             self.paint_prepared_inline_text_groups_in_phases(
                 &phaseable_text_groups,
                 text_source,
-                &decoration_geometries,
+                decoration_geometries,
+            );
+        }
+    }
+
+    /// Paint one generated inline-like box as an atomic compositing subtree.
+    ///
+    /// The scope owns already-positioned line fragments, so capture preserves
+    /// their internal paint bands and descendant stacking contexts. Links are
+    /// page annotations rather than graphical content and remain outside the
+    /// opacity group, as required by CSS Color hit-testing semantics.
+    /// <https://drafts.csswg.org/css-pseudo-4/#first-line-styling>
+    /// <https://drafts.csswg.org/css-color-4/#transparency>
+    fn paint_prepared_inline_scope(
+        &mut self,
+        scope: &PreparedInlinePaintScope,
+        text_source: Option<RenderedLineSource>,
+        decoration_geometries: &[TextDecorationOriginLineGeometry],
+    ) {
+        debug_assert_eq!(scope.kind, PreparedInlinePaintScopeKind::FirstLine);
+        debug_assert!(scope.opacity.value() < 1.0);
+        let checkpoint = self.current_page.paint_checkpoint();
+        let source_order = self.next_paint_source_order();
+        self.paint_prepared_inline_items(&scope.items, text_source, decoration_geometries);
+        let mut fragment = self.current_page.take_paint_fragment_since(checkpoint);
+        let bounds = fragment.bounds();
+        let links = std::mem::take(&mut fragment.links);
+        if !fragment.is_empty() {
+            let bounds = bounds.expect("painted first-line scope has finite paint bounds");
+            let context = PaintStackingContext::from_banded_fragment_with_stack_level(
+                StackLevel::Auto,
+                fragment,
+                Vec::new(),
+            )
+            .with_source_order(source_order)
+            .with_effects(PaintEffects {
+                opacity: scope.opacity.value(),
+                ..PaintEffects::default()
+            })
+            .with_bounds(bounds);
+            self.current_page.append_paint_fragment_owned(
+                PaintFragment::from_stacking_context_in_band(PaintBand::Inline, context),
+                PaintTranslation::identity(),
+            );
+        }
+        if !links.is_empty() {
+            self.current_page.append_paint_fragment_owned(
+                PaintFragment::from_primitives(Vec::new(), links),
+                PaintTranslation::identity(),
             );
         }
     }
@@ -101,10 +169,13 @@ impl<'a> LayoutBuilder<'a> {
         line: &PreparedInlineLine,
     ) -> Vec<TextDecorationOriginLineGeometry> {
         let mut geometries: Vec<TextDecorationOriginLineGeometry> = Vec::new();
-        for item in &line.paint_items {
-            let PreparedInlinePaintItem::TextGroup(group) = item else {
-                continue;
-            };
+        let mut text_groups = Vec::new();
+        line.for_each_paint_leaf(|item| {
+            if let PreparedInlinePaintItem::TextGroup(group) = item {
+                text_groups.push(group);
+            }
+        });
+        for group in text_groups {
             // A group can retain its shaped glyph advance while its fitted
             // paint bounds collapse at an inline-fragment boundary. Line
             // decorations still cover that text, so use the shaped advance

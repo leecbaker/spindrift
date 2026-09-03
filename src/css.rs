@@ -10,10 +10,11 @@ mod ua;
 mod values;
 
 pub(crate) use cascade::{
-    ParsedImage, SvgPresentationAttributeDeclarations, anonymous_block_style, anonymous_text_style,
-    apply_declarations, apply_declarations_with_inheritance_source,
-    apply_pseudo_rules_with_parent_ch_advance, declarations_affect_same_property,
-    default_display_is_block_level_for_tag, default_style_for_tag, origin_importance_rank,
+    ModeledLonghandSet, ParsedImage, SvgPresentationAttributeDeclarations, anonymous_block_style,
+    anonymous_text_style, apply_declarations, apply_declarations_with_inheritance_source,
+    apply_pseudo_rules_with_parent_ch_advance, copy_modeled_longhand,
+    declarations_affect_same_property, default_display_is_block_level_for_tag,
+    default_style_for_tag, modeled_longhand_has_same_source, origin_importance_rank,
     parse_background_image, parse_css_image, parse_individual_rotate, parse_individual_scale,
     parse_individual_translate, parse_object_view_box, parse_transform, parse_transform_box,
     parse_transform_origin, style_for_element_with_signature,

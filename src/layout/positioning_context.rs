@@ -18,6 +18,63 @@ pub(in crate::layout) struct ContainingBlock {
     pub(in crate::layout) origin_page_index: Option<usize>,
 }
 
+/// Identity of one atomic inline's temporary paint coordinate space.
+///
+/// Positioned containing blocks established inside the scratch layout retain
+/// this identity even when their rectangles differ from the atomic root.
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks>
+/// <https://drafts.csswg.org/css-position-3/#def-cb>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) struct AtomicInlineCoordinateSpaceId(u64);
+
+impl AtomicInlineCoordinateSpaceId {
+    pub(in crate::layout) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Coordinate space owning positioned containing-block geometry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::layout) enum PositionedCoordinateSpace {
+    #[default]
+    Page,
+    AtomicInline(AtomicInlineCoordinateSpaceId),
+}
+
+/// Positioned containing-block geometry together with its coordinate owner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct PositionedContainingBlockContext {
+    pub(in crate::layout) geometry: ContainingBlock,
+    pub(in crate::layout) coordinate_space: PositionedCoordinateSpace,
+}
+
+impl PositionedContainingBlockContext {
+    pub(in crate::layout) const fn page(geometry: ContainingBlock) -> Self {
+        Self {
+            geometry,
+            coordinate_space: PositionedCoordinateSpace::Page,
+        }
+    }
+
+    pub(in crate::layout) const fn in_space(
+        geometry: ContainingBlock,
+        coordinate_space: PositionedCoordinateSpace,
+    ) -> Self {
+        Self {
+            geometry,
+            coordinate_space,
+        }
+    }
+}
+
+impl std::ops::Deref for PositionedContainingBlockContext {
+    type Target = ContainingBlock;
+
+    fn deref(&self) -> &Self::Target {
+        &self.geometry
+    }
+}
+
 /// Positioning state retained while an atomic inline is laid out on its
 /// temporary page.
 ///
@@ -33,7 +90,89 @@ pub(in crate::layout) struct ContainingBlock {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct EscapedAtomPositioningContext {
     pub(in crate::layout) actual_containing_block: ContainingBlock,
-    pub(in crate::layout) static_position: AbsoluteStaticPosition,
+    pub(in crate::layout) static_position: AtomicInlineStaticPosition,
+}
+
+/// Atom-local source geometry for a hypothetical block-level positioned box.
+///
+/// The physical rectangle belongs to the atomic inline's scratch page, while
+/// its logical start edges belong to the atom's own writing mode. Keeping
+/// those values together prevents an enclosing page flow from retagging an
+/// RTL or sideways static position as horizontal LTR.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+/// <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct AtomicInlineStaticPosition {
+    pub(in crate::layout) content_rect: PageTopRect,
+    pub(in crate::layout) axes: WritingModeAxes,
+}
+
+impl AtomicInlineStaticPosition {
+    pub(in crate::layout) fn new(content_rect: PageTopRect, axes: WritingModeAxes) -> Self {
+        Self { content_rect, axes }
+    }
+
+    fn static_position_rectangle(self) -> StaticPositionRectangle {
+        let area = match self.axes.physical_axis(LogicalAxis::Inline) {
+            PhysicalAxis::Horizontal => PageTopRect::new(
+                self.content_rect.x(),
+                self.content_rect.top_y(),
+                self.content_rect.width(),
+                0.0,
+            ),
+            PhysicalAxis::Vertical => {
+                let x = match self.axes.physical_side(LogicalSide::BlockStart) {
+                    PhysicalSide::Left => self.content_rect.x(),
+                    PhysicalSide::Right => self.content_rect.x() + self.content_rect.width(),
+                    PhysicalSide::Top | PhysicalSide::Bottom => {
+                        unreachable!("a vertical writing mode has a horizontal block axis")
+                    }
+                };
+                PageTopRect::new(
+                    x,
+                    self.content_rect.top_y(),
+                    0.0,
+                    self.content_rect.height(),
+                )
+            }
+        };
+        StaticPositionRectangle {
+            area,
+            writing_mode: self.axes.writing_mode(),
+            direction: self.axes.direction(),
+            justify_items: css::SelfAlignment::NORMAL,
+            align_items: css::SelfAlignment::NORMAL,
+        }
+    }
+
+    pub(in crate::layout) fn in_atomic_space(self) -> AbsoluteStaticPosition {
+        AbsoluteStaticPosition::from_page_rect(
+            self.content_rect.x(),
+            self.content_rect.x() + self.content_rect.width(),
+            self.content_rect.top_y(),
+        )
+        .with_static_position_rectangle(self.static_position_rectangle())
+    }
+
+    pub(in crate::layout) fn in_page_owned_containing_block(
+        self,
+        containing_block: ContainingBlock,
+    ) -> AbsoluteStaticPosition {
+        let horizontal_offset = containing_block.x();
+        let mut rectangle = self.static_position_rectangle();
+        rectangle.area = PageTopRect::new(
+            rectangle.area.x() + horizontal_offset,
+            rectangle.area.top_y(),
+            rectangle.area.width(),
+            rectangle.area.height(),
+        );
+        AbsoluteStaticPosition::from_page_rect(
+            self.content_rect.x() + horizontal_offset,
+            self.content_rect.x() + self.content_rect.width() + horizontal_offset,
+            self.content_rect.top_y(),
+        )
+        .with_static_position_rectangle(rectangle)
+    }
 }
 
 /// Physical content-box geometry of a normal-flow containing block.

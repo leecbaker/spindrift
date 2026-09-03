@@ -105,6 +105,18 @@ fn reverse_full_width_transform_for_text_combine(text: &str) -> String {
         .collect()
 }
 
+fn text_combine_upright_visual_text(text: &str, style: &ComputedStyle) -> String {
+    let bidi_text = if let Some((start, end)) = bidi_control_scope_for_style(style) {
+        format!("{start}{text}{end}")
+    } else {
+        text.to_owned()
+    };
+    resolve_bidi_visual_ranges(&bidi_text, style.direction)
+        .into_iter()
+        .map(|range| text_without_bidi_format_controls(&bidi_text[range.range]).into_owned())
+        .collect()
+}
+
 /// Returns whether two normalized text items may belong to one
 /// `text-combine-upright` composition.
 ///
@@ -140,15 +152,100 @@ fn text_combine_upright_contiguous_word_end(items: &[InlineItem], start: usize) 
     };
 
     let mut end = start + 1;
-    while let Some(InlineItem::Word(next)) = items.get(end) {
-        if !text_combine_upright_words_are_compatible(first_word, next)
-            || text_combine_upright_text_has_bidi_controls(&next.text)
-        {
-            break;
+    loop {
+        match items.get(end) {
+            Some(InlineItem::Word(next)) => {
+                if !text_combine_upright_words_are_compatible(first_word, next)
+                    || text_combine_upright_text_has_bidi_controls(&next.text)
+                {
+                    break;
+                }
+                end += 1;
+            }
+            Some(InlineItem::Break(_))
+                if matches!(items.get(end + 1), Some(InlineItem::Word(next))
+                    if text_combine_upright_words_are_compatible(first_word, next)
+                        && !text_combine_upright_text_has_bidi_controls(&next.text)) =>
+            {
+                // Forced line breaks inside an accepted composition are
+                // ignored by CSS Writing Modes. Absorb the marker only when
+                // compatible text follows so a trailing break remains owned
+                // by the parent formatting context.
+                end += 1;
+            }
+            _ => break,
         }
-        end += 1;
     }
     end
+}
+
+#[derive(Debug, Clone)]
+struct TextCombineCandidate {
+    range: std::ops::Range<usize>,
+    normalized_text: String,
+    source_style: ComputedStyle,
+}
+
+/// Analyze normalized inline structure without mutating it.
+///
+/// Materialization is deliberately separate: intrinsic and final layout call
+/// the same formation entry point, and candidate selection therefore cannot
+/// observe partially replaced atoms from an earlier decision.
+fn analyze_text_combine_upright_candidates(items: &[InlineItem]) -> Vec<TextCombineCandidate> {
+    let mut candidates = Vec::new();
+    let mut bidi_scopes = Vec::<ComputedStyle>::new();
+    let mut index = 0;
+    while index < items.len() {
+        let Some(InlineItem::Word(first_word)) = items.get(index) else {
+            index += 1;
+            continue;
+        };
+        if first_word.source == InlineTextSource::BidiControl {
+            if bidi_scopes.last().is_some_and(|scope| {
+                bidi_control_scope_for_style(scope).is_some_and(|(_, end)| end == first_word.text)
+            }) {
+                bidi_scopes.pop();
+            } else if bidi_control_scope_for_style(&first_word.style)
+                .is_some_and(|(start, _)| start == first_word.text)
+            {
+                bidi_scopes.push(first_word.style.as_ref().clone());
+            }
+            index += 1;
+            continue;
+        }
+        let style = first_word.style.as_ref();
+        if text_combine_upright_text_has_bidi_controls(&first_word.text)
+            || !matches!(
+                style.text_combine_upright,
+                css::TextCombineUpright::All | css::TextCombineUpright::Digits(_)
+            )
+            || !matches!(
+                style.text_layout_policy(),
+                css::TextLayoutPolicy::Vertical(_)
+            )
+        {
+            index += 1;
+            continue;
+        }
+        let end = text_combine_upright_contiguous_word_end(items, index);
+        let source_text = items[index..end]
+            .iter()
+            .filter_map(|item| match item {
+                InlineItem::Word(word) => Some(word.text.as_str()),
+                InlineItem::Break(_) => None,
+                _ => unreachable!("a TCY candidate contains only words and forced breaks"),
+            })
+            .collect::<String>();
+        if let Some(normalized_text) = text_combine_upright_text(&source_text, style) {
+            candidates.push(TextCombineCandidate {
+                range: index..end,
+                normalized_text,
+                source_style: bidi_scopes.last().cloned().unwrap_or_else(|| style.clone()),
+            });
+        }
+        index = end.max(index + 1);
+    }
+    candidates
 }
 
 /// Directional formatting characters are invisible UBA input, not text that
@@ -169,16 +266,20 @@ fn text_combine_upright_text_has_bidi_controls(text: &str) -> bool {
 }
 
 /// Whether an item can create a later in-flow line in the surrounding clamp
-/// stream. Floats and static-position placeholders are source-order layout
-/// participants but do not themselves make a clamp overflow boundary.
+/// stream. Floats, source markers, and temporary static-position hypothetical
+/// boxes are source-order layout participants but do not themselves make a
+/// clamp overflow boundary.
 fn inline_item_can_continue_line_clamp(item: &InlineItem) -> bool {
     match item {
         InlineItem::Word(_) | InlineItem::Break(_) => true,
         InlineItem::Atom(atom) => !matches!(
             atom.content(),
-            InlineAtomContent::StaticPositionPlaceholder(_)
+            InlineAtomContent::StaticPositionHypothetical { .. }
         ),
-        InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => false,
+        InlineItem::StaticPositionSourceMarker(_)
+        | InlineItem::Float(_)
+        | InlineItem::PageScopeStart(_)
+        | InlineItem::PageScopeEnd => false,
     }
 }
 
@@ -646,63 +747,36 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let mut output = Vec::with_capacity(items.len());
         let source_items = std::mem::take(items);
+        let candidates = analyze_text_combine_upright_candidates(&source_items);
+        let mut candidate_index = 0;
         let mut index = 0;
         while index < source_items.len() {
+            let Some(candidate) = candidates
+                .get(candidate_index)
+                .filter(|candidate| candidate.range.start == index)
+            else {
+                output.push(source_items[index].clone());
+                index += 1;
+                continue;
+            };
             let InlineItem::Word(first_word) = &source_items[index] else {
-                output.push(source_items[index].clone());
-                index += 1;
-                continue;
+                unreachable!("a planned TCY candidate starts with text")
             };
-
-            // Bidi controls delimit the source scope that they establish.
-            // They must remain in the UAX #9 input stream even when the
-            // surrounding visible text is eligible for `text-combine-upright`.
-            if text_combine_upright_text_has_bidi_controls(&first_word.text) {
-                output.push(source_items[index].clone());
-                index += 1;
-                continue;
-            }
-
             let style = first_word.style.as_ref();
-            if !matches!(
-                style.text_combine_upright,
-                css::TextCombineUpright::All | css::TextCombineUpright::Digits(_)
-            ) || !matches!(
-                style.text_layout_policy(),
-                css::TextLayoutPolicy::Vertical(_)
-            ) {
-                output.push(source_items[index].clone());
-                index += 1;
-                continue;
-            }
-
-            // Accumulate a scoped normalized text run.  `all` can include
-            // collapsed interior spaces; `digits` is rejected below unless
-            // the complete run is an eligible ASCII digit sequence.
-            let end = text_combine_upright_contiguous_word_end(&source_items, index);
-            let source_text = source_items[index..end]
-                .iter()
-                .map(|item| match item {
-                    InlineItem::Word(word) => word.text.as_str(),
-                    _ => unreachable!("a TCY text run contains only words"),
-                })
-                .collect::<String>();
-
-            let Some(text) = text_combine_upright_text(&source_text, style) else {
-                output.extend(source_items[index..end].iter().cloned());
-                index = end;
-                continue;
-            };
+            let mut source_style = style.clone();
+            source_style.direction = candidate.source_style.direction;
+            source_style.unicode_bidi = candidate.source_style.unicode_bidi;
             // CSS Text's source transformation precedes the text-combine
             // full-width reversal. Apply it once to the composed source,
             // then leave the nested horizontal sequence with already-used
             // text so it cannot transform the run a second time.
             // <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
             // <https://drafts.csswg.org/css-text-3/#text-transform-property>
-            let transformed_text = transform_text(&text, style);
+            let transformed_text = transform_text(&candidate.normalized_text, style);
             let horizontal_text = reverse_full_width_transform_for_text_combine(&transformed_text);
 
             let mut horizontal_style = style.clone();
+            horizontal_style.display = css::Display::INLINE_BLOCK;
             horizontal_style.writing_mode = WritingMode::HorizontalTb;
             horizontal_style.text_orientation = css::TextOrientation::Mixed;
             horizontal_style.text_combine_upright = css::TextCombineUpright::None;
@@ -715,6 +789,12 @@ impl<'a> LayoutBuilder<'a> {
             horizontal_style.line_height_value = css::ComputedLineHeight::Number(1.0);
             horizontal_style.line_height = horizontal_style.font_size;
             horizontal_style.letter_spacing = css::ComputedLengthPercentage::ZERO;
+            // Materialize the source inline's embed/override/isolate controls
+            // explicitly around the nested text, then normalize the nested
+            // root so its unicode-bidi value cannot apply the policy twice.
+            // The retained direction still selects the isolated paragraph's
+            // base direction.
+            horizontal_style.unicode_bidi = css::UnicodeBidi::Normal;
             // Tate-chu-yoko composes its horizontal run in a one-em square.
             // Center the uncompressed run there before the paint-time scale
             // maps an over-wide run back to that same square.
@@ -742,22 +822,26 @@ impl<'a> LayoutBuilder<'a> {
                 .measure_text(&horizontal_text, &horizontal_style)
                 .max(horizontal_style.font_size)
                 .max(1.0);
+            // Resolve the isolated paragraph before it is captured. The
+            // nested line sequence is a retained visual paint subtree, not a
+            // second source paragraph, so feeding the already resolved text
+            // through another RTL root would apply UAX #9 twice.
+            let horizontal_visual_text =
+                text_combine_upright_visual_text(&horizontal_text, &source_style);
+            horizontal_style.direction = Direction::Ltr;
             let horizontal_word = InlineWord {
-                text: horizontal_text,
+                text: horizontal_visual_text,
                 style: inline_style(&horizontal_style),
                 baseline_shift: 0.0,
                 visual_offset: InlineVisualOffset::zero(),
-                // The outer atomic box owns the link rectangle.  Retaining a
-                // second link on the nested line would duplicate annotations.
+                // The outer atomic box owns the link rectangle. Retaining a
+                // second link on the nested line duplicates annotations.
                 link_target: None,
                 mergeable: false,
-                // The nested horizontal sequence is already the used text of
-                // one composition. Generated-content provenance belongs to
-                // the outer atom; retaining it here would make the normal
-                // horizontal line builder apply generated-text source rules a
-                // second time and diverge from an equivalent authored run.
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
+                excluded_positioning_geometry_source: first_word
+                    .excluded_positioning_geometry_source,
                 ancestor_inline_decorations: Rc::clone(&first_word.ancestor_inline_decorations),
             };
             let sequence = self.collect_inline_line_sequence_with_text_box_trim(
@@ -768,29 +852,45 @@ impl<'a> LayoutBuilder<'a> {
                 0.0,
             );
             let em = style.font_size.max(0.0);
-            // A combined composition aligns its one-em square to the parent
-            // inline box's central baseline before `vertical-align` shifts it.
-            // The atom has no margin, so its logical block-start-to-baseline
-            // offset is exactly half of the square's block extent.
-            // <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
-            let baseline_offset = em * 0.5;
+            let mut atom_style = style.clone();
+            // A composition is generated from text, not the principal box of
+            // whichever element supplied that text. Its parent-facing used
+            // style must therefore be inline-level even when the inherited
+            // run begins directly in a block container.
+            atom_style.display = css::Display::INLINE;
             let atom = InlineAtom::new(
                 InlineAtomContent::TextCombineUpright {
-                    sequence,
-                    horizontal_style: Box::new(horizontal_style),
-                    inline_scale: (em / horizontal_width).min(1.0),
+                    composition: Box::new(TextCombineComposition {
+                        source: TextCombineSource {
+                            boundary_text: transformed_text,
+                            style: Box::new(source_style),
+                        },
+                        layout: TextCombineLayout {
+                            sequence,
+                            horizontal_style: Box::new(horizontal_style),
+                            inline_scale: (em / horizontal_width).min(1.0),
+                        },
+                        square: TextCombineSquareGeometry::new(layout_pt(em)),
+                    }),
                 },
-                style.clone(),
+                atom_style,
                 None,
                 InlineSize::new(em, em),
-                baseline_offset,
+                // Text-combine owns a parent-dependent central baseline, so
+                // the generic exported-baseline constructor input is unused.
+                0.0,
+                // This field retains only the authored/source shift. Parent
+                // baseline-table conversion belongs exclusively to the
+                // square geometry resolver once parent metrics are known.
                 first_word.baseline_shift,
                 first_word.link_target.as_deref().map(ToOwned::to_owned),
                 None,
             )
+            .with_text_combine_parent_central_baseline()
             .with_visual_offset(first_word.visual_offset);
             output.push(InlineItem::Atom(Box::new(atom)));
-            index = end;
+            index = candidate.range.end;
+            candidate_index += 1;
         }
         *items = output;
     }
@@ -1527,7 +1627,7 @@ impl<'a> LayoutBuilder<'a> {
             && trim.block_start > 0.0
             && let Some(record) = records
                 .iter_mut()
-                .find(|record| record.fragment.is_some() && !record.is_phantom)
+                .find(|record| record.fragment.is_some() && !record.kind.is_phantom())
         {
             record.block_start_trim = trim.block_start;
         }
@@ -1536,7 +1636,7 @@ impl<'a> LayoutBuilder<'a> {
             && let Some(record) = records
                 .iter_mut()
                 .rev()
-                .find(|record| record.fragment.is_some() && !record.is_phantom)
+                .find(|record| record.fragment.is_some() && !record.kind.is_phantom())
         {
             record.block_end_trim = trim.block_end;
         }
@@ -1667,8 +1767,8 @@ impl<'a> LayoutBuilder<'a> {
             );
             let fragment_records = sequence.fragment_records_for_paint(painted, fragment_count);
             for line in &fragment_records {
-                stack.advance(line.block_before);
-                stack.apply(self);
+                let placement = stack.place_line(line);
+                placement.apply(self);
                 self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
                 let line_top = self.cursor_y;
                 let oversized_page_line = self.active_fragmentainer_kind()
@@ -1731,10 +1831,9 @@ impl<'a> LayoutBuilder<'a> {
                     // Record that occupancy before a following forced break
                     // chooses its destination page context.
                     // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
-                    if !line.is_phantom {
+                    if !line.kind.is_phantom() {
                         self.mark_current_page_flow_content();
                     }
-                    stack.advance(line.height());
                     stack = self.apply_collected_line_clearance(stack, line.clear_after, context);
                 }
             }
@@ -1819,11 +1918,10 @@ impl<'a> LayoutBuilder<'a> {
                     fragment.range.record_count(),
                 );
                 for line in &fragment_records {
-                    stack.advance(line.block_before);
-                    stack.apply(self);
+                    let placement = stack.place_line(line);
+                    placement.apply(self);
                     self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
                     self.paint_collected_inline_line(line, context, None);
-                    stack.advance(line.height());
                 }
             }
 
@@ -1911,8 +2009,8 @@ impl<'a> LayoutBuilder<'a> {
             );
             let fragment_records = sequence.fragment_records_for_paint(painted, fragment_count);
             for line in &fragment_records {
-                stack.advance(line.block_before);
-                stack.apply(self);
+                let placement = stack.place_line(line);
+                placement.apply(self);
                 self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
                 if !marker_painted && !self.outside_marker_anchor_is_pending(marker) {
                     let formatted_line_block_start = PageTopBlockPosition::new(self.cursor_y);
@@ -1940,7 +2038,6 @@ impl<'a> LayoutBuilder<'a> {
                     marker_painted = true;
                 }
                 self.paint_collected_inline_line(line, context, None);
-                stack.advance(line.height());
                 stack = self.apply_collected_line_clearance(stack, line.clear_after, context);
             }
             stack.apply(self);
@@ -2012,11 +2109,11 @@ impl<'a> LayoutBuilder<'a> {
         let mut stack =
             InlineLineStackCursor::new(block_style, saved_left, saved_right, fragment_block_top);
         for line in &fragment_records {
-            stack.advance(line.block_before);
-            let line_top = stack.cursor_y;
+            let placement = stack.place_line(line);
+            let line_top = placement.cursor_y;
             let line_bottom = line_top - line.height();
             if line_top >= slice.bottom && line_bottom <= slice.top {
-                stack.apply(self);
+                placement.apply(self);
                 self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
                 self.paint_collected_inline_line_with_float_policy(
                     line,
@@ -2025,7 +2122,6 @@ impl<'a> LayoutBuilder<'a> {
                     float_policy,
                 );
             }
-            stack.advance(line.height());
         }
         self.content_left = saved_left;
         self.content_right = saved_right;
@@ -2061,13 +2157,12 @@ impl<'a> LayoutBuilder<'a> {
         );
         let fragment_records = sequence.fragment_records_for_paint(0, sequence.records.len());
         for line in &fragment_records {
-            stack.advance(line.block_before);
-            stack.apply(self);
+            let placement = stack.place_line(line);
+            placement.apply(self);
             self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
             if let Some(prepared) = self.prepare_inline_line_record(line, context) {
                 self.paint_prepared_inline_line(&prepared);
             }
-            stack.advance(line.height());
         }
         self.content_left = saved_left;
         self.content_right = saved_right;
@@ -2099,11 +2194,10 @@ impl<'a> LayoutBuilder<'a> {
                     block_line_index: line_index,
                     paragraph_line_index: 0,
                     fragment: None,
-                    is_phantom: false,
+                    kind: InlineLineKind::ForcedEmpty,
                     is_first_formatted_line,
                     is_last_line_in_paragraph: true,
                     termination: terminal_termination,
-                    is_forced_empty: true,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: cursor
                         .starts_after_preserved_segment_break,
@@ -2194,12 +2288,11 @@ impl<'a> LayoutBuilder<'a> {
                 block_line_index: next_line_index,
                 paragraph_line_index: 0,
                 fragment: None,
-                is_phantom: false,
+                kind: InlineLineKind::ForcedEmpty,
                 is_first_formatted_line: context.initial_first_formatted_line
                     && next_line_index == 0,
                 is_last_line_in_paragraph: true,
                 termination: terminal_termination,
-                is_forced_empty: true,
                 used_bidi_base_direction: None,
                 starts_after_preserved_segment_break: cursor.starts_after_preserved_segment_break,
                 clear_after: Clear::None,
@@ -2249,14 +2342,13 @@ impl<'a> LayoutBuilder<'a> {
                     block_line_index: next_record_line_index,
                     paragraph_line_index: next_record_line_index - paragraph_start_line_index,
                     fragment: None,
-                    is_phantom: false,
+                    kind: InlineLineKind::ForcedEmpty,
                     is_first_formatted_line: context.initial_first_formatted_line
                         && next_record_line_index == 0,
                     is_last_line_in_paragraph: false,
                     termination: InlineLineTermination::SoftWrap,
                     // Float exclusions can consume a physical line before a
                     // graph range fits the following available float band.
-                    is_forced_empty: true,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: false,
                     clear_after: Clear::None,
@@ -2286,15 +2378,10 @@ impl<'a> LayoutBuilder<'a> {
                 // exclusion geometry; it must not make the originating
                 // collected line record taller than the parent strut.
                 // <https://drafts.csswg.org/css-inline-3/#initial-letter-position>
-                .filter(|item| {
-                    !LayoutBuilder::inline_line_item_is_initial_letter(&item.item)
-                        && matches!(
-                            &item.item,
-                            InlineLineItem::Atom(atom)
-                                if !matches!(atom.content(), InlineAtomContent::InlineEdge(_))
-                        )
+                .filter(|item| !LayoutBuilder::inline_line_item_is_initial_letter(&item.item))
+                .filter_map(|item| {
+                    inline_line_item_additional_block_extent(&item.item, context.block_style)
                 })
-                .map(|item| inline_line_item_logical_block_size(&item.item, context.block_style))
                 .fold(0.0_f32, f32::max);
             let line_height = line_box
                 .metrics
@@ -2303,27 +2390,27 @@ impl<'a> LayoutBuilder<'a> {
                 .max(item_line_height);
             let used_indent = line_box.indent;
             let available_width = line_box.available_width;
-            let is_phantom = inline_line_fragment_is_phantom(&line_box);
+            let preserve_empty_line = force_empty_line && offset + 1 == line_count;
+            let kind = InlineLineKind::for_fragment(&line_box, preserve_empty_line);
             output.push(InlineLineRecord {
                 paragraph_index,
                 block_line_index: line_box_index,
                 paragraph_line_index: line_box_index - paragraph_start_line_index,
                 fragment: Some(line_box.fragment),
-                is_phantom,
+                kind,
                 // A CSS Inline phantom line is not a formatted line. In
                 // particular, edge-only positioning metadata must not
                 // consume `::first-line`, text-indent, or line-clamp state.
                 // <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
                 is_first_formatted_line: context.initial_first_formatted_line
                     && line_box_index == 0
-                    && !is_phantom,
+                    && !kind.is_phantom(),
                 is_last_line_in_paragraph: offset + 1 == line_count,
                 termination: if offset + 1 == line_count {
                     terminal_termination
                 } else {
                     InlineLineTermination::SoftWrap
                 },
-                is_forced_empty: false,
                 used_bidi_base_direction: None,
                 starts_after_preserved_segment_break: offset == 0
                     && cursor.starts_after_preserved_segment_break,
@@ -2382,7 +2469,7 @@ impl<'a> LayoutBuilder<'a> {
         // from that edge is therefore an out-of-flow paint effect, not a
         // reason for the line to acquire height or participate in flow.
         // <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
-        if line.is_phantom
+        if line.kind.is_phantom()
             && !line.has_inline_layout_effects()
             && !line.has_positioned_descendant_replay()
         {
@@ -2537,12 +2624,12 @@ impl<'a> LayoutBuilder<'a> {
         line: &InlineLineRecord,
         block_style: &ComputedStyle,
     ) {
-        if line.is_phantom {
+        if line.kind.is_phantom() {
             return;
         }
         let baseline_offset = if let Some(fragment) = &line.fragment {
             fragment.metrics.baseline_offset
-        } else if line.is_forced_empty {
+        } else if line.kind.is_forced_empty() {
             self.inline_box_text_line_layout_baseline_offset(block_style)
         } else {
             return;
@@ -2557,7 +2644,7 @@ impl<'a> LayoutBuilder<'a> {
             .fragment
             .as_ref()
             .is_some_and(inline_line_fragment_has_principal_content);
-        if !line.is_forced_empty && has_principal_inline_content {
+        if !line.kind.is_forced_empty() && has_principal_inline_content {
             self.anchor_pending_outside_markers_to_in_flow_line(
                 PageTopBlockPosition::new(self.cursor_y),
                 layout_pt(baseline_offset),
@@ -3039,17 +3126,16 @@ mod tests {
         }
     }
 
-    fn line_record(is_phantom: bool, is_forced_empty: bool) -> InlineLineRecord {
+    fn line_record(kind: InlineLineKind) -> InlineLineRecord {
         InlineLineRecord {
             paragraph_index: 0,
             block_line_index: 0,
             paragraph_line_index: 0,
             fragment: None,
-            is_phantom,
+            kind,
             is_first_formatted_line: false,
             is_last_line_in_paragraph: false,
             termination: InlineLineTermination::SoftWrap,
-            is_forced_empty,
             used_bidi_base_direction: None,
             starts_after_preserved_segment_break: false,
             clear_after: Clear::None,
@@ -3066,12 +3152,79 @@ mod tests {
     }
 
     #[test]
+    fn line_stack_placement_applies_block_before_before_capture() {
+        let style = ComputedStyle::initial();
+        let mut line = line_record(InlineLineKind::Normal);
+        line.block_before = 3.0;
+        line.line_height = 10.0;
+        let mut stack = InlineLineStackCursor::new(&style, 100.0, 200.0, 300.0);
+
+        let first = stack.place_line(&line);
+        let second = stack.place_line_with_metrics(0.0, 10.0);
+
+        assert_eq!(first.cursor_y, 297.0);
+        assert_eq!(second.cursor_y, 287.0);
+    }
+
+    #[test]
+    fn line_stack_placement_progresses_once_in_every_physical_block_direction() {
+        let cases = [
+            (
+                WritingMode::HorizontalTb,
+                (100.0, 200.0, 297.0),
+                (100.0, 200.0, 287.0),
+            ),
+            (
+                WritingMode::VerticalRl,
+                (97.0, 197.0, 300.0),
+                (87.0, 187.0, 300.0),
+            ),
+            (
+                WritingMode::VerticalLr,
+                (103.0, 203.0, 300.0),
+                (113.0, 213.0, 300.0),
+            ),
+            (
+                WritingMode::SidewaysRl,
+                (97.0, 197.0, 300.0),
+                (87.0, 187.0, 300.0),
+            ),
+            (
+                WritingMode::SidewaysLr,
+                (103.0, 203.0, 300.0),
+                (113.0, 213.0, 300.0),
+            ),
+        ];
+
+        for (writing_mode, expected_first, expected_second) in cases {
+            let mut style = ComputedStyle::initial();
+            style.writing_mode = writing_mode;
+            let mut stack = InlineLineStackCursor::new(&style, 100.0, 200.0, 300.0);
+            let first = stack.place_line_with_metrics(3.0, 10.0);
+            let second = stack.place_line_with_metrics(0.0, 10.0);
+            assert_eq!(
+                (first.content_left, first.content_right, first.cursor_y),
+                expected_first,
+                "first {writing_mode:?}"
+            );
+            assert_eq!(
+                (second.content_left, second.content_right, second.cursor_y),
+                expected_second,
+                "second {writing_mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn plaintext_direction_finalization_skips_phantom_records() {
         let mut style = ComputedStyle::initial();
         style.unicode_bidi = UnicodeBidi::Plaintext;
         style.direction = Direction::Rtl;
         let mut sequence = InlineLineSequence {
-            records: vec![line_record(true, false), line_record(false, true)],
+            records: vec![
+                line_record(InlineLineKind::Phantom),
+                line_record(InlineLineKind::ForcedEmpty),
+            ],
             ..InlineLineSequence::default()
         };
         let mut preceding = Some(Direction::Ltr);
@@ -3114,7 +3267,10 @@ mod tests {
         let sequence = InlineLineSequence {
             // A collapsed space bracketed by zero-width inline scope markers
             // remains in source order, followed by a real forced empty line.
-            records: vec![line_record(true, false), line_record(false, true)],
+            records: vec![
+                line_record(InlineLineKind::Phantom),
+                line_record(InlineLineKind::ForcedEmpty),
+            ],
             ..InlineLineSequence::default()
         };
 
@@ -3140,7 +3296,10 @@ mod tests {
                 // Collapsed-space-only records remain in source order but do
                 // not create CSS line boxes, even when a vertical intrinsic
                 // size maps those boxes to physical columns.
-                records: vec![line_record(true, false), line_record(false, true)],
+                records: vec![
+                    line_record(InlineLineKind::Phantom),
+                    line_record(InlineLineKind::ForcedEmpty),
+                ],
                 ..InlineLineSequence::default()
             },
             ..InlineIntrinsicMeasurement::default()
@@ -3197,7 +3356,9 @@ mod tests {
 
     fn ordinary_line_sequence(line_count: usize) -> InlineLineSequence {
         InlineLineSequence {
-            records: (0..line_count).map(|_| line_record(false, false)).collect(),
+            records: (0..line_count)
+                .map(|_| line_record(InlineLineKind::Normal))
+                .collect(),
             ..InlineLineSequence::default()
         }
     }
@@ -3610,11 +3771,10 @@ fn clearance_only_inline_line_record(
         block_line_index: cursor.line_index,
         paragraph_line_index: 0,
         fragment: None,
-        is_phantom: false,
+        kind: InlineLineKind::Normal,
         is_first_formatted_line: false,
         is_last_line_in_paragraph: true,
         termination: InlineLineTermination::CollectionBoundary,
-        is_forced_empty: false,
         used_bidi_base_direction: None,
         starts_after_preserved_segment_break: false,
         clear_after: clear,
@@ -3644,6 +3804,28 @@ pub(in crate::layout) struct InlineLineStackCursor {
     cursor_y: f32,
 }
 
+/// The physical placement of one prepared line before paint-time trimming.
+///
+/// Line stacking is resolved once at the layout boundary so ordinary paint
+/// and hypothetical positioned-inline replay cannot implement subtly
+/// different writing-mode progression.
+/// <https://www.w3.org/TR/css-inline-3/#line-box> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct InlineLinePhysicalPlacement {
+    content_left: f32,
+    content_right: f32,
+    pub(in crate::layout) cursor_y: f32,
+}
+
+impl InlineLinePhysicalPlacement {
+    pub(in crate::layout) fn apply(self, layout: &mut LayoutBuilder<'_>) {
+        layout.content_left = self.content_left;
+        layout.content_right = self.content_right;
+        layout.cursor_y = self.cursor_y;
+    }
+}
+
 impl InlineLineStackCursor {
     /// Track line-box stack progression in physical coordinates.
     ///
@@ -3670,6 +3852,30 @@ impl InlineLineStackCursor {
         layout.content_left = self.content_left;
         layout.content_right = self.content_right;
         layout.cursor_y = self.cursor_y;
+    }
+
+    /// Place one line after its preceding block separation, then advance the
+    /// stack to the line's block-end for the next placement.
+    pub(in crate::layout) fn place_line(
+        &mut self,
+        line: &InlineLineRecord,
+    ) -> InlineLinePhysicalPlacement {
+        self.place_line_with_metrics(line.block_before, line.height())
+    }
+
+    fn place_line_with_metrics(
+        &mut self,
+        block_before: f32,
+        line_block_size: f32,
+    ) -> InlineLinePhysicalPlacement {
+        self.advance(block_before);
+        let placement = InlineLinePhysicalPlacement {
+            content_left: self.content_left,
+            content_right: self.content_right,
+            cursor_y: self.cursor_y,
+        };
+        self.advance(line_block_size);
+        placement
     }
 
     pub(in crate::layout) fn advance(&mut self, line_block_size: f32) {
@@ -3705,7 +3911,7 @@ impl InlineLineSequence {
     ) {
         let block_direction = block_style.used_direction();
         for record in &mut self.records {
-            if record.is_phantom {
+            if record.kind.is_phantom() {
                 record.used_bidi_base_direction = None;
                 continue;
             }
@@ -3858,7 +4064,7 @@ impl InlineLineSequence {
     }
 
     pub(in crate::layout) fn has_non_phantom_line(&self) -> bool {
-        self.records.iter().any(|record| !record.is_phantom)
+        self.records.iter().any(|record| !record.kind.is_phantom())
     }
 
     pub(in crate::layout) fn has_flow_effects(&self) -> bool {
@@ -3892,7 +4098,7 @@ impl InlineLineSequence {
     pub(in crate::layout) fn forced_empty_line_count(&self) -> usize {
         self.records
             .iter()
-            .filter(|record| record.is_forced_empty)
+            .filter(|record| record.kind.is_forced_empty())
             .count()
     }
 
@@ -4351,7 +4557,7 @@ impl InlineLineSequence {
             && self.fragment_text_box_trim.block_start > 0.0
             && let Some(record) = records
                 .iter_mut()
-                .find(|record| record.fragment.is_some() && !record.is_phantom)
+                .find(|record| record.fragment.is_some() && !record.kind.is_phantom())
         {
             record.block_start_trim = self.fragment_text_box_trim.block_start;
         }
@@ -4360,7 +4566,7 @@ impl InlineLineSequence {
             && let Some(record) = records
                 .iter_mut()
                 .rev()
-                .find(|record| record.fragment.is_some() && !record.is_phantom)
+                .find(|record| record.fragment.is_some() && !record.kind.is_phantom())
         {
             record.block_end_trim = self.fragment_text_box_trim.block_end;
         }
@@ -4382,9 +4588,9 @@ impl InlineLineSequence {
             && self.fragment_text_box_trim.block_start > 0.0)
             .then(|| {
                 (start_index..end_index).find(|index| {
-                    self.records
-                        .get(*index)
-                        .is_some_and(|record| record.fragment.is_some() && !record.is_phantom)
+                    self.records.get(*index).is_some_and(|record| {
+                        record.fragment.is_some() && !record.kind.is_phantom()
+                    })
                 })
             })
             .flatten();
@@ -4392,9 +4598,9 @@ impl InlineLineSequence {
             && self.fragment_text_box_trim.block_end > 0.0)
             .then(|| {
                 (start_index..end_index).rev().find(|index| {
-                    self.records
-                        .get(*index)
-                        .is_some_and(|record| record.fragment.is_some() && !record.is_phantom)
+                    self.records.get(*index).is_some_and(|record| {
+                        record.fragment.is_some() && !record.kind.is_phantom()
+                    })
                 })
             })
             .flatten();
@@ -4639,13 +4845,12 @@ pub(in crate::layout) struct InlineLineRecord {
     pub(in crate::layout) block_line_index: usize,
     pub(in crate::layout) paragraph_line_index: usize,
     pub(in crate::layout) fragment: Option<InlineLineFragment>,
-    pub(in crate::layout) is_phantom: bool,
+    pub(in crate::layout) kind: InlineLineKind,
     pub(in crate::layout) is_first_formatted_line: bool,
     pub(in crate::layout) is_last_line_in_paragraph: bool,
     /// Why this source line ended. Text fitting distinguishes a forced break
     /// from wrapping, source-block completion, and collection boundaries.
     pub(in crate::layout) termination: InlineLineTermination,
-    pub(in crate::layout) is_forced_empty: bool,
     /// Used inline base direction of this formatted line.
     ///
     /// CSS Text resolves `unicode-bidi: plaintext` per line box: a line with
@@ -4682,6 +4887,44 @@ pub(in crate::layout) struct InlineLineRecord {
         Rc<[crate::layout::text_paint::TextDecorationOriginFragmentGeometry]>,
 }
 
+/// Whether a durable selected row participates in the inline formatting
+/// context and, when it does, whether it contains principal in-flow content.
+///
+/// A line ending at a forced break is an in-flow empty line even when its
+/// selected fragment contains only structural inline-box edges. Keeping these
+/// states mutually exclusive prevents such a line from being both forced
+/// empty and phantom.
+/// <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum InlineLineKind {
+    Normal,
+    ForcedEmpty,
+    Phantom,
+}
+
+impl InlineLineKind {
+    pub(in crate::layout) fn for_fragment(
+        fragment: &InlineLineFragment,
+        preserve_empty_line: bool,
+    ) -> Self {
+        if !inline_line_fragment_is_phantom(fragment) {
+            Self::Normal
+        } else if preserve_empty_line {
+            Self::ForcedEmpty
+        } else {
+            Self::Phantom
+        }
+    }
+
+    pub(in crate::layout) const fn is_phantom(self) -> bool {
+        matches!(self, Self::Phantom)
+    }
+
+    pub(in crate::layout) const fn is_forced_empty(self) -> bool {
+        matches!(self, Self::ForcedEmpty)
+    }
+}
+
 /// Source termination of a durable inline line record.
 ///
 /// `text-fit: per-line` leaves forced-break lines unscaled, while a collected
@@ -4698,6 +4941,11 @@ pub(in crate::layout) enum InlineLineTermination {
 }
 
 impl InlineLineRecord {
+    #[cfg(test)]
+    pub(in crate::layout) const fn is_forced_empty(&self) -> bool {
+        self.kind.is_forced_empty()
+    }
+
     pub(in crate::layout) fn used_block_style<'a>(
         &'a self,
         authored_block_style: &'a ComputedStyle,
@@ -4712,7 +4960,7 @@ impl InlineLineRecord {
     }
 
     pub(in crate::layout) fn height(&self) -> f32 {
-        if self.is_phantom
+        if self.kind.is_phantom()
             && !self
                 .fragment
                 .as_ref()
@@ -4758,7 +5006,7 @@ impl InlineLineRecord {
         // non-phantom when records are collected, so they continue to count.
         // <https://drafts.csswg.org/css-inline/#invisible-line-boxes>
         // <https://www.w3.org/TR/css-break-3/#widows-orphans>
-        !self.is_phantom
+        !self.kind.is_phantom()
     }
 
     /// Whether this line carries an atomic formatting context whose paint was
@@ -4855,12 +5103,12 @@ fn inline_fragment_is_phantom(fragment: &InlineFragment) -> bool {
             && fragment.text().chars().all(is_css_collapsible_whitespace))
 }
 
-fn inline_atom_is_phantom(atom: &InlineAtom) -> bool {
+pub(in crate::layout) fn inline_atom_is_phantom(atom: &InlineAtom) -> bool {
     match atom.content() {
-        InlineAtomContent::StaticPositionPlaceholder(_) => true,
+        InlineAtomContent::StaticPositionHypothetical { .. } => true,
         InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut) => false,
         InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
-            edge.advance.abs() <= 0.001 && edge.paint_extent <= 0.001
+            !edge.contributes_to_line_box()
         }
         InlineAtomContent::InlineEdge(_) => false,
         InlineAtomContent::Leader(_)
@@ -4873,6 +5121,32 @@ fn inline_atom_is_phantom(atom: &InlineAtom) -> bool {
         | InlineAtomContent::Ruby { .. }
         | InlineAtomContent::TextCombineUpright { .. }
         | InlineAtomContent::InlineFragment { .. } => false,
+    }
+}
+
+/// Return the margin-box block extent that an atom contributes beyond the
+/// selected text metrics of its line.
+///
+/// Ordinary atomic inlines carry physical margin-box geometry. An owned inline
+/// box edge instead carries a logical inline advance plus its source style;
+/// when that edge has real margin, border, or padding, the inline box's used
+/// line-height must keep an otherwise edge-only line from collapsing. Keeping
+/// this rule shared by the scalar and mixed line builders prevents hypothetical
+/// static-position replay from inventing a separate height calculation.
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>
+pub(in crate::layout) fn inline_line_item_additional_block_extent(
+    item: &InlineLineItem,
+    block_style: &ComputedStyle,
+) -> Option<f32> {
+    let InlineLineItem::Atom(atom) = item else {
+        return None;
+    };
+    match atom.content() {
+        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => edge
+            .contributes_to_line_box()
+            .then_some(atom.style().line_height),
+        InlineAtomContent::InlineEdge(_) => None,
+        _ => Some(inline_line_item_logical_block_size(item, block_style)),
     }
 }
 
@@ -5038,6 +5312,7 @@ mod text_combine_upright_tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         }
     }
@@ -5066,6 +5341,21 @@ mod text_combine_upright_tests {
         assert_eq!(reverse_full_width_transform_for_text_combine("０"), "０");
         assert_eq!(reverse_full_width_transform_for_text_combine("００"), "00");
         assert_eq!(reverse_full_width_transform_for_text_combine("ＡＢ"), "AB");
+    }
+
+    #[test]
+    fn nested_bidi_paragraph_resolves_intrinsic_rtl_and_override() {
+        let mut override_style = vertical_style(css::TextCombineUpright::All);
+        override_style.direction = Direction::Rtl;
+        override_style.unicode_bidi = css::UnicodeBidi::BidiOverride;
+        assert_eq!(
+            text_combine_upright_visual_text("4321", &override_style),
+            "1234"
+        );
+
+        let mut intrinsic = vertical_style(css::TextCombineUpright::All);
+        intrinsic.direction = Direction::Rtl;
+        assert_eq!(text_combine_upright_visual_text("אבגד", &intrinsic), "דגבא");
     }
 
     #[test]
@@ -5114,6 +5404,27 @@ mod text_combine_upright_tests {
         assert!(!text_combine_upright_words_are_compatible(&first, &linked));
         assert!(text_combine_upright_text_has_bidi_controls("\u{2068}"));
         assert!(!text_combine_upright_text_has_bidi_controls("12"));
+    }
+
+    #[test]
+    fn planner_suppresses_internal_forced_breaks_but_rejects_partial_digits() {
+        let all = vertical_style(css::TextCombineUpright::All);
+        let all_items = vec![
+            InlineItem::Word(Box::new(word("1", &all))),
+            InlineItem::Break(InlineBreak::default()),
+            InlineItem::Word(Box::new(word("2", &all))),
+        ];
+        let candidates = analyze_text_combine_upright_candidates(&all_items);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].range, 0..3);
+        assert_eq!(candidates[0].normalized_text, "12");
+
+        let digits = vertical_style(css::TextCombineUpright::Digits(2));
+        let digits_items = vec![
+            InlineItem::Word(Box::new(word("12", &digits))),
+            InlineItem::Word(Box::new(word("3", &digits))),
+        ];
+        assert!(analyze_text_combine_upright_candidates(&digits_items).is_empty());
     }
 
     #[test]

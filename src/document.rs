@@ -201,7 +201,7 @@ pub enum FontEmbeddingMode {
 ///
 /// # async fn render() -> quire::Result<()> {
 /// let pdf_options = PdfOptions {
-///     profile: PdfProfile::PdfA2B,
+///     profile: PdfProfile::PdfA1B,
 ///     ..PdfOptions::default()
 /// };
 /// let document = Html::from_file("document.html")
@@ -220,26 +220,17 @@ pub enum PdfProfile {
     Pdf,
     /// A PDF/A-1b document.
     PdfA1B,
-    /// A PDF/A-2b document.
-    PdfA2B,
-    /// A PDF/A-3b document.
-    PdfA3B,
-    /// A PDF/A-2u document.
-    PdfA2U,
-    /// A PDF/A-3u document.
-    PdfA3U,
 }
 
 impl PdfProfile {
     /// Returns the PDF version required by this profile.
     ///
     /// ```
-    /// assert_eq!(quire::PdfProfile::PdfA2B.pdf_version(), (1, 7));
+    /// assert_eq!(quire::PdfProfile::PdfA1B.pdf_version(), (1, 4));
     /// ```
     pub const fn pdf_version(self) -> (u8, u8) {
         match self {
             Self::Pdf | Self::PdfA1B => (1, 4),
-            Self::PdfA2B | Self::PdfA3B | Self::PdfA2U | Self::PdfA3U => (1, 7),
         }
     }
 
@@ -259,22 +250,6 @@ impl PdfProfile {
                 part: 1,
                 conformance: "B",
             }),
-            Self::PdfA2B => Some(PdfAIdentification {
-                part: 2,
-                conformance: "B",
-            }),
-            Self::PdfA3B => Some(PdfAIdentification {
-                part: 3,
-                conformance: "B",
-            }),
-            Self::PdfA2U => Some(PdfAIdentification {
-                part: 2,
-                conformance: "U",
-            }),
-            Self::PdfA3U => Some(PdfAIdentification {
-                part: 3,
-                conformance: "U",
-            }),
         }
     }
 }
@@ -284,10 +259,6 @@ impl fmt::Display for PdfProfile {
         formatter.write_str(match self {
             Self::Pdf => "pdf",
             Self::PdfA1B => "pdf/a-1b",
-            Self::PdfA2B => "pdf/a-2b",
-            Self::PdfA3B => "pdf/a-3b",
-            Self::PdfA2U => "pdf/a-2u",
-            Self::PdfA3U => "pdf/a-3u",
         })
     }
 }
@@ -299,12 +270,8 @@ impl FromStr for PdfProfile {
         match value.to_ascii_lowercase().as_str() {
             "pdf" => Ok(Self::Pdf),
             "pdf/a-1b" => Ok(Self::PdfA1B),
-            "pdf/a-2b" => Ok(Self::PdfA2B),
-            "pdf/a-3b" => Ok(Self::PdfA3B),
-            "pdf/a-2u" => Ok(Self::PdfA2U),
-            "pdf/a-3u" => Ok(Self::PdfA3U),
             _ => Err(format!(
-                "unsupported PDF profile {value:?}; expected one of pdf, pdf/a-1b, pdf/a-2b, pdf/a-3b, pdf/a-2u, pdf/a-3u"
+                "unsupported PDF profile {value:?}; expected one of pdf, pdf/a-1b"
             )),
         }
     }

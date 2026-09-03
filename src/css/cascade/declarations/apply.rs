@@ -43,6 +43,7 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
         parent_ch_advance,
     );
     apply_cascaded_color_declarations(style, &declarations, inheritance_source);
+    update_dependency_prepass_provenance(style, &declarations, inheritance_source);
 
     // Font shorthand expansion emits consecutive components with their source
     // cascade metadata intact. Reuse one parsed shorthand for that group.
@@ -99,6 +100,13 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
         };
         if let Some(keyword) = CssWideDefaultKeyword::parse(value) {
             apply_css_wide_default_keyword(style, property, keyword, inheritance_source);
+            for longhand in property.resolve_targets(direction, writing_mode) {
+                if !matches!(keyword, CssWideDefaultKeyword::Inherit)
+                    && !(matches!(keyword, CssWideDefaultKeyword::Unset) && longhand.is_inherited())
+                {
+                    mark_modeled_longhand_specified(style, longhand);
+                }
+            }
             continue;
         }
         if let Some(component) = property.font_component() {
@@ -123,6 +131,7 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
             }
             if let Some((_, font)) = &parsed_font_component {
                 apply_font_shorthand_component(style, component, font);
+                mark_modeled_longhand_specified(style, component);
             }
             continue;
         }
@@ -155,6 +164,9 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
             inheritance_source,
             parent_ch_advance,
         ) {
+            for longhand in property.resolve_targets(direction, writing_mode) {
+                mark_modeled_longhand_specified(style, longhand);
+            }
             continue;
         }
     }
@@ -179,6 +191,66 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
     // <https://drafts.csswg.org/css-viewport/#zoom-property>
     style.effective_zoom =
         EffectiveZoom::from_parent_and_local(inheritance_source.effective_zoom, style.zoom);
+}
+
+fn canonical_longhand(property: &ModeledProperty) -> Option<ModeledLonghand> {
+    match property {
+        ModeledProperty::Longhand(longhand) | ModeledProperty::FontComponent(longhand) => {
+            Some(*longhand)
+        }
+        ModeledProperty::Shorthand(_)
+        | ModeledProperty::Logical(_)
+        | ModeledProperty::Alias(_)
+        | ModeledProperty::All => None,
+    }
+}
+
+fn update_dependency_prepass_provenance(
+    style: &mut ComputedStyle,
+    declarations: &[CascadedDeclaration<'_>],
+    inheritance_source: &ComputedStyle,
+) {
+    for declaration in declarations {
+        let Some(property) = declaration.property.modeled() else {
+            continue;
+        };
+        let Some(longhand) = canonical_longhand(property) else {
+            continue;
+        };
+        if !matches!(
+            longhand,
+            ModeledLonghand::ColorScheme | ModeledLonghand::FontSize | ModeledLonghand::Color
+        ) {
+            continue;
+        }
+        let resolved;
+        let value = if contains_css_variable_reference(&declaration.value) {
+            let Some(value) = resolve_css_variables(&declaration.value, &style.custom_properties)
+            else {
+                inherit_modeled_longhand_provenance(style, inheritance_source, longhand);
+                continue;
+            };
+            resolved = value;
+            trim_css_value(&resolved)
+        } else {
+            trim_css_value(&declaration.value)
+        };
+        if let Some(keyword) = CssWideDefaultKeyword::parse(value) {
+            if matches!(keyword, CssWideDefaultKeyword::Inherit)
+                || (matches!(keyword, CssWideDefaultKeyword::Unset) && longhand.is_inherited())
+            {
+                inherit_modeled_longhand_provenance(style, inheritance_source, longhand);
+            } else {
+                mark_modeled_longhand_specified(style, longhand);
+            }
+        } else if crate::css::parse::cascaded_declaration_is_valid(&declaration.property, value) {
+            mark_modeled_longhand_specified(style, longhand);
+        } else if longhand.is_inherited() {
+            inherit_modeled_longhand_provenance(style, inheritance_source, longhand);
+        } else {
+            mark_modeled_longhand_specified(style, longhand);
+        }
+    }
 }
 
 /// Routes a canonical declaration to its owning feature handler.

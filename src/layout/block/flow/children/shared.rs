@@ -533,7 +533,8 @@ impl<'a> LayoutBuilder<'a> {
         let has_inline_content = items.iter().any(|item| match item {
             InlineItem::Word(_) => !inline_item_is_collapsible_space(item),
             InlineItem::Atom(_) => true,
-            InlineItem::Float(_)
+            InlineItem::StaticPositionSourceMarker(_)
+            | InlineItem::Float(_)
             | InlineItem::Break(_)
             | InlineItem::PageScopeStart(_)
             | InlineItem::PageScopeEnd => false,
@@ -587,7 +588,7 @@ impl<'a> LayoutBuilder<'a> {
                     matches!(
                         &item.item,
                         InlineLineItem::Atom(atom)
-                            if matches!(atom.content(), InlineAtomContent::StaticPositionPlaceholder(_))
+                            if matches!(atom.content(), InlineAtomContent::StaticPositionHypothetical { .. })
                     )
                 })
             }) {

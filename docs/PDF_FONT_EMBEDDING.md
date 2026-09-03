@@ -53,8 +53,8 @@ are subsetted before embedding with `subsetter`.
 ## Conformance Profiles
 
 - The default PDF variant is regular PDF, which uses a PDF 1.4 header and the
-  default font-planning profile. PDF/A-2b is available explicitly through
-  `--pdf-profile pdf/a-2b`.
+  default font-planning profile. PDF/A-1b is available explicitly through
+  `--pdf-profile pdf/a-1b`.
 - The internal font planner has profile hooks for strict PDF, PDF/A, and PDF/UA.
   PDF/A and PDF/UA font plans attach `/CIDSet` streams for subset CIDFonts, but
   tagged PDF structure, output intents, and validator integration are still

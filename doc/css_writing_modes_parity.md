@@ -27,6 +27,13 @@
   while its normal-flow physical position and margins are resolved in the
   containing block's axes; a vertical child of a horizontal block therefore
   remains at the containing block's inline-start edge.
+- Isolated float replay records a typed source and destination border-box
+  origin. Bottom-origin vertical and sideways flows lay out in a stable
+  page-top scratch space, then project the complete ordinary float subtree and
+  any separately captured positioned layers exactly once. Top-origin and
+  horizontal flows replay directly at their destination. Final exclusion
+  geometry comes from the replayed principal border box rather than its paint
+  ink.
 - A different `writing-mode` value from the nearest box-generating ancestor
   promotes a `flow` inner display type to `flow-root`; `display: contents`
   remains inheritance-only and is skipped for that comparison. This covers
@@ -101,6 +108,7 @@ The following local reftests pass with the debug renderer after these changes:
 - `css/css-writing-modes/forms/range-input-vertical-rtl-painting.html`
 - `css/css-break/block-001-wm-vrl-print.html`
 - `css/css-break/block-001-wm-vlr-print.html`
+- `css/css-logical/logical-values-float-clear-4.html`
 
 ## Current table projection
 

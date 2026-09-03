@@ -243,6 +243,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         };
         let second = InlineWord {
@@ -254,6 +255,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         };
 
@@ -856,6 +858,7 @@ pub(in crate::layout) fn push_inline_text_run_with_source(
             mergeable: true,
             source,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         })));
     }
@@ -947,6 +950,7 @@ fn inline_word_is_adjacent_to_source_hanging_edge(
         }
         InlineItem::Word(_)
         | InlineItem::Atom(_)
+        | InlineItem::StaticPositionSourceMarker(_)
         | InlineItem::Float(_)
         | InlineItem::Break(_)
         | InlineItem::PageScopeStart(_)
@@ -1004,6 +1008,8 @@ pub(in crate::layout) struct InlineTextRunMeta {
     pub(in crate::layout) mergeable: bool,
     pub(in crate::layout) source: InlineTextSource,
     pub(in crate::layout) hanging_edges: InlineHangingEdges,
+    pub(in crate::layout) excluded_positioning_geometry_source:
+        Option<InlinePositioningContainingBlockId>,
     pub(in crate::layout) ancestor_inline_decorations: Rc<[InlineAncestorDecoration]>,
 }
 
@@ -1327,6 +1333,7 @@ impl InlineWhitespaceProcessor {
             mergeable: word.mergeable,
             source: word.source,
             hanging_edges: word.hanging_edges,
+            excluded_positioning_geometry_source: word.excluded_positioning_geometry_source,
             ancestor_inline_decorations: word.ancestor_inline_decorations,
         };
         for source_character in word.text.chars() {
@@ -1518,8 +1525,10 @@ impl InlineWhitespaceProcessor {
                     return;
                 }
                 InlineItem::Atom(atom) if atom.content().is_box_edge() => {}
-                InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd | InlineItem::Float(_) => {
-                }
+                InlineItem::StaticPositionSourceMarker(_)
+                | InlineItem::PageScopeStart(_)
+                | InlineItem::PageScopeEnd
+                | InlineItem::Float(_) => {}
                 InlineItem::Word(_) | InlineItem::Break(_) | InlineItem::Atom(_) => return,
             }
         }
@@ -1613,7 +1622,30 @@ impl InlineWhitespaceProcessor {
             && self.output.len() > output_len
             && matches!(self.output.last(), Some(InlineItem::Word(word)) if word.text == " ")
         {
-            let space = self.output.pop().expect("checked trailing space");
+            let mut space = self.output.pop().expect("checked trailing space");
+            // The collapsed sequence began outside this inline, so moving its
+            // surviving space before the start edge must also remove that
+            // inline's positioning-geometry ownership. Retaining the source
+            // id would make the outside space a content edge of a positioned
+            // inline after bidi reordering.
+            // <https://drafts.csswg.org/css-text-3/#white-space-phase-1>
+            // <https://drafts.csswg.org/css-position-3/#def-cb>
+            let crossed_positioning_source = self.output.get(start_edge_index).and_then(|item| {
+                let InlineItem::Atom(atom) = item else {
+                    return None;
+                };
+                let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = atom.content()
+                else {
+                    return None;
+                };
+                (edge.logical_edge == InlineLogicalEdge::Start)
+                    .then_some(edge.positioning_containing_block_id)
+                    .flatten()
+            });
+            if let (Some(source), InlineItem::Word(word)) = (crossed_positioning_source, &mut space)
+            {
+                word.excluded_positioning_geometry_source = Some(source);
+            }
             self.output.insert(start_edge_index, space);
         }
     }
@@ -1666,8 +1698,10 @@ impl InlineWhitespaceProcessor {
                     }
                 }
                 InlineItem::Atom(atom) if atom.content().is_box_edge() => {}
-                InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd | InlineItem::Float(_) => {
-                }
+                InlineItem::StaticPositionSourceMarker(_)
+                | InlineItem::PageScopeStart(_)
+                | InlineItem::PageScopeEnd
+                | InlineItem::Float(_) => {}
                 InlineItem::Break(_) | InlineItem::Atom(_) => return None,
             }
         }
@@ -1690,8 +1724,10 @@ impl InlineWhitespaceProcessor {
                     return word.text.chars().any(character_is_currency_symbol);
                 }
                 InlineItem::Atom(atom) if atom.content().is_box_edge() => {}
-                InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd | InlineItem::Float(_) => {
-                }
+                InlineItem::StaticPositionSourceMarker(_)
+                | InlineItem::PageScopeStart(_)
+                | InlineItem::PageScopeEnd
+                | InlineItem::Float(_) => {}
                 InlineItem::Break(_) | InlineItem::Atom(_) => return false,
             }
         }
@@ -1810,6 +1846,7 @@ impl InlineWhitespaceProcessor {
             mergeable: meta.mergeable,
             source,
             hanging_edges: meta.hanging_edges,
+            excluded_positioning_geometry_source: meta.excluded_positioning_geometry_source,
             ancestor_inline_decorations: Rc::clone(&meta.ancestor_inline_decorations),
         })));
     }
@@ -1842,6 +1879,7 @@ impl InlineWhitespaceProcessor {
         for item in self.output.iter().rev() {
             match item {
                 InlineItem::Atom(atom) if atom.content().is_box_edge() => {}
+                InlineItem::StaticPositionSourceMarker(_) => {}
                 InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => {}
                 // Floats are out of flow in CSS 2.2, so they must not block
                 // CSS Text collapsible whitespace from looking through the

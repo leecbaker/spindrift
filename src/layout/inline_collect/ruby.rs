@@ -43,10 +43,7 @@ impl<'a> LayoutBuilder<'a> {
             if has_base_content {
                 pending_first_letter_style = None;
             }
-            atom.baseline_shift += self
-                .vertical_align_baseline_shift_for_atom(&atom, block_style)
-                .glyph_displacement()
-                .get();
+            atom = self.finish_inline_atom_for_parent(atom, block_style);
             ruby_atoms.push(InlineItem::Atom(Box::new(atom)));
         }
         normalize_ruby_column_group_metrics(&mut ruby_atoms, block_style);
@@ -86,6 +83,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
         let mut base_style = column.base.style.as_deref().unwrap_or(ruby_style).clone();
         base_style.first_line_style = None;
+        base_style.first_line_overrides = css::ModeledLonghandSet::empty();
         base_style.suppress_inapplicable_transform();
         let mut base_items = Vec::new();
         self.collect_inline_box_items(
@@ -137,6 +135,7 @@ impl<'a> LayoutBuilder<'a> {
                 .unwrap_or(ruby_style)
                 .clone();
             annotation_style.first_line_style = None;
+            annotation_style.first_line_overrides = css::ModeledLonghandSet::empty();
             annotation_style.suppress_inapplicable_transform();
             annotation_sides.push(annotation_style.ruby_position.interlinear_side());
             let mut annotation_items = Vec::new();
@@ -380,7 +379,8 @@ pub(super) fn inline_item_has_typographic_content(item: &InlineItem) -> bool {
     match item {
         InlineItem::Word(word) => !word.text.trim().is_empty(),
         InlineItem::Atom(atom) => !atom.content().is_inline_edge(),
-        InlineItem::Float(_)
+        InlineItem::StaticPositionSourceMarker(_)
+        | InlineItem::Float(_)
         | InlineItem::Break(_)
         | InlineItem::PageScopeStart(_)
         | InlineItem::PageScopeEnd => false,
@@ -654,11 +654,19 @@ fn normalize_ruby_column_group_metrics(
             .map(|level| level.block_extent().points())
             .collect();
         atom.size.height = group_block_size;
-        atom.baseline = InlineAtomBaseline::Exported {
+        let atom_writing_mode = atom.style().writing_mode;
+        let border_box_block_size =
+            layout_pt(inline_atom_logical_border_block_size(atom, atom.style()));
+        atom.baseline = InlineAtomBaseline::Physical {
             source: InlineAtomBaselineSource::BorderBox,
-            offset_from_source_box_block_start: atomic_inline_baseline_source_pt(
-                metrics.exported_baseline.points(),
-            ),
+            baselines: crate::layout::baseline::PhysicalBaselineSets::default()
+                .with_first_from_logical_block_start(
+                    block_start_side(atom_writing_mode),
+                    border_box_block_size,
+                    layout_pt(metrics.exported_baseline.points()),
+                    BaselineMetric::Alphabetic,
+                ),
+            missing_axis_synthesis: AtomicInlineBaselineSynthesisSource::MarginBox,
         };
     }
 }

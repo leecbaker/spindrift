@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 use crate::css::cascade::declarations::affected_longhand_names;
 
@@ -30,7 +32,8 @@ macro_rules! define_modeled_longhands {
         /// the copy operation below is regression-tested against every variant.
         /// <https://www.w3.org/TR/css-cascade-5/#value-stages>
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub(in crate::css) enum ModeledLonghand {
+        #[repr(u16)]
+        pub(crate) enum ModeledLonghand {
             $($variant,)*
         }
 
@@ -42,10 +45,58 @@ macro_rules! define_modeled_longhands {
                 }
             }
 
-            pub(in crate::css) const fn css_name(self) -> &'static str {
+            pub(crate) const fn css_name(self) -> &'static str {
                 match self {
                     $(Self::$variant => $name,)*
                 }
+            }
+
+            pub(crate) const fn index(self) -> usize {
+                self as usize
+            }
+
+            /// Whether CSS Pseudo-Elements permits this canonical longhand on
+            /// `::first-line`.
+            ///
+            /// Keeping applicability on the canonical identity makes aliases,
+            /// logical properties, and shorthands converge on the same closed
+            /// property set before layout materializes the pseudo box.
+            /// <https://www.w3.org/TR/css-pseudo-4/#first-line-styling>
+            pub(crate) fn is_first_line_allowed(self) -> bool {
+                let name = self.css_name();
+                name.starts_with("font")
+                    || name.starts_with("background")
+                    || matches!(
+                        name,
+                        "color"
+                            | "letter-spacing"
+                            | "line-height"
+                            | "opacity"
+                            | "tab-size"
+                            | "text-decoration-line"
+                            | "text-decoration-style"
+                            | "text-decoration-color"
+                            | "text-decoration-thickness"
+                            | "text-decoration-inset"
+                            | "text-decoration-skip"
+                            | "text-decoration-skip-ink"
+                            | "text-decoration-skip-self"
+                            | "text-decoration-skip-box"
+                            | "text-decoration-skip-spaces"
+                            | "text-underline-offset"
+                            | "text-underline-position"
+                            | "text-emphasis-color"
+                            | "text-emphasis-style"
+                            | "text-emphasis-position"
+                            | "text-emphasis-skip"
+                            | "text-shadow"
+                            | "text-transform"
+                            | "vertical-align"
+                            | "word-spacing"
+                            | "ruby-position"
+                            | "ruby-align"
+                            | "ruby-overhang"
+                    )
             }
 
             fn copy_from(self, style: &mut ComputedStyle, source: &ComputedStyle) {
@@ -59,6 +110,59 @@ macro_rules! define_modeled_longhands {
             $(ModeledLonghand::$variant,)*
         ];
     };
+}
+
+/// A compact set of canonical computed longhands.
+///
+/// The enum discriminant and this bitset are generated from the same registry,
+/// so a newly modeled property cannot silently fall outside typed pseudo-style
+/// propagation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModeledLonghandSet {
+    words: Arc<[u64]>,
+}
+
+impl ModeledLonghandSet {
+    pub(crate) fn empty() -> Self {
+        Self {
+            words: Arc::default(),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, longhand: ModeledLonghand) {
+        if self.words.len() != ALL_MODELED_LONGHANDS.len().div_ceil(64) {
+            self.words = vec![0; ALL_MODELED_LONGHANDS.len().div_ceil(64)].into();
+        }
+        let index = longhand.index();
+        Arc::make_mut(&mut self.words)[index / 64] |= 1_u64 << (index % 64);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_css_name(&mut self, name: &str) {
+        let longhand = ModeledLonghand::parse(name)
+            .unwrap_or_else(|| panic!("test requested unknown modeled longhand `{name}`"));
+        self.insert(longhand);
+    }
+
+    pub(crate) fn contains(&self, longhand: ModeledLonghand) -> bool {
+        let index = longhand.index();
+        self.words
+            .get(index / 64)
+            .is_some_and(|word| word & (1_u64 << (index % 64)) != 0)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = ModeledLonghand> + '_ {
+        ALL_MODELED_LONGHANDS
+            .iter()
+            .copied()
+            .filter(|longhand| self.contains(*longhand))
+    }
+}
+
+impl Default for ModeledLonghandSet {
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 define_modeled_longhands! {
@@ -668,7 +772,7 @@ pub(in crate::css) fn all_modeled_longhands() -> impl Iterator<Item = ModeledLon
 }
 
 impl ModeledLonghand {
-    pub(in crate::css) fn is_inherited(self) -> bool {
+    pub(crate) fn is_inherited(self) -> bool {
         matches!(
             self.css_name(),
             "border-collapse"
@@ -779,6 +883,9 @@ impl ModeledLonghand {
 /// <https://www.w3.org/TR/css-cascade-5/#inheritance>.
 pub(super) fn inherited_base_style(parent: &ComputedStyle) -> ComputedStyle {
     let mut style = ComputedStyle::initial();
+    style.longhand_provenance.current_source =
+        parent.longhand_provenance.current_source.saturating_add(1);
+    style.longhand_provenance.sources = vec![0; ALL_MODELED_LONGHANDS.len()].into();
     // `zoom` itself is non-inherited, but layout carries its accumulated used
     // scale through each flat-tree descendant. Preserve that layout-only
     // context while the computed longhand remains its initial value.
@@ -811,12 +918,71 @@ pub(super) fn pseudo_inherited_base_style(originating_style: &ComputedStyle) -> 
     style
 }
 
-pub(in crate::css) fn copy_modeled_longhand(
+pub(crate) fn copy_modeled_longhand(
     style: &mut ComputedStyle,
     source: &ComputedStyle,
     longhand: ModeledLonghand,
 ) {
     longhand.copy_from(style, source);
+    ensure_longhand_provenance(style);
+    if let Some(source_owner) = source
+        .longhand_provenance
+        .sources
+        .get(longhand.index())
+        .copied()
+    {
+        Arc::make_mut(&mut style.longhand_provenance.sources)[longhand.index()] = source_owner;
+    }
+}
+
+pub(crate) fn ensure_longhand_provenance(style: &mut ComputedStyle) {
+    if style.longhand_provenance.sources.len() != ALL_MODELED_LONGHANDS.len() {
+        style.longhand_provenance.sources = vec![0; ALL_MODELED_LONGHANDS.len()].into();
+    }
+    if style.longhand_provenance.current_source == 0 {
+        style.longhand_provenance.current_source = 1;
+    }
+}
+
+pub(crate) fn mark_modeled_longhand_specified(
+    style: &mut ComputedStyle,
+    longhand: ModeledLonghand,
+) {
+    ensure_longhand_provenance(style);
+    Arc::make_mut(&mut style.longhand_provenance.sources)[longhand.index()] =
+        style.longhand_provenance.current_source;
+}
+
+pub(crate) fn inherit_modeled_longhand_provenance(
+    style: &mut ComputedStyle,
+    inheritance_source: &ComputedStyle,
+    longhand: ModeledLonghand,
+) {
+    ensure_longhand_provenance(style);
+    Arc::make_mut(&mut style.longhand_provenance.sources)[longhand.index()] = inheritance_source
+        .longhand_provenance
+        .sources
+        .get(longhand.index())
+        .copied()
+        .unwrap_or(0);
+}
+
+pub(crate) fn modeled_longhand_has_same_source(
+    left: &ComputedStyle,
+    right: &ComputedStyle,
+    longhand: ModeledLonghand,
+) -> bool {
+    left.longhand_provenance
+        .sources
+        .get(longhand.index())
+        .copied()
+        .unwrap_or(0)
+        == right
+            .longhand_provenance
+            .sources
+            .get(longhand.index())
+            .copied()
+            .unwrap_or(0)
 }
 
 /// Implements the computed-state contract for each canonical longhand.
@@ -1467,6 +1633,37 @@ mod tests {
             assert_eq!(parsed, longhand);
             copy_modeled_longhand(&mut destination, &source, longhand);
         }
+    }
+
+    #[test]
+    fn every_first_line_longhand_uses_the_exhaustive_computed_style_copier() {
+        let source = ComputedStyle::initial();
+        let mut destination = ComputedStyle::initial();
+        let mut allowed = ModeledLonghandSet::empty();
+
+        for &longhand in ALL_MODELED_LONGHANDS {
+            if longhand.is_first_line_allowed() {
+                allowed.insert(longhand);
+                copy_modeled_longhand(&mut destination, &source, longhand);
+            }
+        }
+
+        for longhand in allowed.iter() {
+            assert!(longhand.is_first_line_allowed(), "{}", longhand.css_name());
+        }
+        for name in [
+            "font-synthesis",
+            "font-synthesis-weight",
+            "font-synthesis-style",
+            "font-synthesis-small-caps",
+            "font-synthesis-position",
+        ] {
+            assert!(
+                allowed.contains(ModeledLonghand::parse(name).expect("modeled font longhand")),
+                "{name}",
+            );
+        }
+        assert!(!allowed.contains(ModeledLonghand::Display));
     }
 
     #[test]

@@ -540,7 +540,7 @@ impl FinalPositionedFragment {
                 source_is_target: stacking.source_is_target,
                 stack_level: stacking.stack_level,
                 links: stacking.links,
-                escaped_atom_translation: stacking.escaped_atom_translation,
+                escaped_atom_replay: stacking.escaped_atom_replay,
             },
         )
     }
@@ -581,6 +581,7 @@ pub(in crate::layout) struct PositionedPaintIdentity {
     pub(in crate::layout) source_element: Option<crate::dom::ElementId>,
     pub(in crate::layout) source_style: ComputedStyle,
     pub(in crate::layout) source_style_identity: usize,
+    pub(in crate::layout) source_box: InlineStaticPositionBoxSource,
 }
 
 /// Page-local stacking data supplied when consuming final positioned paint.
@@ -595,7 +596,7 @@ pub(in crate::layout) struct PositionedStackingMetadata {
     pub(in crate::layout) bounds: PaintClip,
     pub(in crate::layout) child_contexts: Vec<PaintStackingContext>,
     pub(in crate::layout) links: Vec<RenderedLink>,
-    pub(in crate::layout) escaped_atom_translation: EscapedAtomTranslation,
+    pub(in crate::layout) escaped_atom_replay: EscapedAtomReplay,
 }
 
 /// A page-local positioned layer awaiting insertion into one enclosing paint
@@ -611,7 +612,7 @@ struct PageLocalLayerMetadata {
     source_is_target: bool,
     stack_level: StackLevel,
     links: Vec<RenderedLink>,
-    escaped_atom_translation: EscapedAtomTranslation,
+    escaped_atom_replay: EscapedAtomReplay,
 }
 
 impl PendingPageLocalLayer {
@@ -629,12 +630,14 @@ impl PendingPageLocalLayer {
                 source_element: identity.source_element,
                 source_style: identity.source_style,
                 source_style_identity: identity.source_style_identity,
+                source_box: identity.source_box,
                 multicol_fragment_index: None,
                 source_is_target: metadata.source_is_target,
                 stack_level: metadata.stack_level,
                 context,
                 links: metadata.links,
-                escaped_atom_translation: metadata.escaped_atom_translation,
+                escaped_atom_replay: metadata.escaped_atom_replay,
+                overflow_clip_containing_block: None,
             },
         }
     }
@@ -673,6 +676,7 @@ impl PendingPageLocalLayers {
                 source_element: layer.source_element,
                 source_style: layer.source_style,
                 source_style_identity: layer.source_style_identity,
+                source_box: layer.source_box,
             };
             pending.insert(PendingPageLocalLayer::new(
                 destination_page,
@@ -683,7 +687,7 @@ impl PendingPageLocalLayers {
                     source_is_target: layer.source_is_target,
                     stack_level: layer.stack_level,
                     links: layer.links,
-                    escaped_atom_translation: layer.escaped_atom_translation,
+                    escaped_atom_replay: layer.escaped_atom_replay,
                 },
             ));
         }

@@ -1,14 +1,14 @@
 use crate::layout::block::{
-    FloatArea, FloatBandQuery, FloatContour, FloatReplayBlockOriginAdjustment, FlowExclusionKind,
+    FloatArea, FloatBandQuery, FloatContour, FloatReplayProjection, FlowExclusionKind,
     InitialLetterLayout, LogicalFloatPlacement, UsedRoundedRect,
 };
 use crate::layout::{
     Clear, ClearedFloatOuterBlockEnd, Direction, Float, FloatAvoidanceCandidate,
     FloatAvoidanceInlineContainment, FloatBand, FloatBandPlacement, FloatClearanceTarget,
     FloatContext, FloatId, FloatPlacement, FloatPlacementAxes, FloatRunState, FloatShape,
-    HypotheticalClearBorderEdge, LogicalFloatBand, LogicalInlineContentSize, LogicalInlineSpan,
-    PageBlockSpan, PageInlineSpan, PageTopBlockPosition, PageTopPoint, PageTopRect, PhysicalSide,
-    UsedFloatSide, WritingMode, border_box_pt, content_box_pt, margin_box_pt, margin_box_size_pt,
+    HypotheticalClearBorderEdge, LogicalFloatBand, LogicalInlineSpan, PageBlockSpan,
+    PageInlineSpan, PageTopBlockPosition, PageTopPoint, PageTopRect, PaintTranslation,
+    PhysicalSide, UsedFloatSide, WritingMode, border_box_pt, margin_box_pt, margin_box_size_pt,
 };
 use crate::units::SemanticLengthExt;
 
@@ -21,26 +21,44 @@ fn float_axes(writing_mode: WritingMode, direction: Direction) -> FloatPlacement
 }
 
 #[test]
-fn float_replay_origin_adjusts_only_for_bottom_origin_inline_flow() {
-    let logical_inline_size = LogicalInlineContentSize::new(content_box_pt(375.0));
-    let vertical_rtl = FloatReplayBlockOriginAdjustment::for_containing_inline_axis(
+fn float_replay_projects_only_from_bottom_origin_inline_flow() {
+    let destination = PageTopPoint::new(20.0, 300.0);
+    let source = PageTopRect::new(5.0, 450.0, 40.0, 50.0).paint_rect();
+    for axes in [
+        float_axes(WritingMode::VerticalRl, Direction::Rtl),
         float_axes(WritingMode::VerticalLr, Direction::Rtl),
-        top(450.0),
-        logical_inline_size,
-    );
-    assert_eq!(vertical_rtl.paint_translation().y, 75.0);
+        float_axes(WritingMode::SidewaysRl, Direction::Rtl),
+        float_axes(WritingMode::SidewaysLr, Direction::Ltr),
+    ] {
+        let projection = FloatReplayProjection::new(axes, top(450.0), destination);
+        assert_eq!(projection.scratch_border_box_top(), top(450.0));
+        assert_eq!(
+            projection.source_to_destination(source),
+            PaintTranslation::new(15.0, -150.0)
+        );
+        assert_eq!(
+            projection.cursor_source_to_destination(),
+            PaintTranslation::new(0.0, -150.0)
+        );
+    }
 
     for axes in [
         float_axes(WritingMode::HorizontalTb, Direction::Rtl),
+        float_axes(WritingMode::VerticalRl, Direction::Ltr),
         float_axes(WritingMode::VerticalLr, Direction::Ltr),
+        float_axes(WritingMode::SidewaysRl, Direction::Ltr),
         float_axes(WritingMode::SidewaysLr, Direction::Rtl),
     ] {
-        let adjustment = FloatReplayBlockOriginAdjustment::for_containing_inline_axis(
-            axes,
-            top(450.0),
-            logical_inline_size,
+        let projection = FloatReplayProjection::new(axes, top(450.0), destination);
+        assert_eq!(projection.scratch_border_box_top(), top(300.0));
+        assert_eq!(
+            projection.source_to_destination(source),
+            PaintTranslation::identity()
         );
-        assert_eq!(adjustment.paint_translation().y, 0.0);
+        assert_eq!(
+            projection.cursor_source_to_destination(),
+            PaintTranslation::identity()
+        );
     }
 }
 

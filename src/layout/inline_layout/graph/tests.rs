@@ -99,7 +99,7 @@ mod graph_tests {
                             atom.style(),
                         )
                         .points(),
-                        atom.baseline_shift,
+                        atom.baseline_shift(),
                     )),
                     _ => None,
                 },
@@ -883,6 +883,7 @@ mod graph_tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         };
         let mut font_system = FontSystem::new();
@@ -983,6 +984,7 @@ mod graph_tests {
             mergeable: true,
             source: InlineTextSource::BidiControl,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         };
         let mut font_system = FontSystem::new();
@@ -1431,7 +1433,10 @@ mod graph_tests {
     fn first_letter_stream_rejects_text_after_an_atomic_inline() {
         let style = ComputedStyle::initial();
         let atom = InlineAtom::new(
-            InlineAtomContent::StaticPositionPlaceholder(InlineStaticPositionMarkerId::Block),
+            InlineAtomContent::StaticPositionHypothetical {
+                source: InlineStaticPositionSourceId::Block,
+                boundary: StaticPositionHypotheticalBoundary::Transparent,
+            },
             style.clone(),
             None,
             InlineSize::new(0.0, 0.0),

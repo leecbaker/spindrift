@@ -73,12 +73,20 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Inline boxes split around in-flow block descendants preserve positioned
   inline visual effects for the split block segment, including relative offsets
   and integer `z-index` stacking.
-- Inline-level absolutely positioned descendants use a non-painting
-  hypothetical inline placeholder for auto static-position line selection and
-  horizontal placement, so forced breaks, wrapping, and RTL alignment choose
-  the rectangle the box would have occupied in normal flow. Atomic inline
-  sources such as inline-blocks also use the placeholder margin-box top for
-  auto vertical placement, preserving explicit top margins and used heights.
+- Inline-level absolutely positioned descendants retain a typed, zero-advance
+  source marker through inline collection. Deferred replay replaces exactly
+  that marker with a non-painting line-selection carrier, so trimming, bidi,
+  inline edges, and soft wrapping cannot move the anchor to a different source
+  boundary. Non-atomic carriers retain block metrics but have zero inline
+  footprint and remain CSS-Text-transparent; atomic inline sources such as
+  inline-blocks retain their measured hypothetical footprint, ordinary atomic
+  boundary policy, and margin-box top.
+- Principal, `::before`, and `::after` positioned boxes retain distinct owned
+  source identities through deferred sizing, counter scope, final layout, and
+  positioned-paint deduplication. Generated pseudos therefore measure their
+  own generated content instead of rebuilding the originating element's
+  children, and authored inline margins are applied exactly once from the
+  captured margin edge.
 - Direct inline-level positioned children of block flow with active float
   exclusions now enter that same placeholder path instead of inheriting a
   preceding page line. The non-atomic inline hypothetical subject is reset to
@@ -107,6 +115,11 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Block-level absolutely positioned descendants encountered after inline text
   use the buffered inline line sequence for their auto static-position block
   offset, so later floats do not shift or expose the positioned box.
+- A block-level absolutely positioned descendant inside an inline uses the
+  hypothetical block-in-inline split for its static block position. An owned
+  inline edge whose negative margin cancels its border or padding advance still
+  generates the preceding line box, while an undecorated structural edge
+  remains a zero-height phantom line.
 - Consecutive block-level absolute or fixed siblings retain the same captured
   ordinary-flow static position until an in-flow sibling advances that source
   position. An earlier out-of-flow sibling therefore cannot create a phantom
@@ -115,11 +128,16 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   honor the static-position containing block's direction, including RTL cases
   that seed `right` from the hypothetical normal-flow static position.
 - Positioned inline ancestors retain typed start/end edge markers through
-  inline collection. Block-level, and inline-level with explicit insets,
-  absolute descendants can replay those markers through line preparation to
-  form a physical `ContainingBlock`, covering ordinary horizontal
-  static-position cases without reducing the geometry to the block-flow
-  cursor.
+  inline collection. Prepared lines separately expose source-keyed logical
+  content-edge extrema. A producer-independent reducer selects the first
+  generated fragment's start corner and the end-most fragment's end corner,
+  then one writing-mode adapter projects horizontal, vertical, and sideways
+  coordinates without treating disjoint bidi fragments as one physical
+  rectangle. Empty fragments retain marker geometry as their explicit
+  fallback. Vertical and sideways opposite-direction runs share the prepared
+  line's typed visual placements with backgrounds and structural markers.
+  Positioned source edges and static-position anchors remain zero-width
+  structural events instead of entering UAX #9 as replacement objects.
 - A marker-only positioned inline materializes a CSS Inline phantom line
   record. Its zero-height edge geometry remains available to construct the
   positioned descendant's containing block and replay its escaped paint layer
@@ -129,8 +147,10 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - When an explicit-inset descendant occurs before its positioned inline
   ancestor closes, collection defers materialization until that final edge is
   present. A typed pending segment-break placement keeps collapsed boundary
-  whitespace outside the inline box when it began before the start edge; this
-  covers the fragmented horizontal inline-containing-block case.
+  whitespace outside the inline box when it began before the start edge and
+  removes that inline's positioning ownership from the relocated space. This
+  covers ordinary multiline horizontal inline containing blocks in both LTR
+  and RTL.
 - Block-level absolutely positioned descendants with orthogonal writing modes,
   auto physical vertical insets, and both physical horizontal insets set
   preserve their resolved physical static top edge instead of translating by
@@ -150,7 +170,9 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   multicolumn replay restores its captured source clip ancestry with the
   source containing block, rather than inheriting the restored builder state.
   The clip relation follows ancestor ownership rather than requiring the
-  containing block to fit inside the clip. `hidden`, `auto`, and `scroll` remain conservatively
+  containing block to fit inside the clip. An intervening overflow ancestor
+  does not clip or scroll an escaped positioned layer whose containing block is
+  outside that ancestor. `hidden`, `auto`, and `scroll` remain conservatively
   potentially visible.
 - A decoration-free nested absolute box with no paint and no viewport-fixed
   replay requirement does not materialize otherwise blank document pages.
@@ -240,8 +262,9 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 
 ## Follow-Up Areas
 
-- Broaden WPT coverage for positioned inline ancestors combined with nested
-  absolute descendants, transforms, opacity, and fragmentation.
+- Broaden WPT coverage for positioned inline ancestors combined with atomic
+  inline descendants, block-in-inline splits, transforms, opacity, and
+  committed fragmentainer placement.
 - Implement projective perspective, preserve-3D depth ordering, SVG
   stroke/view transform boxes, and transform animations before treating the
   CSS Transforms WPT directory as broadly covered.

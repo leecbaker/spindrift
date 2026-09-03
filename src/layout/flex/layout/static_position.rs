@@ -300,8 +300,11 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
             // <https://www.w3.org/TR/css-flexbox-1/#pagination>
             let positioning_containing_block =
-                PositionedContainingBlockMode::for_style(context.container_style)
-                    .zip(self.containing_blocks.last().copied());
+                PositionedContainingBlockMode::for_style(context.container_style).zip(
+                    self.containing_blocks
+                        .last()
+                        .map(|context| context.geometry),
+                );
             let fragment =
                 PositionedFragmentReplay::unfragmented(static_rect, positioning_containing_block);
             // A physical-column flex child has a main-axis static position

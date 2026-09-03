@@ -11,19 +11,13 @@ fn first_inline_fragment_is_initial_letter<F: InlineFragmentAccess>(fragments: &
         .is_some_and(|fragment| !fragment.style().initial_letter.is_normal())
 }
 
-/// Anchor a vertical glyph run at the same physical visual span selected by
-/// its containing line, even when the run's bidi direction advances from the
-/// opposite physical inline edge.
+/// Anchor a vertical bidi run to the physical span selected by its line.
 ///
-/// Inline line layout resolves visual order and allocates a physical span
-/// using the containing block's writing-mode axes. Text painting then applies
-/// the run style's own vertical advance direction. If those directions
-/// differ, retaining the containing-line glyph origin makes the run advance
-/// outside its allocated span. This is the sole line-to-glyph projection
-/// boundary; callers retain logical inline positions until the line geometry
-/// has chosen the physical span.
-/// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>
-/// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+/// The line origin is expressed at the paragraph's logical inline-start,
+/// while an embedded UAX #9 run can advance from the opposite edge. Shift the
+/// glyph origin across the already allocated span without changing line
+/// fitting or any sibling placement.
+/// <https://drafts.csswg.org/css-writing-modes-4/#bidi-algo>
 fn reposition_vertical_text_group_at_visual_inline_span(
     group: &mut PreparedInlineTextGroup,
     line_style: &ComputedStyle,
@@ -39,8 +33,6 @@ fn reposition_vertical_text_group_at_visual_inline_span(
     let Some(run_axis) = VerticalInlineAxis::for_style(&group.style) else {
         return;
     };
-    // The two signs are +/-1. Their half-difference is exactly the signed
-    // shift from the line-selected glyph edge to the run's own advance edge.
     let origin_shift = (line_axis.advance_sign() - run_axis.advance_sign()) * group.width() * 0.5;
     group.set_y(group.y() + origin_shift);
 }
@@ -92,6 +84,7 @@ impl<'a> LayoutBuilder<'a> {
                 pending_fragments,
                 0.0,
                 pending_preserve_leading_summary_space,
+                false,
                 pending_inline_position,
                 block_style,
             ) {
@@ -418,6 +411,7 @@ impl<'a> LayoutBuilder<'a> {
             fragments,
             0.0,
             preserve_leading_summary_space,
+            false,
             inline_position,
             tab_metric_style,
         ) {
@@ -440,11 +434,13 @@ impl<'a> LayoutBuilder<'a> {
         visual_offset: InlineVisualOffset,
         horizontal_content_bottom_y: Option<f32>,
         preserve_leading_summary_space: bool,
+        synthesize_leading_summary_space: bool,
     ) -> Option<PreparedInlineTextGroup> {
         let mut group = self.prepare_inline_text_group_with_summary_policy(
             fragments,
             0.0,
             preserve_leading_summary_space,
+            synthesize_leading_summary_space,
             visual_inline_start + line_geometry.inline_start_offset,
             tab_metric_style,
         )?;
@@ -499,6 +495,7 @@ impl<'a> LayoutBuilder<'a> {
         horizontal_content_bottom_y: Option<f32>,
         extra_per_separator: f32,
         preserve_leading_summary_space: bool,
+        synthesize_leading_summary_space: bool,
     ) -> Option<PreparedInlineTextGroup> {
         let extra_per_separator = if fragments
             .first()
@@ -513,6 +510,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             extra_per_separator,
             preserve_leading_summary_space,
+            synthesize_leading_summary_space,
             tab_metric_style,
         )?;
         group.line_block_size = line_geometry.line_block_size;

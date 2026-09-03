@@ -216,9 +216,18 @@ mod tests {
         };
         let atom = InlineAtom::new(
             InlineAtomContent::TextCombineUpright {
-                sequence: composition,
-                horizontal_style: Box::new(horizontal_style),
-                inline_scale: 1.0 / 3.0,
+                composition: Box::new(TextCombineComposition {
+                    source: TextCombineSource {
+                        boundary_text: "123".to_owned(),
+                        style: Box::new(vertical_style.clone()),
+                    },
+                    layout: TextCombineLayout {
+                        sequence: composition,
+                        horizontal_style: Box::new(horizontal_style),
+                        inline_scale: 1.0 / 3.0,
+                    },
+                    square: TextCombineSquareGeometry::new(layout_pt(60.0)),
+                }),
             },
             vertical_style.clone(),
             None,
@@ -280,7 +289,8 @@ mod tests {
                         0.0,
                         None,
                         None,
-                    );
+                    )
+                    .with_synthesized_margin_box_block_end_baseline();
 
                     // CSS Inline Layout synthesizes a replaced atomic inline's
                     // alphabetic baseline at its line-under margin edge. Paint

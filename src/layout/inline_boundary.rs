@@ -45,6 +45,7 @@ pub(in crate::layout) fn inline_item_boundary_role(item: &InlineItem) -> InlineB
         }
         InlineItem::Word(_) => InlineBoundaryRole::Text,
         InlineItem::Atom(atom) => inline_atom_boundary_role(atom.content()),
+        InlineItem::StaticPositionSourceMarker(_) => InlineBoundaryRole::TransparentTextBoundary,
         InlineItem::Float(_) => InlineBoundaryRole::Float,
         InlineItem::Break(_) => InlineBoundaryRole::ForcedBreak,
         InlineItem::PageScopeStart(_) => InlineBoundaryRole::PageScopeStart,
@@ -59,11 +60,10 @@ pub(in crate::layout) fn inline_atom_boundary_role(
         InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
         | InlineAtomContent::InlineEdge(InlineEdgeRole::MetricsOnlyStrut)
         | InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
-        | InlineAtomContent::StaticPositionPlaceholder(_) => {
-            // Out-of-flow boxes retain a zero-size placeholder for static
-            // positioning, but CSS Text processes the surrounding source as
-            // one text sequence. The placeholder must not create a text
-            // context reset or a soft-wrap boundary.
+        | InlineAtomContent::StaticPositionHypothetical {
+            boundary: StaticPositionHypotheticalBoundary::Transparent,
+            ..
+        } => {
             // A text-autospace adjustment is likewise a non-text boundary
             // effect: it never supplies UAX #14's atomic-object input or
             // resets the source text context.
@@ -78,10 +78,42 @@ pub(in crate::layout) fn inline_atom_boundary_role(
             InlineBoundaryRole::IndependentFormattingContext
         }
         InlineAtomContent::Canvas
+        | InlineAtomContent::StaticPositionHypothetical {
+            boundary: StaticPositionHypotheticalBoundary::Atomic,
+            ..
+        }
         | InlineAtomContent::Iframe(_)
         | InlineAtomContent::Image(_)
         | InlineAtomContent::Gradient { .. }
         | InlineAtomContent::Svg { .. }
         | InlineAtomContent::Leader(_) => InlineBoundaryRole::OpaqueAtomic,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_position_source_marker_is_transparent_but_hypothetical_is_atomic() {
+        let source = InlineStaticPositionSourceId::Block;
+        assert_eq!(
+            inline_item_boundary_role(&InlineItem::StaticPositionSourceMarker(source)),
+            InlineBoundaryRole::TransparentTextBoundary,
+        );
+        assert_eq!(
+            inline_atom_boundary_role(&InlineAtomContent::StaticPositionHypothetical {
+                source,
+                boundary: StaticPositionHypotheticalBoundary::Atomic,
+            }),
+            InlineBoundaryRole::OpaqueAtomic,
+        );
+        assert_eq!(
+            inline_atom_boundary_role(&InlineAtomContent::StaticPositionHypothetical {
+                source,
+                boundary: StaticPositionHypotheticalBoundary::Transparent,
+            }),
+            InlineBoundaryRole::TransparentTextBoundary,
+        );
     }
 }

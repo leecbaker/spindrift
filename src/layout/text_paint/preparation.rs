@@ -311,7 +311,14 @@ impl<'a> LayoutBuilder<'a> {
         x: f32,
     ) -> Option<PreparedInlineTextGroup> {
         let tab_metric_style = fragments.first()?.style();
-        self.prepare_inline_text_group_with_summary_policy(fragments, x, false, x, tab_metric_style)
+        self.prepare_inline_text_group_with_summary_policy(
+            fragments,
+            x,
+            false,
+            false,
+            x,
+            tab_metric_style,
+        )
     }
 
     pub(in crate::layout) fn prepare_inline_text_group_with_summary_policy<
@@ -321,6 +328,7 @@ impl<'a> LayoutBuilder<'a> {
         fragments: &[F],
         x: f32,
         preserve_leading_summary_space: bool,
+        synthesize_leading_summary_space: bool,
         tab_origin: f32,
         tab_metric_style: &ComputedStyle,
     ) -> Option<PreparedInlineTextGroup> {
@@ -504,7 +512,11 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
 
-        let text_summary = inline_fragment_text_summary(fragments, preserve_leading_summary_space);
+        let text_summary = inline_fragment_text_summary(
+            fragments,
+            preserve_leading_summary_space,
+            synthesize_leading_summary_space,
+        );
         if shaped_runs.is_empty() || text_summary.is_empty() {
             return None;
         }
@@ -619,12 +631,14 @@ impl<'a> LayoutBuilder<'a> {
         x: f32,
         extra_per_separator: f32,
         preserve_leading_summary_space: bool,
+        synthesize_leading_summary_space: bool,
         tab_metric_style: &ComputedStyle,
     ) -> Option<PreparedInlineTextGroup> {
         let mut group = self.prepare_inline_text_group_with_summary_policy(
             fragments,
             x,
             preserve_leading_summary_space,
+            synthesize_leading_summary_space,
             x,
             tab_metric_style,
         )?;

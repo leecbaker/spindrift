@@ -6,6 +6,7 @@ use super::state::{
     FormattingBoxAutomaticBlockSizeReplayCheckpoint, RenderedLegendGeometry,
 };
 use super::*;
+use crate::layout::block::ParentStartClearanceHypothesis;
 use crate::layout::inline_collect::TextDecorationPropagationContext;
 
 #[inline(never)]
@@ -792,10 +793,32 @@ impl<'a> LayoutBuilder<'a> {
                 let adjoins_parent_start =
                     counterfactually_adjoins_parent_start && child_style.clear == Clear::None;
                 if counterfactually_adjoins_parent_start {
-                    inherited_adjoining_start_margin = Some(InheritedAdjoiningStartMargin::new(
-                        adjoining_start_margin.value(),
-                        PageTopBlockPosition::new(self.cursor_y),
-                    ));
+                    let complete_margin = if child_style.clear != Clear::None {
+                        clear_none_hypothetical_start_margin_from_boxes(
+                            child_element,
+                            &child_style,
+                            child_children,
+                            self.document_canvas_overflow,
+                        )
+                        .unwrap_or_else(|| adjoining_start_margin.value())
+                    } else {
+                        adjoining_start_margin.value()
+                    };
+                    let parent_start_hypothesis = self
+                        .inherited_adjoining_start_margins
+                        .last()
+                        .copied()
+                        .map(InheritedAdjoiningStartMargin::parent_start_clearance_hypothesis)
+                        .unwrap_or_else(|| {
+                            ParentStartClearanceHypothesis::new(PageTopBlockPosition::new(
+                                self.cursor_y,
+                            ))
+                        });
+                    inherited_adjoining_start_margin =
+                        Some(InheritedAdjoiningStartMargin::with_parent_start_hypothesis(
+                            complete_margin,
+                            parent_start_hypothesis,
+                        ));
                 }
                 if adjoins_parent_start {
                     if let Some(previous_margin) = previous_flow_bottom_margin {

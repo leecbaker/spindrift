@@ -22,6 +22,37 @@ pub(crate) struct TextBreakPolicy {
     auto_phrase_language: Option<AutoPhraseLanguage>,
 }
 
+/// Return whether `break-spaces` creates a retained soft-wrap opportunity
+/// after `previous` at the boundary before `next`.
+///
+/// CSS Text gives preserved document spaces and breakable "other space
+/// separators" an after-character opportunity, including between adjacent
+/// separators. This is a CSS layer over UAX #14 rather than a replacement for
+/// its non-breaking controls: GL separators such as U+2007 and U+202F retain
+/// LB12 protection after themselves, while WJ and ZWJ still protect a
+/// following boundary.
+/// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>
+/// <https://www.unicode.org/reports/tr14/#LB12>
+pub(crate) fn break_spaces_retains_separator_boundary(
+    white_space: crate::css::WhiteSpace,
+    previous: char,
+    next: Option<char>,
+) -> bool {
+    if white_space != crate::css::WhiteSpace::BreakSpaces {
+        return false;
+    }
+    let previous_is_breakable_separator = is_css_preserved_document_space(previous)
+        || (character_is_css_other_space_separator(previous)
+            && line_break_class(previous) != LineBreak::Glue);
+    previous_is_breakable_separator
+        && !next.is_some_and(|character| {
+            matches!(
+                line_break_class(character),
+                LineBreak::WordJoiner | LineBreak::ZWJ
+            )
+        })
+}
+
 const MEASURED_BREAK_OPPORTUNITY_CACHE_CAPACITY: usize = 128;
 
 impl From<&ComputedStyle> for TextBreakPolicy {
@@ -582,16 +613,18 @@ pub(crate) fn collect_measured_break_opportunities(
         breaks.extend(pre_wrap_preserved_tab_breaks(text));
     }
     if policy.white_space == crate::css::WhiteSpace::BreakSpaces {
-        // `break-spaces` preserves every CSS document space and creates a
-        // soft wrap opportunity after each one, including each tab. Unlike
-        // `pre-wrap`, an adjacent preserved-space run is not coalesced and
-        // its advance does not hang at the selected break.
+        // `break-spaces` creates a retained opportunity after every preserved
+        // document space and every breakable other-space separator. Unlike
+        // `pre-wrap`, adjacent separators are not coalesced, while GL/WJ/ZWJ
+        // protection remains part of the boundary policy.
         // <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>
-        breaks.extend(text.char_indices().filter_map(|(offset, character)| {
-            (is_css_preserved_document_space(character)
-                || character_is_css_other_space_separator(character))
-            .then_some(offset + character.len_utf8())
-        }));
+        let mut characters = text.char_indices().peekable();
+        while let Some((offset, character)) = characters.next() {
+            let next = characters.peek().map(|(_, character)| *character);
+            if break_spaces_retains_separator_boundary(policy.white_space, character, next) {
+                breaks.push(offset + character.len_utf8());
+            }
+        }
     }
 
     if matches!(policy.line_break, CssLineBreak::Anywhere) {
@@ -1201,6 +1234,53 @@ mod tests {
             measured_break_opportunities("　XX　　XX", &style),
             [3, 8, 11, 13]
         );
+
+        let ogham = '\u{1680}';
+        let text = format!("x{ogham}{ogham}x");
+        assert_eq!(
+            measured_break_opportunities(&text, &style),
+            [1 + ogham.len_utf8(), 1 + 2 * ogham.len_utf8(), text.len()]
+        );
+    }
+
+    #[test]
+    fn break_spaces_preserves_other_space_separators_uax14_classes() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = crate::css::WhiteSpace::BreakSpaces;
+
+        for separator in ['\u{1680}', '\u{2000}'] {
+            let text = format!("xx{separator}あ");
+            let before = "xx".len();
+            let after = before + separator.len_utf8();
+            let breaks = measured_break_opportunities(&text, &style);
+            assert!(
+                !breaks.contains(&before) && breaks.contains(&after),
+                "BA separator U+{:04X} must retain its UAX #14 opportunity: {breaks:?}",
+                separator as u32
+            );
+        }
+
+        for separator in ['\u{2007}', '\u{202f}'] {
+            let text = format!("xx{separator}あ");
+            let before = "xx".len();
+            let after = before + separator.len_utf8();
+            let breaks = measured_break_opportunities(&text, &style);
+            assert!(
+                !breaks.contains(&before) && !breaks.contains(&after),
+                "GL separator U+{:04X} must retain LB12/LB12a protection: {breaks:?}",
+                separator as u32
+            );
+        }
+
+        for control in ['\u{2060}', '\u{200d}'] {
+            let text = format!("x\u{3000}{control}x");
+            let after_separator = "x\u{3000}".len();
+            assert!(
+                !measured_break_opportunities(&text, &style).contains(&after_separator),
+                "U+{:04X} must protect the preceding break-spaces boundary",
+                control as u32
+            );
+        }
     }
 
     #[test]

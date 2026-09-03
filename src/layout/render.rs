@@ -1648,6 +1648,7 @@ pub(in crate::layout) fn style_without_typographic_first_line_pseudos(
     }
     let mut style = style.clone();
     style.first_line_style = None;
+    style.first_line_overrides = css::ModeledLonghandSet::empty();
     style.first_letter_style = None;
     Some(style)
 }
@@ -1673,6 +1674,7 @@ pub(in crate::layout) fn style_with_originating_typographic_pseudos(
     }
     let mut style = anonymous_style.clone();
     style.first_line_style = originating_style.first_line_style.clone();
+    style.first_line_overrides = originating_style.first_line_overrides.clone();
     style.first_letter_style = originating_style.first_letter_style.clone();
     Some(style)
 }

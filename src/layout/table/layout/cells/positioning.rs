@@ -172,12 +172,6 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             None
         };
-        // Atomic inline layout uses a temporary page. A positioned table row
-        // is local to that temporary formatting context, so explicit insets
-        // on its absolutely positioned descendants must still receive the
-        // eventual inline-atom translation during paint replay.
-        // <https://www.w3.org/TR/css-position-3/#def-cb>
-        let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
         // Table-cell positioned descendants are replayed after the cell's
         // in-flow (and, for atomic cells, temporary-page) layout has
         // completed.  That temporary formatting context may have installed
@@ -204,10 +198,6 @@ impl<'a> LayoutBuilder<'a> {
             static_content_box.right(),
             static_top,
         ));
-        if self.escaped_atom_positioning_depth > 0 && row_containing_block_scope.is_some() {
-            self.escaped_atom_containing_block = row_containing_block;
-        }
-
         let child_ancestors = self.table_cell_child_ancestors(cell, row);
         let content_scope = self.enter_table_cell_content_scope(
             cell_style,
@@ -254,7 +244,6 @@ impl<'a> LayoutBuilder<'a> {
         } else if let Some(scope) = row_containing_block_scope {
             self.pop_positioned_containing_block(scope);
         }
-        self.escaped_atom_containing_block = previous_escaped_atom_containing_block;
         self.absolute_static_position = previous_absolute_static_position;
         self.restore_table_cell_content_scope(content_scope);
     }

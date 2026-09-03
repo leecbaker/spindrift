@@ -498,13 +498,13 @@ mod tests {
         let cli = Cli::try_parse_from([
             "quire",
             "--pdf-profile",
-            "pdf/a-2u",
+            "pdf/a-1b",
             "input.html",
             "output.pdf",
         ])
         .unwrap();
 
-        assert_eq!(cli.pdf_profile, PdfProfile::PdfA2U);
+        assert_eq!(cli.pdf_profile, PdfProfile::PdfA1B);
 
         let variant =
             Cli::try_parse_from(["quire", "--pdf-variant", "pdf", "input.html", "output.pdf"])
@@ -588,7 +588,7 @@ mod tests {
             .unwrap_err();
 
             assert!(error.to_string().contains("unsupported PDF profile"));
-            assert!(error.to_string().contains("pdf/a-3u"));
+            assert!(error.to_string().contains("pdf/a-1b"));
         }
     }
 

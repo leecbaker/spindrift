@@ -248,6 +248,7 @@ pub(in crate::layout) fn last_hanging_punctuation_width_for_inline_items(
             InlineItem::Atom(atom) if atom.content().is_box_edge() => break,
             InlineItem::Word(_)
             | InlineItem::Atom(_)
+            | InlineItem::StaticPositionSourceMarker(_)
             | InlineItem::Float(_)
             | InlineItem::Break(_)
             | InlineItem::PageScopeStart(_)

@@ -63,6 +63,20 @@ pub(in crate::layout) struct PositionedContainingBlockScope {
     multicol_span_id: Option<u64>,
 }
 
+/// State restored after laying out one atomic inline formatting context on
+/// its scratch page.
+///
+/// The coordinate-space identity and static-position containing block have
+/// the same lifetime: descendants may retain either after deferred positioned
+/// layout, but an enclosing atom must never observe them as its own state.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct AtomicInlineFormattingContextScope {
+    coordinate_space: AtomicInlineCoordinateSpaceId,
+    previous_axes: WritingModeAxes,
+    static_position_context_depth: usize,
+}
+
 /// Durable source geometry for a positioned containing block encountered in
 /// temporary multicolumn layout. Descendant replay resolves against this
 /// continuous source containing block, then uses the shared source-to-
@@ -610,6 +624,77 @@ impl PositionedChildStaticRect {
 }
 
 impl<'a> LayoutBuilder<'a> {
+    pub(in crate::layout) fn begin_atomic_inline_formatting_context(
+        &mut self,
+        style: &ComputedStyle,
+        content_rect: PageTopRect,
+    ) -> AtomicInlineFormattingContextScope {
+        let coordinate_space =
+            AtomicInlineCoordinateSpaceId::new(self.next_atomic_inline_coordinate_space_id);
+        self.next_atomic_inline_coordinate_space_id += 1;
+        self.active_atomic_inline_coordinate_spaces
+            .push(coordinate_space);
+
+        let previous_axes = WritingModeAxes::new(
+            self.containing_block_writing_mode,
+            self.containing_block_direction,
+        );
+        let axes = WritingModeAxes::new(style.writing_mode, style.used_direction());
+        self.containing_block_writing_mode = axes.writing_mode();
+        self.containing_block_direction = axes.direction();
+        let static_position_context_depth = self.static_position_containing_blocks.len();
+        self.static_position_containing_blocks
+            .push(StaticPositionContainingBlock::new(
+                axes,
+                content_rect,
+                style.justify_items,
+            ));
+
+        AtomicInlineFormattingContextScope {
+            coordinate_space,
+            previous_axes,
+            static_position_context_depth,
+        }
+    }
+
+    pub(in crate::layout) fn end_atomic_inline_formatting_context(
+        &mut self,
+        scope: AtomicInlineFormattingContextScope,
+    ) {
+        debug_assert_eq!(
+            self.static_position_containing_blocks.len(),
+            scope.static_position_context_depth + 1,
+        );
+        self.static_position_containing_blocks.pop();
+        debug_assert_eq!(
+            self.active_atomic_inline_coordinate_spaces.last(),
+            Some(&scope.coordinate_space),
+        );
+        self.active_atomic_inline_coordinate_spaces.pop();
+        self.containing_block_writing_mode = scope.previous_axes.writing_mode();
+        self.containing_block_direction = scope.previous_axes.direction();
+    }
+
+    pub(in crate::layout) fn current_positioned_coordinate_space(
+        &self,
+    ) -> PositionedCoordinateSpace {
+        self.active_atomic_inline_coordinate_spaces
+            .last()
+            .copied()
+            .map(PositionedCoordinateSpace::AtomicInline)
+            .unwrap_or(PositionedCoordinateSpace::Page)
+    }
+
+    pub(in crate::layout) fn positioned_containing_block_context(
+        &self,
+        geometry: ContainingBlock,
+    ) -> PositionedContainingBlockContext {
+        PositionedContainingBlockContext::in_space(
+            geometry,
+            self.current_positioned_coordinate_space(),
+        )
+    }
+
     /// Lay out one deferred multicolumn positioned principal into a private
     /// layer vector, then restore the enclosing replay's layers unchanged.
     ///
@@ -1168,6 +1253,7 @@ impl<'a> LayoutBuilder<'a> {
         mode: PositionedContainingBlockMode,
         containing_block: ContainingBlock,
     ) -> PositionedContainingBlockScope {
+        let containing_block = self.positioned_containing_block_context(containing_block);
         let multicol_span_id = (self.multicol_positioned_replay_capture_depth > 0).then(|| {
             let id = self.next_multicol_positioned_containing_block_span_id;
             self.next_multicol_positioned_containing_block_span_id += 1;
@@ -1175,7 +1261,7 @@ impl<'a> LayoutBuilder<'a> {
                 MulticolPositionedContainingBlockSpan {
                     id,
                     mode,
-                    containing_block,
+                    containing_block: containing_block.geometry,
                 },
             );
             id
@@ -1252,22 +1338,20 @@ impl<'a> LayoutBuilder<'a> {
             scope.containing_blocks_depth + 1,
             "positioned containing-block scopes must be finalized in nesting order",
         );
-        *self
-            .containing_blocks
+        self.containing_blocks
             .last_mut()
-            .expect("positioned containing-block scope has one absolute stack entry") =
-            containing_block;
+            .expect("positioned containing-block scope has one absolute stack entry")
+            .geometry = containing_block;
         if scope.mode.establishes_fixed_containing_block() {
             debug_assert_eq!(
                 self.fixed_containing_blocks.len(),
                 scope.fixed_containing_blocks_depth + 1,
                 "fixed containing-block scope must match absolute scope",
             );
-            *self
-                .fixed_containing_blocks
+            self.fixed_containing_blocks
                 .last_mut()
-                .expect("fixed containing-block scope has one fixed stack entry") =
-                containing_block;
+                .expect("fixed containing-block scope has one fixed stack entry")
+                .geometry = containing_block;
         }
         if let Some(id) = scope.multicol_span_id
             && let Some(span) = self
@@ -1298,7 +1382,8 @@ impl<'a> LayoutBuilder<'a> {
         let previous_cursor_y = self.cursor_y;
         let previous_absolute_static_position = self.absolute_static_position;
         let pushed_containing_block = if let Some(containing_block) = static_rect.containing_block {
-            self.containing_blocks.push(containing_block);
+            let context = self.positioned_containing_block_context(containing_block);
+            self.containing_blocks.push(context);
             true
         } else {
             false
@@ -1448,6 +1533,147 @@ mod tests {
             builder.fixed_containing_blocks.len(),
             initial_fixed_containing_blocks
         );
+    }
+
+    #[test]
+    fn positioned_containing_blocks_inherit_atomic_coordinate_space_provenance() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let outer_geometry =
+            ContainingBlock::from_page_top_rect(PageTopRect::new(10.0, 20.0, 30.0, 40.0));
+        let nested_geometry =
+            ContainingBlock::from_page_top_rect(PageTopRect::new(50.0, 60.0, 70.0, 80.0));
+
+        let page_scope = builder.push_positioned_containing_block(
+            PositionedContainingBlockMode::AbsoluteOnly,
+            outer_geometry,
+        );
+        assert_eq!(
+            builder.containing_blocks.last().unwrap().coordinate_space,
+            PositionedCoordinateSpace::Page
+        );
+        builder.pop_positioned_containing_block(page_scope);
+
+        let outer_space = AtomicInlineCoordinateSpaceId::new(41);
+        builder
+            .active_atomic_inline_coordinate_spaces
+            .push(outer_space);
+        let outer_scope = builder.push_positioned_containing_block(
+            PositionedContainingBlockMode::FixedAndAbsolute,
+            outer_geometry,
+        );
+        let nested_scope = builder.push_positioned_containing_block(
+            PositionedContainingBlockMode::AbsoluteOnly,
+            nested_geometry,
+        );
+        assert_eq!(
+            builder.containing_blocks.last().unwrap().coordinate_space,
+            PositionedCoordinateSpace::AtomicInline(outer_space)
+        );
+        assert_eq!(
+            builder
+                .fixed_containing_blocks
+                .last()
+                .unwrap()
+                .coordinate_space,
+            PositionedCoordinateSpace::AtomicInline(outer_space)
+        );
+
+        builder.pop_positioned_containing_block(nested_scope);
+        builder.pop_positioned_containing_block(outer_scope);
+        builder.active_atomic_inline_coordinate_spaces.pop();
+
+        let inner_space = AtomicInlineCoordinateSpaceId::new(42);
+        builder
+            .active_atomic_inline_coordinate_spaces
+            .extend([outer_space, inner_space]);
+        let inner_scope = builder.push_positioned_containing_block(
+            PositionedContainingBlockMode::AbsoluteOnly,
+            nested_geometry,
+        );
+        assert_eq!(
+            builder.containing_blocks.last().unwrap().coordinate_space,
+            PositionedCoordinateSpace::AtomicInline(inner_space)
+        );
+        builder.pop_positioned_containing_block(inner_scope);
+    }
+
+    #[test]
+    fn atomic_inline_formatting_context_scope_nests_and_restores_state() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let initial_axes = WritingModeAxes::new(
+            builder.containing_block_writing_mode,
+            builder.containing_block_direction,
+        );
+        let initial_static_depth = builder.static_position_containing_blocks.len();
+        let initial_atomic_depth = builder.active_atomic_inline_coordinate_spaces.len();
+
+        let mut outer_style = ComputedStyle::initial();
+        outer_style.writing_mode = WritingMode::SidewaysRl;
+        outer_style.direction = Direction::Rtl;
+        let outer_rect = PageTopRect::new(7.0, 91.0, 31.0, 47.0);
+        let outer = builder.begin_atomic_inline_formatting_context(&outer_style, outer_rect);
+        assert_eq!(
+            builder.active_atomic_inline_coordinate_spaces.last(),
+            Some(&outer.coordinate_space)
+        );
+        let outer_context = builder.static_position_containing_blocks.last().unwrap();
+        assert_eq!(outer_context.content_rect, outer_rect);
+        assert_eq!(
+            outer_context.axes,
+            WritingModeAxes::new(WritingMode::SidewaysRl, Direction::Rtl)
+        );
+
+        let mut inner_style = ComputedStyle::initial();
+        inner_style.writing_mode = WritingMode::SidewaysLr;
+        let inner = builder.begin_atomic_inline_formatting_context(
+            &inner_style,
+            PageTopRect::new(13.0, 73.0, 19.0, 29.0),
+        );
+        assert_ne!(inner.coordinate_space, outer.coordinate_space);
+        builder.end_atomic_inline_formatting_context(inner);
+        assert_eq!(
+            WritingModeAxes::new(
+                builder.containing_block_writing_mode,
+                builder.containing_block_direction,
+            ),
+            WritingModeAxes::new(WritingMode::SidewaysRl, Direction::Rtl)
+        );
+        assert_eq!(
+            builder.active_atomic_inline_coordinate_spaces.last(),
+            Some(&outer.coordinate_space)
+        );
+
+        builder.end_atomic_inline_formatting_context(outer);
+        assert_eq!(
+            builder.static_position_containing_blocks.len(),
+            initial_static_depth
+        );
+        assert_eq!(
+            builder.active_atomic_inline_coordinate_spaces.len(),
+            initial_atomic_depth
+        );
+        assert_eq!(
+            WritingModeAxes::new(
+                builder.containing_block_writing_mode,
+                builder.containing_block_direction,
+            ),
+            initial_axes
+        );
+
+        let snapshot = builder.snapshot();
+        let first_retry = builder.begin_atomic_inline_formatting_context(&outer_style, outer_rect);
+        let first_retry_id = first_retry.coordinate_space;
+        builder.end_atomic_inline_formatting_context(first_retry);
+        builder.restore(snapshot);
+        let second_retry = builder.begin_atomic_inline_formatting_context(&outer_style, outer_rect);
+        assert_ne!(second_retry.coordinate_space, first_retry_id);
+        builder.end_atomic_inline_formatting_context(second_retry);
     }
 
     #[test]

@@ -104,6 +104,11 @@ rollback. Its explicit and reset-only modeled subproperties now participate in
 `revert`, `revert-layer`, CSS-wide keywords, and custom-property substitution
 independently; the legacy `font-stretch` spelling is the same cascade slot as
 `font-width`.
+`::first-line` materialization uses that same canonical longhand registry and
+retains cascade-source provenance through nested inline inheritance. Font
+controls such as `font-synthesis-weight` and `font-synthesis-style` therefore
+reach direct and inherited first-line text without replacing a descendant's
+own declaration.
 
 `font-variant-emoji` resolves color versus text presentation per grapheme
 cluster, using actual color-font table presence rather than a font-family

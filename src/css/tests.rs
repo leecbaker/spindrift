@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 
+use super::cascade::ModeledLonghand;
 use super::values::{
     edge_all, parse_computed_length_percentage, parse_computed_line_height,
     parse_deferred_font_size,
@@ -2917,7 +2918,7 @@ async fn form_state_pseudo_classes_use_html_disabled_and_local_constraint_state(
 #[tokio::test]
 async fn typographic_pseudo_element_rules_create_computed_style_slots() {
     let stylesheet = parse_stylesheet(&Css::from_string(
-        "p::first-line { color: red; display: none }\
+        "p::first-line { color: red; background: yellow; display: none; font: italic bold 10px serif; font-synthesis: none; font-synthesis-weight: none; font-synthesis-style: none; font-synthesis-small-caps: none; font-synthesis-position: none }\
          p::first-letter { color: blue; display: none; margin-left: 10px; initial-letter: 2 }",
     ));
     let style = style_for_element_with_signature(
@@ -2940,6 +2941,51 @@ async fn typographic_pseudo_element_rules_create_computed_style_slots() {
         style.first_line_style.as_ref().unwrap().display,
         style.display
     );
+    assert!(
+        style
+            .first_line_overrides
+            .contains(ModeledLonghand::FontSynthesis)
+    );
+    assert!(
+        style
+            .first_line_overrides
+            .contains(ModeledLonghand::FontSynthesisWeight)
+    );
+    assert!(
+        style
+            .first_line_overrides
+            .contains(ModeledLonghand::FontSynthesisStyle)
+    );
+    assert!(
+        style
+            .first_line_overrides
+            .contains(ModeledLonghand::FontSynthesisSmallCaps)
+    );
+    assert!(
+        style
+            .first_line_overrides
+            .contains(ModeledLonghand::FontSynthesisPosition)
+    );
+    assert!(
+        style
+            .first_line_overrides
+            .contains(ModeledLonghand::FontFamily)
+    );
+    assert!(
+        style
+            .first_line_overrides
+            .contains(ModeledLonghand::FontFeatureSettings)
+    );
+    assert!(
+        style
+            .first_line_overrides
+            .contains(ModeledLonghand::BackgroundColor)
+    );
+    assert!(
+        !style
+            .first_line_overrides
+            .contains(ModeledLonghand::Display)
+    );
     assert_eq!(
         style.first_letter_style.as_ref().unwrap().display,
         style.display
@@ -2949,6 +2995,52 @@ async fn typographic_pseudo_element_rules_create_computed_style_slots() {
         style.first_letter_style.as_ref().unwrap().initial_letter,
         InitialLetter::Specified { size: 2.0, sink: 2 }
     );
+}
+
+#[tokio::test]
+async fn computed_longhand_provenance_distinguishes_inheritance_from_equal_specified_values() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".specified { font-synthesis-style: auto }\
+         .inherited { font-synthesis-style: inherit }\
+         .unset { font-synthesis-style: unset }\
+         .custom { --synthesis: auto; font-synthesis-style: var(--synthesis) }\
+         .invalid { font-synthesis-style: var(--missing) }",
+    ));
+    let parent_signature = ElementSignature::new("p", HashMap::new());
+    let parent = style_for_element_with_signature(
+        parent_signature.clone(),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let child = |class: &str| {
+        style_for_element_with_signature(
+            ElementSignature::new(
+                "span",
+                HashMap::from([("class".to_string(), class.to_string())]),
+            ),
+            None,
+            std::slice::from_ref(&stylesheet),
+            Some(&parent),
+            std::slice::from_ref(&parent_signature),
+        )
+    };
+
+    for class in ["specified", "custom"] {
+        assert!(!modeled_longhand_has_same_source(
+            &child(class),
+            &parent,
+            ModeledLonghand::FontSynthesisStyle,
+        ));
+    }
+    for class in ["inherited", "unset", "invalid", "none"] {
+        assert!(modeled_longhand_has_same_source(
+            &child(class),
+            &parent,
+            ModeledLonghand::FontSynthesisStyle,
+        ));
+    }
 }
 
 #[tokio::test]

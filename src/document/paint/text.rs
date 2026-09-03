@@ -174,6 +174,9 @@ impl RenderedLine {
 
     pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
         self.origin = offset.transform_point(self.origin);
+        self.glyph_ink_bounds = self
+            .glyph_ink_bounds
+            .map(|bounds| bounds.translated(offset));
         self
     }
 
@@ -970,7 +973,7 @@ mod tests {
         rendered_lines_can_merge_as_exact_paint_continuation,
         split_rendered_line_for_opaque_text_coverage,
     };
-    use crate::document::paint::geometry::PaintPoint;
+    use crate::document::paint::geometry::{PaintClip, PaintPoint, PaintTranslation};
     use crate::document::paint::paths::{RenderedPath, RenderedPathFillRule};
     use crate::{CssColor, PaintStrokeWidth};
 
@@ -1044,6 +1047,19 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(line.origin(), PaintPoint::new(5.0, 6.0));
+    }
+
+    #[test]
+    fn translated_line_moves_its_cached_glyph_ink_bounds_with_its_origin() {
+        let line = test_rendered_line()
+            .with_glyph_ink_bounds(Some(PaintClip::new(11.0, 12.0, 13.0, 14.0)))
+            .translated(PaintTranslation::new(3.0, -4.0));
+
+        assert_eq!(line.origin(), PaintPoint::new(13.0, 16.0));
+        assert_eq!(
+            line.glyph_ink_bounds,
+            Some(PaintClip::new(14.0, 8.0, 13.0, 14.0))
+        );
     }
 
     #[test]

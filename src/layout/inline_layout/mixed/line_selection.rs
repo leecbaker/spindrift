@@ -4,7 +4,7 @@ use super::*;
 use crate::layout::block::{
     FloatContour, FlowExclusionKind, InitialLetterLayout, LogicalFloatPlacement,
 };
-use crate::layout::inline_layout::InlineLineTermination;
+use crate::layout::inline_layout::{InlineLineKind, InlineLineTermination};
 
 /// Whether a graph's source context can reuse cached advances for a selected
 /// line.
@@ -927,12 +927,11 @@ impl<'a> LayoutBuilder<'a> {
                     block_line_index: next_record_line_index,
                     paragraph_line_index: records.len(),
                     fragment: None,
-                    is_phantom: false,
+                    kind: InlineLineKind::ForcedEmpty,
                     is_first_formatted_line: context.initial_first_formatted_line
                         && next_record_line_index == 0,
                     is_last_line_in_paragraph: false,
                     termination: InlineLineTermination::SoftWrap,
-                    is_forced_empty: true,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: false,
                     clear_after: Clear::None,
@@ -963,15 +962,13 @@ impl<'a> LayoutBuilder<'a> {
                 // participant, rather than increasing this ordinary line
                 // record's block advance.
                 // <https://drafts.csswg.org/css-inline-3/#initial-letter-position>
-                .filter(|item| {
-                    !LayoutBuilder::inline_line_item_is_initial_letter(&item.item)
-                        && matches!(
-                            &item.item,
-                            InlineLineItem::Atom(atom)
-                                if !matches!(atom.content(), InlineAtomContent::InlineEdge(_))
-                        )
+                .filter(|item| !LayoutBuilder::inline_line_item_is_initial_letter(&item.item))
+                .filter_map(|item| {
+                    crate::layout::inline_layout::inline_line_item_additional_block_extent(
+                        &item.item,
+                        block_style,
+                    )
                 })
-                .map(|item| inline_line_item_logical_block_size(&item.item, block_style))
                 .fold(0.0_f32, f32::max);
             let line_height = line_box
                 .metrics
@@ -980,26 +977,25 @@ impl<'a> LayoutBuilder<'a> {
                 .max(item_line_height);
             let used_indent = line_box.indent;
             let available_width = line_box.available_width;
-            let is_phantom = inline_line_fragment_is_phantom(&line_box);
+            let kind = InlineLineKind::for_fragment(&line_box, false);
             records.push(InlineLineRecord {
                 paragraph_index: 0,
                 block_line_index,
                 paragraph_line_index: records.len(),
                 fragment: Some(line_box),
-                is_phantom,
+                kind,
                 // Edge-only phantom records retain positioned-inline source
                 // geometry, but are not formatted lines.
                 // <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
                 is_first_formatted_line: context.initial_first_formatted_line
                     && block_line_index == 0
-                    && !is_phantom,
+                    && !kind.is_phantom(),
                 is_last_line_in_paragraph: offset + 1 == line_count,
                 termination: if offset + 1 == line_count {
                     InlineLineTermination::BlockEnd
                 } else {
                     InlineLineTermination::SoftWrap
                 },
-                is_forced_empty: false,
                 used_bidi_base_direction: None,
                 starts_after_preserved_segment_break: false,
                 clear_after: Clear::None,
@@ -1152,7 +1148,7 @@ impl<'a> LayoutBuilder<'a> {
         let formatted_records = records
             .iter()
             .enumerate()
-            .filter(|(_, record)| record.fragment.is_some() && !record.is_phantom)
+            .filter(|(_, record)| record.fragment.is_some() && !record.kind.is_phantom())
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let first_formatted = *formatted_records.first()?;
@@ -3201,55 +3197,18 @@ impl<'a> LayoutBuilder<'a> {
             ),
         };
         if applies_first_line_style {
-            let mut items = measured_inline_items(&materialized.items);
             // `::first-line` participates in line fitting, including balanced
-            // candidate evaluation. Painting applies the same pseudo after a
-            // line is selected, but balancing must shape this candidate with
-            // the used first-line style before deciding its break point.
+            // candidate evaluation. Use the same durable materialization path
+            // as the finally selected line so shaping, CSS Text edge effects,
+            // and line-box metrics cannot observe different used styles.
             // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo> and
             // <https://drafts.csswg.org/css-text-4/#text-wrap-style>
-            apply_first_line_pseudos_to_line_items(
-                &mut items,
+            self.materialize_first_line_used_style(
+                &mut materialized,
                 block_style,
-                false,
-                &mut self.font_system,
+                graph.selected_line_end_condition(range, end.break_opportunity),
+                available_width,
             );
-            materialized.items = items
-                .into_iter()
-                .map(|item| {
-                    let shaped = match &item {
-                        InlineLineItem::Fragment(fragment) => self
-                            .font_system
-                            .shape_untracked_inline_line(
-                                fragment.text(),
-                                fragment.style(),
-                                fragment.style().line_height,
-                            )
-                            .map(std::rc::Rc::new),
-                        InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
-                    };
-                    let width = shaped
-                        .as_deref()
-                        .map(ShapedInlineLine::advance_width)
-                        .unwrap_or_else(|| match &item {
-                            InlineLineItem::Atom(atom) => {
-                                inline_atom_logical_inline_size(atom, block_style)
-                            }
-                            InlineLineItem::Fragment(_) | InlineLineItem::Float(_) => 0.0,
-                        });
-                    MeasuredInlineItem::new(item, width, shaped)
-                })
-                .collect();
-            // Recomposition for `::first-line` has produced fresh shaper
-            // advances. Reapply the single visual-boundary pass before this
-            // candidate is measured, exactly as final paint will do.
-            apply_visual_tracking_boundaries(&mut materialized.items);
-            let widths = inline_content_width_for_line_items(
-                &materialized.items,
-                &mut self.font_system,
-                |item| item.used_advance().points(),
-            );
-            materialized.fitting_width = widths.fitting_width;
         }
         let hanging_widths = hanging_punctuation_widths_for_line_items(
             &mut self.font_system,
@@ -3267,6 +3226,66 @@ impl<'a> LayoutBuilder<'a> {
             exact_remeasurement_started.elapsed(),
         );
         width
+    }
+
+    /// Materialize the generated `::first-line` inline box into one selected
+    /// graph line.
+    ///
+    /// Candidate selection and durable line construction both call this
+    /// adapter. Keeping the pseudo style in the selected measured items is
+    /// necessary because font properties can change not only paint, but also
+    /// glyph advances, CSS Text edge effects, and the root inline box's used
+    /// line height.
+    /// <https://drafts.csswg.org/css-pseudo-4/#first-line-styling>
+    fn materialize_first_line_used_style(
+        &mut self,
+        line: &mut MaterializedInlineGraphLine,
+        block_style: &ComputedStyle,
+        line_end: SelectedLineEndCondition,
+        available_width: Option<f32>,
+    ) {
+        let mut source_items = measured_inline_items(&line.items);
+        apply_first_line_pseudos_to_line_items(
+            &mut source_items,
+            block_style,
+            false,
+            &mut self.font_system,
+        );
+        for (measured, source) in line.items.iter_mut().zip(source_items) {
+            measured.item = source;
+            remeasure_materialized_item(measured, &mut self.font_system);
+        }
+        apply_visual_tracking_boundaries(&mut line.items);
+        resolve_materialized_line_tab_and_ruby_geometry(
+            &mut line.items,
+            &mut self.font_system,
+            block_style,
+        );
+
+        let widths =
+            inline_content_width_for_line_items(&line.items, &mut self.font_system, |item| {
+                item.used_advance().points()
+            });
+        let collapsed_end_trim_width = trailing_collapsible_measured_width(&line.items);
+        let pre_wrap_suffix_width = trailing_pre_wrap_hanging_width_with_unconditional_separators(
+            &line.items,
+            &mut self.font_system,
+        );
+        let pre_wrap_hanging_width = if widths.trailing_space_width > 0.0 {
+            pre_wrap_suffix_width
+        } else {
+            line_end.pre_wrap_hanging_width(
+                pre_wrap_suffix_width,
+                widths.fitting_width,
+                available_width,
+            )
+        };
+        line.edge_effects.collapsed_end_trim_width = collapsed_end_trim_width;
+        line.edge_effects.pre_wrap_hanging_width = pre_wrap_hanging_width;
+        line.edge_effects.hanging_space_separator_width = widths.trailing_space_width;
+        line.fitting_width =
+            (widths.fitting_width - collapsed_end_trim_width - pre_wrap_hanging_width).max(0.0);
+        line.content_width = line.fitting_width;
     }
 
     /// Enumerate same-count legal break sequences for one balance group.
@@ -5048,6 +5067,7 @@ impl<'a> LayoutBuilder<'a> {
             padding_box_width,
             style.line_height + style.padding.top + style.padding.bottom,
         ));
+        let containing_block = self.positioned_containing_block_context(containing_block);
         self.containing_blocks.push(containing_block);
         true
     }
@@ -5615,6 +5635,16 @@ impl<'a> LayoutBuilder<'a> {
             &mut self.font_system,
             block_style,
         );
+        let materializes_first_line_style =
+            row.identity.is_first_formatted_line && block_style.first_line_style.is_some();
+        if materializes_first_line_style {
+            self.materialize_first_line_used_style(
+                &mut materialized,
+                block_style,
+                line_end,
+                Some(line_available_width),
+            );
+        }
         resolve_materialized_line_leaders(
             &mut materialized,
             &mut self.font_system,
@@ -5626,7 +5656,7 @@ impl<'a> LayoutBuilder<'a> {
         let bidi_scope_continuations = graph.bidi_scope_continuations_for_range(range);
         let used_text = materialized.used_text();
         let edge_effects = materialized.edge_effects.clone();
-        InlineLineFragment::new(
+        let mut fragment = InlineLineFragment::new(
             materialized.items,
             metrics,
             HangingPunctuationWidths::default(),
@@ -5637,7 +5667,11 @@ impl<'a> LayoutBuilder<'a> {
         )
         .with_edge_effects(edge_effects)
         .with_bidi_scope_continuations(bidi_scope_continuations)
-        .with_source_end(range.end)
+        .with_source_end(range.end);
+        if materializes_first_line_style {
+            fragment.mark_first_line_style_materialized();
+        }
+        fragment
     }
 }
 

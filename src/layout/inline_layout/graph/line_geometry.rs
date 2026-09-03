@@ -63,7 +63,7 @@ where
 /// preceding atom's used advance. Iterate the two selected-line operations to
 /// a small fixed point so a tab after ruby never retains a stop calculated
 /// from the source atom's conservative annotation width.
-pub(super) fn resolve_materialized_line_tab_and_ruby_geometry(
+pub(in crate::layout) fn resolve_materialized_line_tab_and_ruby_geometry(
     items: &mut [MeasuredInlineItem],
     font_system: &mut FontSystem,
     block_style: &ComputedStyle,

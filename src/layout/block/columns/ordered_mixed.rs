@@ -259,8 +259,10 @@ impl<'a> LayoutBuilder<'a> {
                         &mut state.previous_child_page_end,
                     );
                     if inline_outcome.clamp_line_slots >= remaining_slots.visible_line_limit() {
-                        if inline_outcome.has_flow_effects {
+                        if inline_outcome.has_non_phantom_line {
                             state.first_formatted_line.consume_next_formatted_line();
+                        }
+                        if inline_outcome.has_flow_effects {
                             self.flush_float_run(&mut state.float_run);
                         }
                         traversal_state.debit_inline_outcome(inline_outcome);
@@ -302,8 +304,10 @@ impl<'a> LayoutBuilder<'a> {
                         state.first_formatted_line.applies_to_next_inline_run(),
                         &mut state.previous_child_page_end,
                     );
-                    if inline_outcome.has_flow_effects {
+                    if inline_outcome.has_non_phantom_line {
                         state.first_formatted_line.consume_next_formatted_line();
+                    }
+                    if inline_outcome.has_flow_effects {
                         self.flush_float_run(&mut state.float_run);
                     }
                     traversal_state.debit_inline_outcome(inline_outcome);
@@ -331,8 +335,10 @@ impl<'a> LayoutBuilder<'a> {
                     state.first_formatted_line.applies_to_next_inline_run(),
                     &mut state.previous_child_page_end,
                 );
-                if inline_outcome.has_flow_effects {
+                if inline_outcome.has_non_phantom_line {
                     state.first_formatted_line.consume_next_formatted_line();
+                }
+                if inline_outcome.has_flow_effects {
                     state.seen_flow_child = true;
                     state.previous_flow_bottom_margin = None;
                     self.flush_float_run(&mut state.float_run);
@@ -414,8 +420,10 @@ impl<'a> LayoutBuilder<'a> {
                     state.first_formatted_line.applies_to_next_inline_run(),
                     &mut state.previous_child_page_end,
                 );
-                if inline_outcome.has_flow_effects {
+                if inline_outcome.has_non_phantom_line {
                     state.first_formatted_line.consume_next_formatted_line();
+                }
+                if inline_outcome.has_flow_effects {
                     state.seen_flow_child = true;
                     state.previous_flow_bottom_margin = None;
                     self.flush_float_run(&mut state.float_run);
@@ -560,8 +568,10 @@ impl<'a> LayoutBuilder<'a> {
                     &mut state.previous_child_page_end,
                 );
             }
-            if inline_outcome.has_flow_effects {
+            if inline_outcome.has_non_phantom_line {
                 state.first_formatted_line.consume_next_formatted_line();
+            }
+            if inline_outcome.has_flow_effects {
                 state.seen_flow_child = true;
                 state.previous_flow_bottom_margin = None;
                 self.flush_float_run(&mut state.float_run);
@@ -694,6 +704,19 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
             preserve_adjusted_block_margins(&mut child_style);
 
+            // A block container whose first in-flow child is block-level
+            // takes its first formatted line from that child. Ordered mixed
+            // flow can reach this boundary after any number of positioned or
+            // floated siblings; those out-of-flow boxes must not consume the
+            // originating typographic pseudo before the child descends to its
+            // own first line.
+            // <https://drafts.csswg.org/css-pseudo-4/#first-text-line>
+            if state.first_formatted_line.applies_to_next_inline_run()
+                && let Some(style_with_originating_pseudos) =
+                    style_with_originating_typographic_pseudos(&child_style, style)
+            {
+                *child_style = style_with_originating_pseudos;
+            }
             state.seen_flow_child = true;
             state.first_formatted_line.consume_next_formatted_line();
 
@@ -893,8 +916,10 @@ impl<'a> LayoutBuilder<'a> {
             state.first_formatted_line.applies_to_next_inline_run(),
             &mut state.previous_child_page_end,
         );
-        if inline_outcome.has_flow_effects {
+        if inline_outcome.has_non_phantom_line {
             state.first_formatted_line.consume_next_formatted_line();
+        }
+        if inline_outcome.has_flow_effects {
             state.previous_flow_bottom_margin = None;
             self.flush_float_run(&mut state.float_run);
         }

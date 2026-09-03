@@ -14,6 +14,8 @@ const FONT_SYNTHESIS_WEIGHT_PDF_FIXTURE: &str =
     "tests/fixtures/wpt/css/css-fonts/font-synthesis-weight-pdf.html";
 const FONT_SYNTHESIS_STYLE_PDF_FIXTURE: &str =
     "tests/fixtures/wpt/css/css-fonts/font-synthesis-style-pdf.html";
+const FONT_SYNTHESIS_FIRST_LINE_PDF_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/font-synthesis-first-line-pdf.html";
 const VARIABLE_FONT_INSTANCE_PDF_FIXTURE: &str =
     "tests/fixtures/wpt/css/css-fonts/variable-font-instance-pdf.html";
 const SIZE_ADJUST_MIXED_OPAQUE_COVERAGE_FIXTURE: &str =
@@ -79,7 +81,16 @@ async fn font_synthesis_style_is_retained_per_selected_document_font() {
             .lines()
             .iter()
             .find(|line| line.text == text)
-            .unwrap_or_else(|| panic!("fixture line {text:?} should paint"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "fixture line {text:?} should paint; got {:?}",
+                    document.pages[0]
+                        .lines()
+                        .iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
         line_font(&document, line)
     };
 
@@ -92,6 +103,43 @@ async fn font_synthesis_style_is_retained_per_selected_document_font() {
             .is_ok_and(|face| face.is_italic()),
         "the authored italic stack must select its real italic face"
     );
+}
+
+/// `::first-line` becomes the inheritance parent for text in its generated
+/// line box, including text owned by an otherwise unstyled inline descendant.
+/// <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+#[tokio::test]
+async fn first_line_font_synthesis_controls_reach_owned_and_nested_text() {
+    let document = Html::from_file(FONT_SYNTHESIS_FIRST_LINE_PDF_FIXTURE)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let font_for = |text: &str| {
+        let line = document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text.contains(text))
+            .unwrap_or_else(|| {
+                panic!(
+                    "fixture line {text:?} should paint; got {:?}",
+                    document.pages[0]
+                        .lines()
+                        .iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        line_font(&document, line)
+    };
+
+    for text in ["directstyle", "nestedstyle"] {
+        assert!(font_for(text).synthesis.oblique.is_none(), "{text}");
+    }
+    for text in ["directweight", "nestedweight"] {
+        assert!(!font_for(text).synthesis.embolden, "{text}");
+    }
 }
 
 /// Each CSS variation location must retain its own PDF document-font record.
@@ -883,7 +931,7 @@ fn css_string_escape(value: &str) -> String {
 
 #[tokio::test]
 async fn embeds_shaped_system_font_symbols_without_question_mark_fallbacks() {
-    let pdf = Html::from_string("<p>© 2018 • KinSNP® ≥7 cM ≤ 0.5</p>")
+    let pdf = Html::from_string("<p>© 2018 • Example® ≥7 cM ≤ 0.5</p>")
         .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
         .await
         .unwrap();
@@ -898,12 +946,12 @@ async fn embeds_shaped_system_font_symbols_without_question_mark_fallbacks() {
     assert!(rendered.contains("<2265>"));
     assert!(rendered.contains("<2264>"));
     assert!(!rendered.contains("(? 2018"));
-    assert!(!rendered.contains("KinSNP?"));
+    assert!(!rendered.contains("Example?"));
 }
 
 #[tokio::test]
 async fn rendered_text_lines_preserve_shaped_glyphs_for_pdf() {
-    let document = Html::from_string("<p>KinSNP® ≥7</p>")
+    let document = Html::from_string("<p>Example® ≥7</p>")
         .render(&RenderOptions::default())
         .await
         .unwrap();
@@ -911,7 +959,7 @@ async fn rendered_text_lines_preserve_shaped_glyphs_for_pdf() {
     let line = document.pages[0]
         .lines()
         .iter()
-        .find(|line| line.text.contains("KinSNP"))
+        .find(|line| line.text.contains("Example"))
         .unwrap();
     let glyphs = line
         .runs

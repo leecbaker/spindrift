@@ -2,6 +2,7 @@ use super::generated_content::{
     annotate_line_break_element_breaks_with_clear, generated_content_originating_clear,
 };
 use super::*;
+use crate::layout::block::{AtomicPrincipalFlow, classify_atomic_principal_flow};
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn with_positioned_layout_suppressed<R>(
@@ -368,6 +369,7 @@ impl<'a> LayoutBuilder<'a> {
                         &mut paragraph,
                         context,
                         force_empty_line,
+                        inline_layout::InlineLineTermination::ForcedBreak,
                         starts_after_forced_break,
                         &mut output,
                     );
@@ -378,6 +380,7 @@ impl<'a> LayoutBuilder<'a> {
                         &mut paragraph,
                         context,
                         false,
+                        inline_layout::InlineLineTermination::CollectionBoundary,
                         starts_after_forced_break,
                         &mut output,
                     );
@@ -392,6 +395,7 @@ impl<'a> LayoutBuilder<'a> {
             &mut paragraph,
             context,
             false,
+            inline_layout::InlineLineTermination::BlockEnd,
             starts_after_forced_break,
             &mut output,
         );
@@ -457,6 +461,7 @@ impl<'a> LayoutBuilder<'a> {
         paragraph: &mut Vec<InlineItem>,
         context: InlineParagraphContext<'_>,
         force_empty_line: bool,
+        terminal_termination: inline_layout::InlineLineTermination,
         starts_after_forced_break: bool,
         output: &mut inline_layout::InlineIntrinsicMeasurement,
     ) -> bool {
@@ -472,11 +477,10 @@ impl<'a> LayoutBuilder<'a> {
                         block_line_index: line_index,
                         paragraph_line_index: 0,
                         fragment: None,
-                        is_phantom: false,
+                        kind: inline_layout::InlineLineKind::ForcedEmpty,
                         is_first_formatted_line: line_index == 0,
                         is_last_line_in_paragraph: true,
-                        termination: inline_layout::InlineLineTermination::BlockEnd,
-                        is_forced_empty: true,
+                        termination: terminal_termination,
                         used_bidi_base_direction: None,
                         starts_after_preserved_segment_break: false,
                         clear_after: Clear::None,
@@ -559,11 +563,10 @@ impl<'a> LayoutBuilder<'a> {
                     block_line_index: next_line_count,
                     paragraph_line_index: 0,
                     fragment: None,
-                    is_phantom: false,
+                    kind: inline_layout::InlineLineKind::ForcedEmpty,
                     is_first_formatted_line: next_line_count == 0,
                     is_last_line_in_paragraph: true,
-                    termination: inline_layout::InlineLineTermination::BlockEnd,
-                    is_forced_empty: true,
+                    termination: terminal_termination,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: false,
                     clear_after: Clear::None,
@@ -616,13 +619,12 @@ impl<'a> LayoutBuilder<'a> {
                         paragraph_line_index: output.sequence.records.len()
                             - paragraph_start_line_index,
                         fragment: None,
-                        is_phantom: false,
+                        kind: inline_layout::InlineLineKind::ForcedEmpty,
                         is_first_formatted_line: next_record_line_index == 0,
                         is_last_line_in_paragraph: false,
                         termination: inline_layout::InlineLineTermination::SoftWrap,
                         // A float-excluded line has no selected source range, but
                         // it still consumes block-size before the next float band.
-                        is_forced_empty: true,
                         used_bidi_base_direction: None,
                         starts_after_preserved_segment_break: false,
                         clear_after: Clear::None,
@@ -639,7 +641,8 @@ impl<'a> LayoutBuilder<'a> {
                 next_record_line_index += 1;
             }
             let line_index = line.line_index;
-            let is_phantom = inline_layout::inline_line_fragment_is_phantom(&line);
+            let preserve_empty_line = force_empty_line && offset + 1 == line_count;
+            let kind = inline_layout::InlineLineKind::for_fragment(&line, preserve_empty_line);
             output
                 .sequence
                 .records
@@ -648,15 +651,14 @@ impl<'a> LayoutBuilder<'a> {
                     block_line_index: line_index,
                     paragraph_line_index: output.sequence.records.len()
                         - paragraph_start_line_index,
-                    is_phantom,
-                    is_first_formatted_line: line_index == 0,
+                    kind,
+                    is_first_formatted_line: line_index == 0 && !kind.is_phantom(),
                     is_last_line_in_paragraph: offset + 1 == line_count,
                     termination: if offset + 1 == line_count {
-                        inline_layout::InlineLineTermination::BlockEnd
+                        terminal_termination
                     } else {
                         inline_layout::InlineLineTermination::SoftWrap
                     },
-                    is_forced_empty: false,
                     used_bidi_base_direction: None,
                     starts_after_preserved_segment_break: false,
                     clear_after: Clear::None,
@@ -788,11 +790,8 @@ impl<'a> LayoutBuilder<'a> {
                         );
                         layout.end_counter_scope(counter_scope);
                         layout.counter_set = counter_snapshot;
-                        if let Some(mut atom) = atom {
-                            atom.baseline_shift += layout
-                                .vertical_align_baseline_shift_for_atom(&atom, style)
-                                .glyph_displacement()
-                                .get();
+                        if let Some(atom) = atom {
+                            let atom = layout.finish_inline_atom_for_parent(atom, style);
                             output.push(InlineItem::Atom(Box::new(atom)));
                             return;
                         }
@@ -1196,10 +1195,32 @@ impl<'a> LayoutBuilder<'a> {
                         BlockSizeBasisSource::InlineBlock,
                     ),
                 );
+                let principal_flow = if children.is_empty() {
+                    AtomicPrincipalFlow::InlineSequence
+                } else {
+                    let has_block_children = has_non_inline_formatting_box(children);
+                    classify_atomic_principal_flow(
+                        false,
+                        false,
+                        !has_block_children && formatting_box_has_inline_content(children),
+                    )
+                };
                 let contribution = if children.is_empty() {
                     let text = inline_text_for_style(element, style);
                     self.intrinsic_inline_measurement_for_text(&text, style, available_width)
                         .contribution
+                } else if matches!(principal_flow, AtomicPrincipalFlow::BlockChildren) {
+                    let (min_content, max_content) = self.block_intrinsic_content_inline_sizes(
+                        element,
+                        style,
+                        stylesheets,
+                        Some(children),
+                        available_width,
+                    );
+                    inline_layout::InlineIntrinsicContribution {
+                        min_content,
+                        max_content,
+                    }
                 } else {
                     self.intrinsic_inline_contribution_for_element(
                         element,
@@ -1209,22 +1230,77 @@ impl<'a> LayoutBuilder<'a> {
                     )
                 };
                 self.block_percentage_context_stack.pop();
-                let content_width = crate::layout::intrinsic::content_box_width_from_intrinsic(
-                    style,
-                    layout_pt(available_width),
-                    non_content_pt(horizontal_extras),
-                    contribution.min_content.content_box_length(),
-                    contribution.max_content.content_box_length(),
-                    crate::layout::intrinsic::IntrinsicAutoWidth::ShrinkToFit,
-                )
-                .points();
+                let content_width = if style.writing_mode.has_vertical_lines()
+                    && matches!(principal_flow, AtomicPrincipalFlow::BlockChildren)
+                    && style.box_values.height.is_auto()
+                {
+                    // The atomic parent negotiates this formatting context's
+                    // logical inline size. In vertical writing that is the
+                    // physical height, so resolve shrink-to-fit against the
+                    // line's available inline measure rather than through
+                    // the physical `width` property adapter.
+                    crate::layout::intrinsic::shrink_to_fit_width(
+                        contribution.min_content.content_box_length(),
+                        contribution.max_content.content_box_length(),
+                        content_box_pt(available_width),
+                    )
+                    .points()
+                } else {
+                    crate::layout::intrinsic::content_box_width_from_intrinsic(
+                        style,
+                        layout_pt(available_width),
+                        non_content_pt(horizontal_extras),
+                        contribution.min_content.content_box_length(),
+                        contribution.max_content.content_box_length(),
+                        crate::layout::intrinsic::IntrinsicAutoWidth::ShrinkToFit,
+                    )
+                    .points()
+                };
                 let mut content_width = if style.box_values.width.is_auto() {
                     content_width.max(style.font_size)
                 } else {
                     content_width
                 };
+                let block_flow_geometry = (style.writing_mode.has_vertical_lines()
+                    && matches!(principal_flow, AtomicPrincipalFlow::BlockChildren))
+                .then(|| {
+                    // The shrink-to-fit result selected from this atomic
+                    // context's intrinsic contribution is its logical inline
+                    // measure in vertical writing. Ordinary block stretch
+                    // sizing would replace this indefinite atomic measure
+                    // with the initial containing block's physical height.
+                    let logical_inline_size = LogicalInlineContentSize::new(content_box_pt(
+                        definite_content_height.unwrap_or(content_width),
+                    ));
+                    let logical_block_size = LogicalBlockContentSize::new(content_box_pt(
+                        self.estimate_block_child_intrinsic_logical_block_size(
+                            element,
+                            style,
+                            stylesheets,
+                            Some(children),
+                            available_width,
+                            Some(logical_inline_size),
+                        ),
+                    ));
+                    (logical_inline_size, logical_block_size)
+                });
                 let (measured_content_height, measured_physical_height, line_baseline_offset) =
-                    if children.is_empty() {
+                    if let Some((logical_inline_size, logical_block_size)) = block_flow_geometry {
+                        content_width = logical_block_size.points();
+                        (
+                            logical_block_size.points(),
+                            logical_inline_size.points(),
+                            self.estimate_block_child_intrinsic_last_baseline(
+                                element,
+                                style,
+                                stylesheets,
+                                Some(children),
+                                available_width,
+                                logical_inline_size,
+                            )
+                            .map(SemanticLengthExt::points),
+                        )
+                    } else if children.is_empty() {
                         let text = inline_text_for_style(element, style);
                         let measurement =
                             self.intrinsic_inline_measurement_for_text(&text, style, content_width);
@@ -1295,7 +1371,11 @@ impl<'a> LayoutBuilder<'a> {
                 let baseline_offset = Self::inline_block_baseline_offset(
                     style,
                     used_property_containment(element, style).layout,
-                    border_box_height,
+                    if vertical_writing_mode {
+                        content_width + horizontal_extras
+                    } else {
+                        border_box_height
+                    },
                     line_baseline_offset,
                 );
                 (
@@ -1532,11 +1612,8 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     self.end_counter_scope(counter_scope);
                     self.counter_set = counter_snapshot;
-                    if let Some(mut atom) = atom {
-                        atom.baseline_shift += self
-                            .vertical_align_baseline_shift_for_atom(&atom, context.block_style)
-                            .glyph_displacement()
-                            .get();
+                    if let Some(atom) = atom {
+                        let atom = self.finish_inline_atom_for_parent(atom, context.block_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
                     } else {
                         let text = inline_text_for_style(box_.core.element, &box_.core.style);
@@ -1578,11 +1655,8 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     self.end_counter_scope(counter_scope);
                     self.counter_set = counter_snapshot;
-                    if let Some(mut atom) = atom {
-                        atom.baseline_shift += self
-                            .vertical_align_baseline_shift_for_atom(&atom, context.block_style)
-                            .glyph_displacement()
-                            .get();
+                    if let Some(atom) = atom {
+                        let atom = self.finish_inline_atom_for_parent(atom, context.block_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
                     }
                 }

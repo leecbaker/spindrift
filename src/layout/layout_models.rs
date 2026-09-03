@@ -21,10 +21,16 @@ pub(in crate::layout) struct PositionedPaintLayer {
     /// page-space stacking context so enclosing scroll containers can form
     /// snap areas only after positioned remapping is complete.
     pub(in crate::layout) source_style: ComputedStyle,
-    /// Pointer identity of the originating generated-box style. The style is
-    /// also retained above for paint effects; this compact identity is used
-    /// only by the final-commit duplicate assertion.
+    /// Runtime identity of this independently constructed layout instance.
+    /// Semantic box identity distinguishes generated siblings; this retains
+    /// distinct speculative/committed captures until replay selects the final
+    /// fragment.
     pub(in crate::layout) source_style_identity: usize,
+    /// Semantic element box that produced this positioned principal.
+    /// Principal and generated boxes share an `ElementId`, so duplicate
+    /// suppression must retain this role rather than infer identity from a
+    /// temporary computed-style address.
+    pub(in crate::layout) source_box: InlineStaticPositionBoxSource,
     /// Distinguishes independently clipped continuations of one positioned
     /// principal in a multicolumn fragmentainer sequence.
     pub(in crate::layout) multicol_fragment_index: Option<usize>,
@@ -32,7 +38,100 @@ pub(in crate::layout) struct PositionedPaintLayer {
     pub(in crate::layout) stack_level: StackLevel,
     pub(in crate::layout) context: PaintStackingContext,
     pub(in crate::layout) links: Vec<RenderedLink>,
-    pub(in crate::layout) escaped_atom_translation: EscapedAtomTranslation,
+    pub(in crate::layout) escaped_atom_replay: EscapedAtomReplay,
+    /// The containing-block stack entry that owns this out-of-flow layer.
+    ///
+    /// `None` denotes an escaped normal-flow paint context, which remains
+    /// subject to every ancestor overflow clip. Positioned layers retain the
+    /// selected stack depth so a deferred clip can determine whether it lies
+    /// between the positioned descendant and its containing block.
+    /// <https://www.w3.org/TR/CSS22/visufx.html#overflow-clipping>
+    pub(in crate::layout) overflow_clip_containing_block:
+        Option<PositionedContainingBlockScopeDepth>,
+}
+
+/// Containing-block ancestry relevant to overflow clipping of one positioned
+/// paint layer.
+///
+/// Absolute and fixed positioning use distinct containing-block stacks. The
+/// depth is recorded at selection time, while the corresponding ancestor box
+/// records the stack depths at which its contents began.
+/// <https://www.w3.org/TR/css-position-3/#def-cb>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum PositionedContainingBlockScopeDepth {
+    Absolute(usize),
+    Fixed(usize),
+}
+
+/// Positioned containing-block ancestry visible at the start of an in-flow
+/// box's contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct PositionedOverflowClipBoundary {
+    absolute_depth: usize,
+    fixed_depth: usize,
+}
+
+impl PositionedOverflowClipBoundary {
+    pub(in crate::layout) const fn new(absolute_depth: usize, fixed_depth: usize) -> Self {
+        Self {
+            absolute_depth,
+            fixed_depth,
+        }
+    }
+
+    /// Whether this ancestor may clip or scroll the escaped layer.
+    ///
+    /// CSS 2.2 excludes overflow clipping by an ancestor between an absolutely
+    /// positioned descendant and its containing block. A containing block
+    /// established by this box or one of its descendants has a greater stack
+    /// depth and therefore remains subject to the box's overflow effects.
+    /// <https://www.w3.org/TR/CSS22/visufx.html#overflow-clipping>
+    pub(in crate::layout) const fn applies_to(self, layer: &PositionedPaintLayer) -> bool {
+        self.applies_to_containing_block(layer.overflow_clip_containing_block)
+    }
+
+    const fn applies_to_containing_block(
+        self,
+        containing_block: Option<PositionedContainingBlockScopeDepth>,
+    ) -> bool {
+        match containing_block {
+            None => true,
+            Some(PositionedContainingBlockScopeDepth::Absolute(depth)) => {
+                depth > self.absolute_depth
+            }
+            Some(PositionedContainingBlockScopeDepth::Fixed(depth)) => depth > self.fixed_depth,
+        }
+    }
+}
+
+#[cfg(test)]
+mod positioned_overflow_clip_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn clip_applies_only_when_the_containing_block_is_inside_its_boundary() {
+        let boundary = PositionedOverflowClipBoundary::new(2, 3);
+
+        assert!(boundary.applies_to_containing_block(None));
+        assert!(
+            !boundary.applies_to_containing_block(Some(
+                PositionedContainingBlockScopeDepth::Absolute(2),
+            ))
+        );
+        assert!(
+            boundary.applies_to_containing_block(Some(
+                PositionedContainingBlockScopeDepth::Absolute(3),
+            ))
+        );
+        assert!(
+            !boundary
+                .applies_to_containing_block(Some(PositionedContainingBlockScopeDepth::Fixed(3),))
+        );
+        assert!(
+            boundary
+                .applies_to_containing_block(Some(PositionedContainingBlockScopeDepth::Fixed(4),))
+        );
+    }
 }
 
 /// Runtime identity for one page-local positioned principal. Rust ownership
@@ -42,6 +141,7 @@ pub(in crate::layout) struct PositionedPaintLayer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::layout) struct PositionedPaintCommitKey {
     source_element: crate::dom::ElementId,
+    source_box: InlineStaticPositionBoxSource,
     source_style_identity: usize,
     multicol_fragment_index: Option<usize>,
 }
@@ -51,6 +151,7 @@ impl PositionedPaintLayer {
         self.source_element
             .map(|source_element| PositionedPaintCommitKey {
                 source_element,
+                source_box: self.source_box,
                 source_style_identity: self.source_style_identity,
                 multicol_fragment_index: self.multicol_fragment_index,
             })
@@ -82,14 +183,49 @@ impl PositionedPaintLayer {
 /// atom's final line position:
 /// <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks> and
 /// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width>.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(in crate::layout) struct EscapedAtomTranslation {
-    pub(in crate::layout) translate_x_with_atom: bool,
-    pub(in crate::layout) translate_y_with_atom: bool,
-    pub(in crate::layout) normalize_x: f32,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) enum EscapedAtomAxisReplay {
+    RetainPageCoordinate,
+    FollowAtomicInline,
 }
 
-impl EscapedAtomTranslation {
+/// Horizontal source used when an escaped positioned layer follows its atom.
+///
+/// Page-owned automatic coordinates were resolved relative to their page
+/// containing block and must first be normalized from that origin. Atom-owned
+/// coordinates already belong to the scratch atomic formatting context, so
+/// replacing its capture origin with an intermediate containing-block origin
+/// would discard positioned-ancestor displacement.
+/// <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) enum EscapedAtomHorizontalReplay {
+    RetainPageCoordinate,
+    FollowFromAtomicCapture,
+    FollowFromPageContainingBlock(PageInlinePosition),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct EscapedAtomReplayPolicy {
+    pub(in crate::layout) horizontal: EscapedAtomHorizontalReplay,
+    pub(in crate::layout) vertical: EscapedAtomAxisReplay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct EscapedAtomReplayTransform {
+    pub(in crate::layout) source_origin: PaintPoint,
+    pub(in crate::layout) horizontal: EscapedAtomAxisReplay,
+    pub(in crate::layout) vertical: EscapedAtomAxisReplay,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(in crate::layout) enum EscapedAtomReplay {
+    #[default]
+    RetainPageCoordinates,
+    Pending(EscapedAtomReplayPolicy),
+    Resolved(EscapedAtomReplayTransform),
+}
+
+impl EscapedAtomReplay {
     pub(in crate::layout) fn none() -> Self {
         Self::default()
     }
@@ -103,54 +239,124 @@ impl EscapedAtomTranslation {
     /// inline-block page.
     /// <https://www.w3.org/TR/css-position-3/#relative-positioning>
     pub(in crate::layout) fn normal_flow_fragment() -> Self {
-        Self {
-            translate_x_with_atom: true,
-            translate_y_with_atom: true,
-            normalize_x: 0.0,
-        }
+        Self::Pending(EscapedAtomReplayPolicy {
+            horizontal: EscapedAtomHorizontalReplay::FollowFromAtomicCapture,
+            vertical: EscapedAtomAxisReplay::FollowAtomicInline,
+        })
     }
 
-    pub(in crate::layout) fn from_positioned_static_axes(
+    pub(in crate::layout) fn for_positioned_box(
         containing_block: ContainingBlock,
+        containing_block_is_atom_local: bool,
         uses_static_x: bool,
         uses_static_y: bool,
-        normalize_static_x: bool,
     ) -> Self {
-        Self {
-            translate_x_with_atom: uses_static_x,
-            translate_y_with_atom: uses_static_y,
-            normalize_x: if uses_static_x && normalize_static_x {
-                -containing_block.x()
+        let follows_y = containing_block_is_atom_local || uses_static_y;
+        Self::Pending(EscapedAtomReplayPolicy {
+            horizontal: if containing_block_is_atom_local {
+                EscapedAtomHorizontalReplay::FollowFromAtomicCapture
+            } else if uses_static_x {
+                EscapedAtomHorizontalReplay::FollowFromPageContainingBlock(PageInlinePosition::new(
+                    containing_block.x(),
+                ))
             } else {
-                0.0
+                EscapedAtomHorizontalReplay::RetainPageCoordinate
             },
+            vertical: if follows_y {
+                EscapedAtomAxisReplay::FollowAtomicInline
+            } else {
+                EscapedAtomAxisReplay::RetainPageCoordinate
+            },
+        })
+    }
+
+    pub(in crate::layout) fn resolve_from_capture_origin(self, capture_origin: PaintPoint) -> Self {
+        match self {
+            Self::Pending(policy) => {
+                let (horizontal, source_x) = match policy.horizontal {
+                    EscapedAtomHorizontalReplay::RetainPageCoordinate => (
+                        EscapedAtomAxisReplay::RetainPageCoordinate,
+                        capture_origin.x,
+                    ),
+                    EscapedAtomHorizontalReplay::FollowFromAtomicCapture => {
+                        (EscapedAtomAxisReplay::FollowAtomicInline, capture_origin.x)
+                    }
+                    EscapedAtomHorizontalReplay::FollowFromPageContainingBlock(origin) => {
+                        (EscapedAtomAxisReplay::FollowAtomicInline, origin.points())
+                    }
+                };
+                Self::Resolved(EscapedAtomReplayTransform {
+                    source_origin: PaintPoint::new(source_x, capture_origin.y),
+                    horizontal,
+                    vertical: policy.vertical,
+                })
+            }
+            Self::RetainPageCoordinates | Self::Resolved(_) => self,
         }
     }
 
-    pub(in crate::layout) fn escape_offset(self, atom_local_y_offset: f32) -> PaintTranslation {
+    pub(in crate::layout) fn translation_to(self, final_origin: PaintPoint) -> PaintTranslation {
+        debug_assert!(
+            !matches!(self, Self::Pending(_)),
+            "escaped atomic-inline replay must be resolved at capture"
+        );
+        let Self::Resolved(transform) = self else {
+            return PaintTranslation::identity();
+        };
         PaintTranslation::new(
-            self.normalize_x,
-            if self.translate_y_with_atom {
-                atom_local_y_offset
-            } else {
-                0.0
+            match transform.horizontal {
+                EscapedAtomAxisReplay::RetainPageCoordinate => 0.0,
+                EscapedAtomAxisReplay::FollowAtomicInline => {
+                    final_origin.x - transform.source_origin.x
+                }
+            },
+            match transform.vertical {
+                EscapedAtomAxisReplay::RetainPageCoordinate => 0.0,
+                EscapedAtomAxisReplay::FollowAtomicInline => {
+                    final_origin.y - transform.source_origin.y
+                }
             },
         )
     }
 
-    pub(in crate::layout) fn atom_offset(self, atom_x: f32, atom_y: f32) -> PaintTranslation {
-        PaintTranslation::new(
-            if self.translate_x_with_atom {
-                atom_x
-            } else {
-                0.0
-            },
-            if self.translate_y_with_atom {
-                atom_y
-            } else {
-                0.0
-            },
-        )
+    /// Rebase a layer that has just been placed inside an enclosing atomic
+    /// inline's scratch page. Axes retained in page space remain retained;
+    /// axes that followed the inner atom acquire the enclosing capture origin
+    /// when that outer atom is sealed.
+    pub(in crate::layout) fn pending_in_enclosing_atomic_space(self) -> Self {
+        let (horizontal, vertical) = match self {
+            Self::Resolved(transform) => (
+                match transform.horizontal {
+                    EscapedAtomAxisReplay::RetainPageCoordinate => {
+                        EscapedAtomHorizontalReplay::RetainPageCoordinate
+                    }
+                    EscapedAtomAxisReplay::FollowAtomicInline => {
+                        EscapedAtomHorizontalReplay::FollowFromAtomicCapture
+                    }
+                },
+                transform.vertical,
+            ),
+            Self::RetainPageCoordinates => (
+                EscapedAtomHorizontalReplay::RetainPageCoordinate,
+                EscapedAtomAxisReplay::RetainPageCoordinate,
+            ),
+            Self::Pending(policy) => (
+                match policy.horizontal {
+                    EscapedAtomHorizontalReplay::RetainPageCoordinate => {
+                        EscapedAtomHorizontalReplay::RetainPageCoordinate
+                    }
+                    EscapedAtomHorizontalReplay::FollowFromAtomicCapture
+                    | EscapedAtomHorizontalReplay::FollowFromPageContainingBlock(_) => {
+                        EscapedAtomHorizontalReplay::FollowFromAtomicCapture
+                    }
+                },
+                policy.vertical,
+            ),
+        };
+        Self::Pending(EscapedAtomReplayPolicy {
+            horizontal,
+            vertical,
+        })
     }
 
     /// Select the page that owns a replayed escaped layer.
@@ -165,10 +371,17 @@ impl EscapedAtomTranslation {
         atom_page_index: usize,
         positioned_page_index: usize,
     ) -> usize {
-        if self.translate_y_with_atom {
-            atom_page_index
-        } else {
-            positioned_page_index
+        match self {
+            Self::Resolved(EscapedAtomReplayTransform {
+                vertical: EscapedAtomAxisReplay::FollowAtomicInline,
+                ..
+            }) => atom_page_index,
+            Self::RetainPageCoordinates
+            | Self::Pending(_)
+            | Self::Resolved(EscapedAtomReplayTransform {
+                vertical: EscapedAtomAxisReplay::RetainPageCoordinate,
+                ..
+            }) => positioned_page_index,
         }
     }
 }
@@ -1043,6 +1256,10 @@ pub(in crate::layout) struct InlineWord {
     pub(in crate::layout) mergeable: bool,
     pub(in crate::layout) source: InlineTextSource,
     pub(in crate::layout) hanging_edges: InlineHangingEdges,
+    /// A positioned ancestor excluded from this occurrence's content-edge
+    /// geometry after CSS Text relocates boundary whitespace outside it.
+    pub(in crate::layout) excluded_positioning_geometry_source:
+        Option<InlinePositioningContainingBlockId>,
     pub(in crate::layout) ancestor_inline_decorations: Rc<[InlineAncestorDecoration]>,
 }
 
@@ -1425,6 +1642,8 @@ pub(in crate::layout) struct InlineFragmentData {
     /// mixed-inline visual reordering so the final paint shaping pass can
     /// preserve the already-selected order and glyph mirroring level.
     pub(in crate::layout) resolved_bidi_direction: Option<ResolvedBidiDirection>,
+    pub(in crate::layout) excluded_positioning_geometry_source:
+        Option<InlinePositioningContainingBlockId>,
     pub(in crate::layout) ancestor_inline_decorations: Rc<[InlineAncestorDecoration]>,
     /// The source inline ancestry used to resolve visual tracking boundaries.
     pub(in crate::layout) tracking_scope: Option<Rc<InlineTrackingScope>>,
@@ -1637,6 +1856,7 @@ impl InlineFragment {
                 boundary_shaped_source: None,
                 boundary_shaped_range: None,
                 resolved_bidi_direction: None,
+                excluded_positioning_geometry_source: None,
                 ancestor_inline_decorations,
                 tracking_scope: None,
                 starts_visual_fragment: false,
@@ -1654,6 +1874,20 @@ impl InlineFragment {
     pub(in crate::layout) fn with_baseline_shift(mut self, baseline_shift: f32) -> Self {
         self.baseline_shift = baseline_shift;
         self
+    }
+
+    pub(in crate::layout) fn with_excluded_positioning_geometry_source(
+        mut self,
+        source: Option<InlinePositioningContainingBlockId>,
+    ) -> Self {
+        Rc::make_mut(&mut self.data).excluded_positioning_geometry_source = source;
+        self
+    }
+
+    pub(in crate::layout) fn excluded_positioning_geometry_source(
+        &self,
+    ) -> Option<InlinePositioningContainingBlockId> {
+        self.data.excluded_positioning_geometry_source
     }
 
     pub(in crate::layout) fn with_visual_offset(
@@ -2073,6 +2307,12 @@ impl<'a> PendingInlineFragment<'a> {
     ) -> Option<InlineScopeLineRelativeAlignment> {
         self.fragment.line_relative_alignment()
     }
+
+    pub(in crate::layout) fn excluded_positioning_geometry_source(
+        self,
+    ) -> Option<InlinePositioningContainingBlockId> {
+        self.fragment.excluded_positioning_geometry_source()
+    }
 }
 
 impl InlineFragmentAccess for PendingInlineFragment<'_> {
@@ -2250,8 +2490,8 @@ pub(in crate::layout) struct InlineAncestorDecoration {
     pub(in crate::layout) paints_background_or_border: bool,
     /// A positioned inline scope whose generated line fragment contains this
     /// source. This is metadata-only when `style` has no paintable decoration.
-    /// It lets positioned-layout recover the physical union of fragmented
-    /// inline boxes without inferring ownership from visual order.
+    /// It lets positioned layout collect independent logical content-edge
+    /// extrema without inferring ownership from visual or paint order.
     pub(in crate::layout) positioning_containing_block_id:
         Option<InlinePositioningContainingBlockId>,
     /// Identity of an opacity-owning lexical inline scope.
@@ -3081,11 +3321,211 @@ pub(in crate::layout) struct HangingPunctuationWidths {
 pub(in crate::layout) struct PreparedInlineLine {
     pub(in crate::layout) metrics: InlineLineMetrics,
     pub(in crate::layout) paint_items: Vec<PreparedInlinePaintItem>,
+    /// Used content-edge geometry for positioned inline ancestors on this
+    /// line. This is layout output, not paint metadata: bidi can split one
+    /// inline into disjoint visual fragments, while CSS Positioned Layout
+    /// selects the start-most and end-most content edges independently.
+    /// <https://drafts.csswg.org/css-position-3/#def-cb>
+    pub(in crate::layout) positioning_geometry: Vec<PreparedInlinePositioningGeometry>,
     /// Origin-owned decorating-box fragment geometry selected for this line.
     /// It is intentionally separate from text receiver provenance, which is
     /// segmented for paint but cannot define CSS percentage bases.
     pub(in crate::layout) decoration_origin_fragments:
         Rc<[crate::layout::text_paint::TextDecorationOriginFragmentGeometry]>,
+}
+
+/// Logical content-edge extrema contributed by one positioned inline on one
+/// prepared line. The four coordinates deliberately do not form a rectangle:
+/// disjoint bidi fragments can contribute different extrema.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct PreparedInlineLogicalContentEdges {
+    inline_start: InlinePositioningInlineCoordinate,
+    inline_end: InlinePositioningInlineCoordinate,
+    block_start: InlinePositioningBlockCoordinate,
+    block_end: InlinePositioningBlockCoordinate,
+}
+
+impl PreparedInlineLogicalContentEdges {
+    fn from_rect(rect: PageTopRect, axes: WritingModeAxes) -> Self {
+        Self {
+            inline_start: InlinePositioningLogicalCoordinate::from_rect_side(
+                rect,
+                axes.physical_side(LogicalSide::InlineStart),
+            ),
+            inline_end: InlinePositioningLogicalCoordinate::from_rect_side(
+                rect,
+                axes.physical_side(LogicalSide::InlineEnd),
+            ),
+            block_start: InlinePositioningLogicalCoordinate::from_rect_side(
+                rect,
+                axes.physical_side(LogicalSide::BlockStart),
+            ),
+            block_end: InlinePositioningLogicalCoordinate::from_rect_side(
+                rect,
+                axes.physical_side(LogicalSide::BlockEnd),
+            ),
+        }
+    }
+
+    fn extend_with_rect(&mut self, rect: PageTopRect, axes: WritingModeAxes) {
+        let candidate = Self::from_rect(rect, axes);
+        self.inline_start = self.inline_start.farther_toward(
+            candidate.inline_start,
+            axes.physical_side(LogicalSide::InlineStart),
+        );
+        self.inline_end = self.inline_end.farther_toward(
+            candidate.inline_end,
+            axes.physical_side(LogicalSide::InlineEnd),
+        );
+        self.block_start = self.block_start.farther_toward(
+            candidate.block_start,
+            axes.physical_side(LogicalSide::BlockStart),
+        );
+        self.block_end = self.block_end.farther_toward(
+            candidate.block_end,
+            axes.physical_side(LogicalSide::BlockEnd),
+        );
+    }
+
+    pub(in crate::layout) fn start_corner(self) -> InlinePositioningLogicalCorner {
+        InlinePositioningLogicalCorner {
+            inline: self.inline_start,
+            block: self.block_start,
+        }
+    }
+
+    pub(in crate::layout) fn end_corner(self) -> InlinePositioningLogicalCorner {
+        InlinePositioningLogicalCorner {
+            inline: self.inline_end,
+            block: self.block_end,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum InlinePositioningInlineAxis {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum InlinePositioningBlockAxis {}
+
+/// A page-space coordinate whose value is associated with one logical axis.
+///
+/// The scalar is already physically projected, but the axis marker prevents
+/// callers from swapping the inline and block components before the named
+/// containing-block adapter consumes them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct InlinePositioningLogicalCoordinate<Axis> {
+    physical_page_coordinate: f32,
+    axis: std::marker::PhantomData<Axis>,
+}
+
+pub(in crate::layout) type InlinePositioningInlineCoordinate =
+    InlinePositioningLogicalCoordinate<InlinePositioningInlineAxis>;
+pub(in crate::layout) type InlinePositioningBlockCoordinate =
+    InlinePositioningLogicalCoordinate<InlinePositioningBlockAxis>;
+
+impl<Axis> InlinePositioningLogicalCoordinate<Axis> {
+    pub(in crate::layout) const fn new(physical_page_coordinate: f32) -> Self {
+        Self {
+            physical_page_coordinate,
+            axis: std::marker::PhantomData,
+        }
+    }
+
+    fn from_rect_side(rect: PageTopRect, side: PhysicalSide) -> Self {
+        Self::new(match side {
+            PhysicalSide::Left => rect.x(),
+            PhysicalSide::Right => rect.x() + rect.width(),
+            PhysicalSide::Top => rect.top_y(),
+            PhysicalSide::Bottom => rect.bottom_y(),
+        })
+    }
+
+    fn farther_toward(self, candidate: Self, side: PhysicalSide) -> Self {
+        let physical_page_coordinate = match side {
+            PhysicalSide::Left | PhysicalSide::Bottom => self
+                .physical_page_coordinate
+                .min(candidate.physical_page_coordinate),
+            PhysicalSide::Right | PhysicalSide::Top => self
+                .physical_page_coordinate
+                .max(candidate.physical_page_coordinate),
+        };
+        Self::new(physical_page_coordinate)
+    }
+
+    pub(in crate::layout) const fn physical_page_coordinate(self) -> f32 {
+        self.physical_page_coordinate
+    }
+}
+
+/// A logical corner whose coordinates remain associated with their axes until
+/// the containing-block writing mode projects them into page space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct InlinePositioningLogicalCorner {
+    pub(in crate::layout) inline: InlinePositioningInlineCoordinate,
+    pub(in crate::layout) block: InlinePositioningBlockCoordinate,
+}
+
+/// Prepared geometry belonging to one positioned inline source on one line.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) struct PreparedInlinePositioningGeometry {
+    pub(in crate::layout) source: InlinePositioningContainingBlockId,
+    pub(in crate::layout) axes: WritingModeAxes,
+    pub(in crate::layout) content_edges: Option<PreparedInlineLogicalContentEdges>,
+    pub(in crate::layout) start_marker: Option<PageTopRect>,
+    pub(in crate::layout) end_marker: Option<PageTopRect>,
+}
+
+impl PreparedInlinePositioningGeometry {
+    pub(in crate::layout) fn new(
+        source: InlinePositioningContainingBlockId,
+        axes: WritingModeAxes,
+    ) -> Self {
+        Self {
+            source,
+            axes,
+            content_edges: None,
+            start_marker: None,
+            end_marker: None,
+        }
+    }
+
+    pub(in crate::layout) fn record_content_rect(&mut self, rect: PageTopRect) {
+        if let Some(edges) = &mut self.content_edges {
+            edges.extend_with_rect(rect, self.axes);
+        } else {
+            self.content_edges = Some(PreparedInlineLogicalContentEdges::from_rect(
+                rect, self.axes,
+            ));
+        }
+    }
+
+    pub(in crate::layout) fn record_marker(&mut self, edge: InlineLogicalEdge, rect: PageTopRect) {
+        match edge {
+            InlineLogicalEdge::Start => self.start_marker = Some(rect),
+            InlineLogicalEdge::End => self.end_marker = Some(rect),
+        }
+    }
+
+    pub(in crate::layout) fn start_corner(&self) -> Option<InlinePositioningLogicalCorner> {
+        self.content_edges
+            .map(PreparedInlineLogicalContentEdges::start_corner)
+            .or_else(|| {
+                self.start_marker.map(|marker| {
+                    PreparedInlineLogicalContentEdges::from_rect(marker, self.axes).start_corner()
+                })
+            })
+    }
+
+    pub(in crate::layout) fn end_corner(&self) -> Option<InlinePositioningLogicalCorner> {
+        self.content_edges
+            .map(PreparedInlineLogicalContentEdges::end_corner)
+            .or_else(|| {
+                self.end_marker.map(|marker| {
+                    PreparedInlineLogicalContentEdges::from_rect(marker, self.axes).end_corner()
+                })
+            })
+    }
 }
 
 /// A positioned inline paint item inside a prepared line box.
@@ -3101,6 +3541,75 @@ pub(in crate::layout) enum PreparedInlinePaintItem {
     FragmentBackground(PreparedInlineFragment),
     TextGroup(PreparedInlineTextGroup),
     Atom(PreparedInlineAtom),
+    Scope(Box<PreparedInlinePaintScope>),
+}
+
+/// The generated inline-like box that owns a prepared paint-effect subtree.
+///
+/// Keeping this hierarchy in prepared layout output makes non-inherited
+/// effects apply once to the generated box and all of its contents, rather
+/// than being copied onto independently painted descendants.
+/// <https://drafts.csswg.org/css-pseudo-4/#first-line-styling> and
+/// <https://drafts.csswg.org/css-color-4/#transparency>
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct PreparedInlinePaintScope {
+    pub(in crate::layout) kind: PreparedInlinePaintScopeKind,
+    pub(in crate::layout) opacity: css::Opacity,
+    pub(in crate::layout) items: Vec<PreparedInlinePaintItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum PreparedInlinePaintScopeKind {
+    FirstLine,
+}
+
+impl PreparedInlinePaintItem {
+    /// Visit leaf paint items in tree order, descending through generated
+    /// paint scopes without exposing scope representation to geometry users.
+    pub(in crate::layout) fn for_each_leaf<'a>(
+        &'a self,
+        visit: &mut impl FnMut(&'a PreparedInlinePaintItem),
+    ) {
+        match self {
+            Self::Scope(scope) => {
+                for item in &scope.items {
+                    item.for_each_leaf(visit);
+                }
+            }
+            Self::FragmentBackground(_) | Self::TextGroup(_) | Self::Atom(_) => visit(self),
+        }
+    }
+
+    fn find_map_leaf<'a, T>(
+        &'a self,
+        find: &mut impl FnMut(&'a PreparedInlinePaintItem) -> Option<T>,
+    ) -> Option<T> {
+        match self {
+            Self::Scope(scope) => scope.items.iter().find_map(|item| item.find_map_leaf(find)),
+            Self::FragmentBackground(_) | Self::TextGroup(_) | Self::Atom(_) => find(self),
+        }
+    }
+}
+
+impl PreparedInlineLine {
+    /// Visit every prepared leaf while preserving nested effect-scope order.
+    pub(in crate::layout) fn for_each_paint_leaf<'a>(
+        &'a self,
+        mut visit: impl FnMut(&'a PreparedInlinePaintItem),
+    ) {
+        for item in &self.paint_items {
+            item.for_each_leaf(&mut visit);
+        }
+    }
+
+    pub(in crate::layout) fn find_map_paint_leaf<'a, T>(
+        &'a self,
+        mut find: impl FnMut(&'a PreparedInlinePaintItem) -> Option<T>,
+    ) -> Option<T> {
+        self.paint_items
+            .iter()
+            .find_map(|item| item.find_map_leaf(&mut find))
+    }
 }
 
 /// A positioned inline text fragment with its line-fragment geometry.
@@ -3649,7 +4158,10 @@ mod child_available_space_tests {
         let actual_containing_block =
             ContainingBlock::from_page_top_rect(PageTopRect::new(48.0, 720.0, 500.0, 700.0))
                 .on_page(3);
-        let static_position = AbsoluteStaticPosition::from_page_rect(0.0, 120.0, 9_960.0);
+        let static_position = AtomicInlineStaticPosition::new(
+            PageTopRect::new(0.0, 9_960.0, 120.0, 40.0),
+            WritingModeAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+        );
         let context = EscapedAtomPositioningContext {
             actual_containing_block,
             static_position,
@@ -3657,31 +4169,139 @@ mod child_available_space_tests {
 
         assert_eq!(context.actual_containing_block, actual_containing_block);
         assert_eq!(context.actual_containing_block.origin_page_index, Some(3));
-        assert_eq!(context.static_position.page_left_x, 0.0);
-        assert_eq!(context.static_position.page_right_x, 120.0);
-        assert_eq!(context.static_position.page_top_y, 9_960.0);
-
-        let auto_axes = EscapedAtomTranslation::from_positioned_static_axes(
-            context.actual_containing_block,
-            true,
-            true,
-            true,
+        assert_eq!(
+            context.static_position.content_rect,
+            PageTopRect::new(0.0, 9_960.0, 120.0, 40.0)
         );
-        assert_eq!(auto_axes.escape_offset(-9_940.0).x, -48.0);
-        assert_eq!(auto_axes.escape_offset(-9_940.0).y, -9_940.0);
-        assert_eq!(auto_axes.atom_offset(160.0, 640.0).x, 160.0);
-        assert_eq!(auto_axes.atom_offset(160.0, 640.0).y, 640.0);
+        assert_eq!(
+            context.static_position.axes,
+            WritingModeAxes::new(WritingMode::HorizontalTb, Direction::Ltr)
+        );
 
-        let explicit_axes = EscapedAtomTranslation::from_positioned_static_axes(
+        let auto_axes = EscapedAtomReplay::for_positioned_box(
             context.actual_containing_block,
             false,
-            false,
-            false,
+            true,
+            true,
+        )
+        .resolve_from_capture_origin(PaintPoint::new(0.0, 9_940.0));
+        assert_eq!(
+            auto_axes.translation_to(PaintPoint::new(160.0, 640.0)),
+            PaintTranslation::new(112.0, -9_300.0)
         );
-        assert_eq!(explicit_axes.atom_offset(160.0, 640.0).x, 0.0);
-        assert_eq!(explicit_axes.atom_offset(160.0, 640.0).y, 0.0);
+
+        let explicit_axes = EscapedAtomReplay::for_positioned_box(
+            context.actual_containing_block,
+            false,
+            false,
+            false,
+        )
+        .resolve_from_capture_origin(PaintPoint::new(0.0, 9_940.0));
+        assert_eq!(
+            explicit_axes.translation_to(PaintPoint::new(160.0, 640.0)),
+            PaintTranslation::identity()
+        );
         assert_eq!(auto_axes.replay_page_index(7, 3), 7);
         assert_eq!(explicit_axes.replay_page_index(7, 3), 3);
+
+        let atom_local_explicit = EscapedAtomReplay::for_positioned_box(
+            context.actual_containing_block,
+            true,
+            false,
+            false,
+        )
+        .resolve_from_capture_origin(PaintPoint::new(0.0, 9_940.0));
+        assert_eq!(
+            atom_local_explicit.translation_to(PaintPoint::new(160.0, 640.0)),
+            PaintTranslation::new(160.0, -9_300.0)
+        );
+        assert_eq!(atom_local_explicit.replay_page_index(7, 3), 7);
+
+        let rebased = atom_local_explicit
+            .pending_in_enclosing_atomic_space()
+            .resolve_from_capture_origin(PaintPoint::new(20.0, 8_000.0));
+        assert_eq!(
+            rebased.translation_to(PaintPoint::new(200.0, 500.0)),
+            PaintTranslation::new(180.0, -7_500.0)
+        );
+    }
+
+    #[test]
+    fn escaped_atom_replay_uses_owner_specific_horizontal_sources() {
+        let containing_block =
+            ContainingBlock::from_page_top_rect(PageTopRect::new(40.0, 80.0, 50.0, 60.0));
+        let capture_origin = PaintPoint::new(10.0, 70.0);
+        let final_origin = PaintPoint::new(100.0, 20.0);
+
+        let cases = [
+            (false, false, PaintTranslation::identity()),
+            (false, true, PaintTranslation::new(60.0, 0.0)),
+            (true, false, PaintTranslation::new(90.0, -50.0)),
+            (true, true, PaintTranslation::new(90.0, -50.0)),
+        ];
+        for (atom_owned, uses_static_x, expected) in cases {
+            let replay = EscapedAtomReplay::for_positioned_box(
+                containing_block,
+                atom_owned,
+                uses_static_x,
+                atom_owned,
+            )
+            .resolve_from_capture_origin(capture_origin);
+            assert_eq!(
+                replay.translation_to(final_origin),
+                expected,
+                "atom_owned={atom_owned}, uses_static_x={uses_static_x}",
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_inline_static_position_projects_logical_axes() {
+        let content_rect = PageTopRect::new(7.0, 91.0, 31.0, 47.0);
+        for (writing_mode, direction, expected_area) in [
+            (
+                WritingMode::HorizontalTb,
+                Direction::Ltr,
+                PageTopRect::new(7.0, 91.0, 31.0, 0.0),
+            ),
+            (
+                WritingMode::HorizontalTb,
+                Direction::Rtl,
+                PageTopRect::new(7.0, 91.0, 31.0, 0.0),
+            ),
+            (
+                WritingMode::SidewaysRl,
+                Direction::Ltr,
+                PageTopRect::new(38.0, 91.0, 0.0, 47.0),
+            ),
+            (
+                WritingMode::SidewaysRl,
+                Direction::Rtl,
+                PageTopRect::new(38.0, 91.0, 0.0, 47.0),
+            ),
+            (
+                WritingMode::SidewaysLr,
+                Direction::Ltr,
+                PageTopRect::new(7.0, 91.0, 0.0, 47.0),
+            ),
+            (
+                WritingMode::SidewaysLr,
+                Direction::Rtl,
+                PageTopRect::new(7.0, 91.0, 0.0, 47.0),
+            ),
+        ] {
+            let source = AtomicInlineStaticPosition::new(
+                content_rect,
+                WritingModeAxes::new(writing_mode, direction),
+            );
+            let rectangle = source
+                .in_atomic_space()
+                .static_position_rectangle()
+                .unwrap();
+            assert_eq!(rectangle.area, expected_area);
+            assert_eq!(rectangle.writing_mode, writing_mode);
+            assert_eq!(rectangle.direction, direction);
+        }
     }
 }
 

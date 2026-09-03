@@ -119,10 +119,11 @@ behavior where the specs leave implementation details ambiguous.
   its parent start margin queries the counterfactual parent-start edge. The
   latter can produce negative clearance when its actual top margin extends
   below the float, without extending the parent background.
-- A cleared parent resolves its complete adjoining first-child start-margin
-  set before calculating clearance, then consumes that descendant contribution
-  during child layout so negative child margins are neither lost nor applied a
-  second time.
+- A cleared parent resolves its complete adjoining start-margin chain before
+  calculating clearance. The chain continues through self-collapsing
+  descendants and siblings while skipping intervening floats and positioned
+  boxes, then the used child traversal consumes each contribution only at its
+  normal source boundary.
 - Float painting preserves per-fragment opacity, transform, and overflow clip
   effects.
 - Bookmarks, anchors, named strings, and running elements produced while laying

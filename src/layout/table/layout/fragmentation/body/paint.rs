@@ -40,12 +40,12 @@ use crate::layout::table::{
     table_row_span_height, table_vertical_edge_spacing,
 };
 use crate::layout::{
-    AssignmentPlacement, BlockSizePercentageBasis, ContainingBlock, EscapedAtomTranslation,
+    AssignmentPlacement, BlockSizePercentageBasis, ContainingBlock, EscapedAtomReplay,
     FragmentPageMetadata, FragmentainerKind, GeneratedPseudoCounterMode, InlineItem,
-    InlineVisualOffset, LayoutBuilder, LogicalBlockContentSize, PageInlineSpan, PageTopPoint,
-    PageTopRect, PaintBackgroundArea, PhysicalContentHeight, PhysicalContentWidth,
-    PositionedContainingBlockMode, PositionedPaintLayer, RelativeOffset, ReplayFloatScope,
-    StackingContextPolicy, UsedOverflowAxes,
+    InlineStaticPositionBoxSource, InlineVisualOffset, LayoutBuilder, LogicalBlockContentSize,
+    PageInlineSpan, PageTopPoint, PageTopRect, PaintBackgroundArea, PhysicalContentHeight,
+    PhysicalContentWidth, PositionedContainingBlockMode, PositionedPaintLayer, RelativeOffset,
+    ReplayFloatScope, StackingContextPolicy, UsedOverflowAxes,
     background_image_primitives_for_style_with_paint_areas, block_paint_ops_with_phases,
     box_content_contour_is_non_rectangular, box_tree, effective_overflow_for_style, inline_layout,
     paint_space_rect, property_containment_establishes_independent_formatting_context,
@@ -326,17 +326,19 @@ impl<'a> LayoutBuilder<'a> {
             transaction_depth: self.positioned_paint_transaction_depth,
             source_element: None,
             source_style: style.clone(),
-            source_style_identity: style as *const ComputedStyle as usize,
+            source_style_identity: 0,
+            source_box: InlineStaticPositionBoxSource::Principal,
             multicol_fragment_index: None,
             source_is_target: false,
             stack_level: policy.stack_level,
             context,
             links: fragment.links,
-            escaped_atom_translation: if self.escaped_atom_positioning_depth > 0 {
-                EscapedAtomTranslation::normal_flow_fragment()
+            escaped_atom_replay: if self.escaped_atom_positioning_depth > 0 {
+                EscapedAtomReplay::normal_flow_fragment()
             } else {
-                EscapedAtomTranslation::none()
+                EscapedAtomReplay::none()
             },
+            overflow_clip_containing_block: None,
         });
     }
 
@@ -604,8 +606,7 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
         for relative_paint in relative_structural_paints {
-            let source_style_identity =
-                &relative_paint.source_style as *const ComputedStyle as usize;
+            let source_box = InlineStaticPositionBoxSource::Principal;
             let policy = StackingContextPolicy::for_non_positioned_style_effect(
                 &relative_paint.style,
                 relative_paint.bounds,
@@ -625,17 +626,19 @@ impl<'a> LayoutBuilder<'a> {
                 transaction_depth: self.positioned_paint_transaction_depth,
                 source_element: None,
                 source_style: relative_paint.source_style,
-                source_style_identity,
+                source_style_identity: 0,
+                source_box,
                 multicol_fragment_index: None,
                 source_is_target: false,
                 stack_level: policy.stack_level,
                 context,
                 links: Vec::new(),
-                escaped_atom_translation: if self.escaped_atom_positioning_depth > 0 {
-                    EscapedAtomTranslation::normal_flow_fragment()
+                escaped_atom_replay: if self.escaped_atom_positioning_depth > 0 {
+                    EscapedAtomReplay::normal_flow_fragment()
                 } else {
-                    EscapedAtomTranslation::none()
+                    EscapedAtomReplay::none()
                 },
+                overflow_clip_containing_block: None,
             });
         }
 

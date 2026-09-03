@@ -211,6 +211,28 @@ impl<'a> LayoutBuilder<'a> {
         LogicalInlineContentSize::new(content_box_pt(self.current_content_logical_inline_size()))
     }
 
+    /// Select the available logical inline measure for a descendant flow.
+    ///
+    /// Parallel writing modes inherit the containing formatting context's
+    /// already-selected logical inline measure, even when its corresponding
+    /// physical height is automatic and therefore not a percentage basis.
+    /// Only an orthogonal descendant consults the physical-axis fallback
+    /// policy carried by [`ChildAvailableSpace`].
+    /// <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
+    pub(in crate::layout) fn current_available_logical_inline_size_for(
+        &self,
+        writing_mode: WritingMode,
+    ) -> LogicalInlineContentSize {
+        let containing_space = self.current_child_available_space();
+        if WritingModeAxes::new(containing_space.writing_mode, Direction::Ltr).swaps_physical_axes()
+            == WritingModeAxes::new(writing_mode, Direction::Ltr).swaps_physical_axes()
+        {
+            self.current_content_logical_inline_content_size()
+        } else {
+            containing_space.logical_inline_size_for(writing_mode)
+        }
+    }
+
     /// Return the active containing block's definite logical inline basis for
     /// CSS edge-percentage resolution.
     pub(in crate::layout) fn current_content_logical_inline_percentage_basis(

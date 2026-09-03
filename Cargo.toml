@@ -8,6 +8,14 @@ repository = "https://github.com/lee/quire"
 readme = "README.md"
 keywords = ["html", "css", "pdf", "renderer", "weasyprint"]
 categories = ["command-line-utilities", "rendering"]
+exclude = [
+    "doc/stack_profiling.md",
+    "example_html_reports/**",
+    "example_reports_*/**",
+    "render_example_reports*",
+    "request_*_debug.html",
+    "request_*_default_stack.html",
+]
 
 [lib]
 name = "quire"

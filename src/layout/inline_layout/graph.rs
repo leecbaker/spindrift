@@ -50,7 +50,7 @@ mod line_edges;
 mod line_selection;
 pub(in crate::layout) use self::line_edges::*;
 mod line_geometry;
-use self::line_geometry::*;
+pub(in crate::layout) use self::line_geometry::*;
 
 #[cfg(test)]
 mod tests;

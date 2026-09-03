@@ -20,28 +20,6 @@ enum PostLayoutHeightReplay {
     BorderBox(BorderBoxLength),
 }
 
-/// Classify the one traversal that owns a block's child source.
-///
-/// The facts supplied here come from the normalized formatting-box stream and,
-/// for a direct float-only source, from the direct DOM. The latter is needed
-/// because a float's descendants must remain terminal at the parent's inline
-/// boundary.
-fn classify_child_traversal_mode(
-    ordered_mixed_flow_required: bool,
-    direct_float_children: bool,
-    inline_sequence_required: bool,
-) -> ChildTraversalMode {
-    if ordered_mixed_flow_required {
-        ChildTraversalMode::OrderedMixed
-    } else if direct_float_children {
-        ChildTraversalMode::DirectFloatChildren
-    } else if inline_sequence_required {
-        ChildTraversalMode::InlineSequence
-    } else {
-        ChildTraversalMode::BlockChildren
-    }
-}
-
 impl PostLayoutHeightReplay {
     fn from_specified_length(value: LayoutLength, box_sizing: BoxSizing) -> Self {
         match box_sizing {
@@ -540,16 +518,15 @@ impl<'a> LayoutBuilder<'a> {
         let fragmentainer_kind = self.active_fragmentainer_kind();
         let mut geometry =
             self.block_layout_geometry(element, source_style, stylesheets, child_boxes);
-        if source_style.writing_mode == WritingMode::HorizontalTb
-            && let Some(logical_inline_size) = replayed_item_logical_inline_size
-        {
-            // Flex replay enters through a border-box containing span, but
-            // horizontal inline layout consumes the item's final content-box
+        if let Some(logical_inline_size) = replayed_item_logical_inline_size {
+            // An isolated item replay can enter through a containing span that
+            // differs from the principal box's already-selected content-box
             // inline measure. The typed replay boundary performed that box
             // conversion before element dispatch; retain it for this root
-            // only rather than relabeling the border-box availability.
+            // only rather than relabeling the containing availability.
             // <https://www.w3.org/TR/css-flexbox-1/#flex-items>
             // <https://www.w3.org/TR/css-sizing-3/#box-sizing>
+            // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
             geometry.content_logical_inline_size = logical_inline_size;
         }
         // All normal-flow state that must remain valid while descendants
@@ -870,80 +847,56 @@ impl<'a> LayoutBuilder<'a> {
         let is_document_canvas = self.element_uses_document_canvas_flow(element);
         let can_adjoin_first_child_margin =
             !is_document_canvas || !element.tag.eq_ignore_ascii_case("html");
-        let (hypothetical_start_margin, _clearance_hypothetical_uses_adjoining_start_margin) =
-            if geometry.style.clear != Clear::None {
+        let hypothetical_start_margin =
+            if geometry.style.clear != Clear::None && can_adjoin_first_child_margin {
                 if let Some(children) = child_boxes {
-                    let can_adjoin = can_adjoin_first_child_margin
-                        && can_collapse_block_start_margin(
+                    if can_collapse_block_start_margin(
+                        element,
+                        &geometry.style,
+                        geometry.border_edges,
+                        has_direct_inline_content_box(children),
+                        self.used_overflow_for_element(element, &geometry.style),
+                    ) {
+                        clear_none_hypothetical_start_margin_from_boxes(
                             element,
                             &geometry.style,
-                            geometry.border_edges,
-                            has_direct_inline_content_box(children),
-                            self.used_overflow_for_element(element, &geometry.style),
-                        )
-                        && collapsible_first_child_start_margin_from_boxes(
                             children,
-                            element,
-                            &geometry.style,
                             self.document_canvas_overflow,
                         )
-                        .is_some();
-                    (
-                        if can_adjoin_first_child_margin {
-                            collapsible_start_margin_for_box(
-                                element,
-                                &geometry.style,
-                                children,
-                                self.document_canvas_overflow,
-                            )
-                        } else {
-                            geometry.style.margin.top
-                        },
-                        can_adjoin,
-                    )
-                } else {
-                    let can_adjoin = can_adjoin_first_child_margin
-                        && can_collapse_block_start_margin(
-                            element,
-                            &geometry.style,
-                            geometry.border_edges,
-                            has_direct_inline_content_before_first_flow_child_dom_with_font_metrics(
-                                element,
-                                &geometry.style,
-                                stylesheets,
-                                &self.ancestors,
-                                &mut self.font_system,
-                            ),
-                            self.used_overflow_for_element(element, &geometry.style),
-                        )
-                        && collapsible_first_child_start_margin_dom_with_font_metrics(
-                            element,
-                            &geometry.style,
-                            stylesheets,
-                            &self.ancestors,
-                            &mut self.font_system,
-                            self.document_canvas_overflow,
-                        )
-                        .is_some();
+                        .map(SemanticLengthExt::points)
+                        .unwrap_or(geometry.style.margin.top)
+                    } else {
+                        geometry.style.margin.top
+                    }
+                } else if can_collapse_block_start_margin(
+                    element,
+                    &geometry.style,
+                    geometry.border_edges,
+                    has_direct_inline_content_before_first_flow_child_dom_with_font_metrics(
+                        element,
+                        &geometry.style,
+                        stylesheets,
+                        &self.ancestors,
+                        &mut self.font_system,
+                    ),
+                    self.used_overflow_for_element(element, &geometry.style),
+                ) {
                     let mut resolver = DomStyleResolver::with_font_system(&mut self.font_system);
-                    (
-                        if can_adjoin_first_child_margin {
-                            collapsible_start_margin_dom_with_resolver(
-                                element,
-                                &geometry.style,
-                                stylesheets,
-                                &self.ancestors,
-                                &mut resolver,
-                                self.document_canvas_overflow,
-                            )
-                        } else {
-                            geometry.style.margin.top
-                        },
-                        can_adjoin,
+                    clear_none_hypothetical_start_margin_dom_with_resolver(
+                        element,
+                        &geometry.style,
+                        stylesheets,
+                        &self.ancestors,
+                        &mut resolver,
+                        self.document_canvas_overflow,
                     )
+                    .map(SemanticLengthExt::points)
+                    .unwrap_or(geometry.style.margin.top)
+                } else {
+                    geometry.style.margin.top
                 }
             } else {
-                (geometry.style.margin.top, false)
+                geometry.style.margin.top
             };
         let applied_start_margin =
             page_start_margin(layout_pt(hypothetical_start_margin), starts_at_page_top);
@@ -1404,6 +1357,10 @@ impl<'a> LayoutBuilder<'a> {
         let paint_checkpoint = self.boxed_paint_checkpoint();
         let paint_page_index = self.pages.len();
         let positioned_layer_start = self.positioned_layers.len();
+        let positioned_overflow_clip_boundary = PositionedOverflowClipBoundary::new(
+            self.containing_blocks.len(),
+            self.fixed_containing_blocks.len(),
+        );
         let pending_paint_fragment_start = self.pending_paint_fragments.len();
         let pending_positioned_page_span_target_at_start = self
             .pending_positioned_fragmentation
@@ -1859,7 +1816,7 @@ impl<'a> LayoutBuilder<'a> {
                             .any(|box_| !formatting_box_can_only_create_phantom_line_boxes(box_))
                 })
                 .unwrap_or(false);
-        let traversal_mode = classify_child_traversal_mode(
+        let traversal_mode = classify_atomic_principal_flow(
             ordered_mixed_flow_required,
             direct_float_children,
             inline_sequence_required,
@@ -1973,6 +1930,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut laid_out_inline_multicol = false;
         let mut preceding_inline_local_cutoff = false;
         let mut preceding_inline_clamp_block_advance = crate::units::content_box_pt(0.0);
+        let mut preceding_inline_has_non_phantom_line = false;
         // Retain a committed simple vertical inline sequence when available.
         // Vertical auto-size geometry consumes that exact layout rather than
         // reconstructing the same text after selecting its inline measure.
@@ -1988,6 +1946,7 @@ impl<'a> LayoutBuilder<'a> {
                 element.attrs.get("href").map(String::as_str),
                 list_marker.as_deref(),
             );
+            preceding_inline_has_non_phantom_line = true;
         // Ordered mixed-flow traversal owns every inline run, including a
         // standalone `<br>` between floated or block-level siblings. Laying
         // the parent inline items here as well would collect the complete DOM
@@ -2010,7 +1969,9 @@ impl<'a> LayoutBuilder<'a> {
                     multicol_content_height,
                 );
                 laid_out_inline_multicol = laid_out_multicol_inline_items;
+                preceding_inline_has_non_phantom_line |= laid_out_multicol_inline_items;
                 if !laid_out_multicol_inline_items {
+                    let inline_outcome;
                     committed_vertical_inline_sequence =
                         if let Some(selected) = selected_orthogonal_inline_layout.as_ref() {
                             debug_assert_eq!(
@@ -2023,9 +1984,10 @@ impl<'a> LayoutBuilder<'a> {
                                 &selected.frozen_replay_input,
                                 stylesheets,
                             );
+                            inline_outcome = selected.line_sequence.layout_outcome();
                             Some(selected.line_sequence.clone())
                         } else {
-                            self.layout_inline_items_block(
+                            let (sequence, outcome) = self.layout_inline_items_block(
                                 element,
                                 inline_style,
                                 stylesheets,
@@ -2041,8 +2003,11 @@ impl<'a> LayoutBuilder<'a> {
                                 (0.0, 0.0),
                                 element.attrs.get("href").map(String::as_str),
                                 list_marker.as_deref(),
-                            )
+                            );
+                            inline_outcome = outcome;
+                            sequence
                         };
+                    preceding_inline_has_non_phantom_line |= inline_outcome.has_non_phantom_line;
                     preceding_inline_local_cutoff = committed_vertical_inline_sequence
                         .as_ref()
                         .is_some_and(|sequence| sequence.has_local_continuation_cutoff);
@@ -2060,6 +2025,7 @@ impl<'a> LayoutBuilder<'a> {
                     element.attrs.get("href").map(String::as_str),
                     list_marker.as_deref(),
                 );
+                preceding_inline_has_non_phantom_line = true;
             } else {
                 let laid_out_multicol_text = self.layout_multicol_text_block(
                     &text,
@@ -2070,6 +2036,7 @@ impl<'a> LayoutBuilder<'a> {
                     multicol_content_height,
                 );
                 laid_out_inline_multicol = laid_out_multicol_text;
+                preceding_inline_has_non_phantom_line |= laid_out_multicol_text;
                 if !laid_out_multicol_text {
                     let outcome = self.layout_text_block(
                         &text,
@@ -2080,6 +2047,7 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     preceding_inline_local_cutoff = outcome.has_local_continuation_cutoff;
                     preceding_inline_clamp_block_advance = outcome.clamp_block_advance;
+                    preceding_inline_has_non_phantom_line |= outcome.has_non_phantom_line;
                 }
             }
             self.pop_text_box_line_trim_scope(pushed_text_box_trim);
@@ -2117,6 +2085,8 @@ impl<'a> LayoutBuilder<'a> {
                     list_marker.as_deref(),
                 );
             }
+            preceding_inline_has_non_phantom_line |=
+                laid_out_box_inline_multicol || box_inline_has_flow_effects;
             self.pop_text_box_line_trim_scope(pushed_text_box_trim);
         }
         // A list item's marker belongs to its principal flow, not to a
@@ -2146,6 +2116,7 @@ impl<'a> LayoutBuilder<'a> {
                 list_marker.as_deref(),
             );
             self.pop_text_box_line_trim_scope(pushed_text_box_trim);
+            preceding_inline_has_non_phantom_line = true;
         }
         let laid_out_column_children = laid_out_inline_multicol
             || laid_out_box_inline_multicol
@@ -2404,7 +2375,7 @@ impl<'a> LayoutBuilder<'a> {
                     laid_out_column_children,
                     traversal_mode,
                     run_in_inline_items_laid_out,
-                    has_preceding_inline_flow_content: has_collectable_inline_content
+                    has_preceding_inline_flow_content: preceding_inline_has_non_phantom_line
                         && !matches!(traversal_mode, ChildTraversalMode::OrderedMixed),
                     preceding_inline_local_cutoff,
                     preceding_inline_clamp_block_advance,
@@ -2423,7 +2394,6 @@ impl<'a> LayoutBuilder<'a> {
             self.finish_outside_marker_anchor();
         }
         let pending_end_margin_collapse = children_outcome.pending_end_margin_collapse;
-        let collapsed_start_margin_offset = children_outcome.collapsed_start_margin_offset;
         let margin_collapse_boundary = match start_margin_arrangement.margin_collapse_boundary() {
             BlockMarginCollapseBoundary::Adjoining => {
                 children_outcome.adjoining_margin_set_boundary
@@ -2432,6 +2402,18 @@ impl<'a> LayoutBuilder<'a> {
                 BlockMarginCollapseBoundary::SeparatedByClearance
             }
         };
+        // A descendant clearance boundary invalidates the provisional paint
+        // offset accumulated while its start margins were assumed to adjoin
+        // this principal box. The box keeps its normal-flow border edge;
+        // clearance owns the separated descendant placement below it.
+        // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+        // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+        let collapsed_start_margin_offset =
+            if margin_collapse_boundary == BlockMarginCollapseBoundary::SeparatedByClearance {
+                layout_pt(0.0)
+            } else {
+                children_outcome.collapsed_start_margin_offset
+            };
         // Keep the rendered legend's source-fragment geometry at the parent
         // decoration boundary.  The next decoration pass consumes it to
         // exclude only the fieldset border, never descendant backgrounds.
@@ -3255,10 +3237,13 @@ impl<'a> LayoutBuilder<'a> {
         );
         let static_scroll_translation =
             crate::layout::scroll_snap::static_scroll_translation(static_scroll_offset, style);
-        // Positioned descendants escape normal-flow paint capture, but remain
-        // contents of this scroll container. Apply the same static scroll
-        // translation and overflow clip before they are replayed into the
+        // Positioned descendants escape normal-flow paint capture. Those whose
+        // containing block is this box or one of its descendants remain its
+        // scrolling contents; an out-of-flow descendant whose containing block
+        // is outside this box is not clipped or scrolled by this intervening
+        // ancestor. Apply the effects before eligible layers replay into the
         // ancestor stacking context.
+        // <https://www.w3.org/TR/CSS22/visufx.html#overflow-clipping>
         // <https://www.w3.org/TR/css-overflow-3/#scrollable>
         if static_scroll_translation.x != 0.0 || static_scroll_translation.y != 0.0 {
             for layer in self
@@ -3266,6 +3251,9 @@ impl<'a> LayoutBuilder<'a> {
                 .get_mut(positioned_layer_start..)
                 .unwrap_or_default()
             {
+                if !positioned_overflow_clip_boundary.applies_to(layer) {
+                    continue;
+                }
                 *layer = layer.clone().translated(static_scroll_translation);
             }
         }
@@ -3282,9 +3270,12 @@ impl<'a> LayoutBuilder<'a> {
                 .get_mut(positioned_layer_start..)
                 .unwrap_or_default()
             {
-                // An escaped positioned layer still belongs to this scroll
-                // container, but an overflow scope that cannot exclude any
-                // of its recorded ink is not a paint-order boundary. In
+                if !positioned_overflow_clip_boundary.applies_to(layer) {
+                    continue;
+                }
+                // This escaped positioned layer still belongs to this scroll
+                // container. An overflow scope that cannot exclude any of its
+                // recorded ink is not a paint-order boundary. In
                 // particular, retaining it changes PDF edge coverage where
                 // a later opaque in-flow background fully covers the layer.
                 // <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge>

@@ -96,6 +96,141 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
     None
 }
 
+pub(in crate::layout) fn clear_none_hypothetical_start_margin_dom_with_resolver(
+    element: &Element,
+    style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
+    overflow_context: DocumentCanvasResolution,
+) -> Option<LayoutLength> {
+    if style.margin_trim.block_start {
+        return None;
+    }
+    let mut set = AdjoiningMarginSet::from_margin(layout_pt(style.margin.top));
+    complete_adjoining_child_margin_set_dom(
+        &mut set,
+        element,
+        style,
+        stylesheets,
+        ancestors,
+        resolver,
+        overflow_context,
+    )
+    .then(|| set.collapsed())
+}
+
+/// Extend a CSS2 hypothetical start-margin set through every adjoining
+/// self-collapsing descendant and sibling in DOM source order.
+///
+/// This is deliberately separate from the scalar first-child query used by
+/// ordinary child placement: future sibling margins belong in the
+/// counterfactual clearance position, but must not be consumed early by the
+/// runtime sibling cursor.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+fn complete_adjoining_child_margin_set_dom(
+    set: &mut AdjoiningMarginSet,
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
+    overflow_context: DocumentCanvasResolution,
+) -> bool {
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+    let mut found_in_flow_child = false;
+    let mut has_preceding_css_float = false;
+    for child in &element.children {
+        let NodeKind::Element(child_element) = &child.kind else {
+            if let NodeKind::Text(text) = &child.kind
+                && !collapse_whitespace(text).is_empty()
+            {
+                break;
+            }
+            continue;
+        };
+        let signature = ElementSignature::with_sibling_list(
+            child_element.tag.clone(),
+            child_element.attrs.clone(),
+            element_index,
+            sibling_tags.clone(),
+        );
+        element_index += 1;
+        let child_style = resolver.style_for_element(
+            child_element,
+            signature.clone(),
+            stylesheets,
+            Some(parent_style),
+            ancestors,
+        );
+        if child_style.float != Float::None {
+            has_preceding_css_float = true;
+            continue;
+        }
+        if matches!(child_style.position, Position::Absolute | Position::Fixed) {
+            continue;
+        }
+        let is_flow_child = is_normal_block_flow_child(child_element, &child_style);
+        if !is_flow_child {
+            if !inline_text(child_element).is_empty() {
+                break;
+            }
+            continue;
+        }
+        if child_style.clear != Clear::None && has_preceding_css_float {
+            break;
+        }
+
+        found_in_flow_child = true;
+        let mut child_ancestors = ancestors.to_vec();
+        child_ancestors.push(signature);
+        let child_collapses_through = is_self_collapsing_block_dom_with_resolver(
+            child_element,
+            &child_style,
+            stylesheets,
+            &child_ancestors,
+            resolver,
+            overflow_context,
+        );
+        let mut child_set = AdjoiningMarginSet::from_margin(layout_pt(child_style.margin.top));
+        if !child_style.margin_trim.block_start
+            && can_collapse_block_start_margin(
+                child_element,
+                &child_style,
+                UsedEdges::from_css_edges(used_border_widths(&child_style)),
+                has_direct_inline_content_dom_with_resolver(
+                    child_element,
+                    &child_style,
+                    stylesheets,
+                    &child_ancestors,
+                    resolver,
+                ),
+                overflow_context.used_overflow(child_element, &child_style),
+            )
+        {
+            complete_adjoining_child_margin_set_dom(
+                &mut child_set,
+                child_element,
+                &child_style,
+                stylesheets,
+                &child_ancestors,
+                resolver,
+                overflow_context,
+            );
+        }
+        if child_collapses_through {
+            child_set.include(layout_pt(child_style.margin.bottom));
+        }
+        set.merge(child_set);
+        if !child_collapses_through {
+            break;
+        }
+    }
+    found_in_flow_child
+}
+
 pub(in crate::layout) fn collapsible_start_margin_dom_with_resolver(
     element: &Element,
     style: &ComputedStyle,

@@ -718,7 +718,7 @@ impl<'a> LayoutBuilder<'a> {
                     columns: &grid_layout.columns,
                     rows: &grid_layout.rows,
                 },
-                containing_block,
+                containing_block.geometry,
             ));
             true
         } else {
@@ -773,7 +773,11 @@ impl<'a> LayoutBuilder<'a> {
                     column_line_offsets: &grid_layout.columns.line_offsets(),
                     row_line_offsets: &grid_layout.rows.line_offsets(),
                     positioning_containing_block: establishes_positioning_containing_block
-                        .then(|| self.containing_blocks.last().copied())
+                        .then(|| {
+                            self.containing_blocks
+                                .last()
+                                .map(|context| context.geometry)
+                        })
                         .flatten(),
                 },
             );
@@ -1679,7 +1683,7 @@ impl<'a> LayoutBuilder<'a> {
                     columns: &grid_layout.columns,
                     rows: &grid_layout.rows,
                 },
-                containing_block,
+                containing_block.geometry,
             ));
             true
         } else {
@@ -1725,7 +1729,11 @@ impl<'a> LayoutBuilder<'a> {
                     column_line_offsets: &grid_layout.columns.line_offsets(),
                     row_line_offsets: &grid_layout.rows.line_offsets(),
                     positioning_containing_block: establishes_positioning_containing_block
-                        .then(|| self.containing_blocks.last().copied())
+                        .then(|| {
+                            self.containing_blocks
+                                .last()
+                                .map(|context| context.geometry)
+                        })
                         .flatten(),
                 },
             );

@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use super::*;
+use crate::units::content_box_to_margin_box_length;
 
 impl PhysicalInlineTextBounds {
     pub(in crate::layout) fn new(baseline_origin: InlinePoint, inline_size: f32) -> Self {
@@ -198,14 +199,6 @@ impl InlineLineGeometry {
         // <https://drafts.csswg.org/css-writing-modes-4/#valdef-writing-mode-sideways-lr>
         let (placement, placement_logical_inline_start) =
             if self.writing_mode == WritingMode::SidewaysLr && self.direction == Direction::Rtl {
-                // The line geometry was collected with RTL's physical top edge
-                // as its inline start. `sideways-lr` instead has a fixed
-                // bottom-to-top physical line, so changing only `direction`
-                // would reinterpret that top coordinate as a bottom coordinate
-                // and replay the atom outside its cell. Reproject the retained
-                // logical line span to the writing-mode-defined bottom edge at
-                // the same boundary.
-                // <https://www.w3.org/TR/css-writing-modes-4/#valdef-writing-mode-sideways-lr>
                 (
                     Self {
                         direction: Direction::Ltr,
@@ -326,12 +319,95 @@ pub(in crate::layout) struct InlineAtom {
     pub(in crate::layout) data: Rc<InlineAtomData>,
     pub(in crate::layout) size: InlineSize,
     pub(in crate::layout) baseline: InlineAtomBaseline,
-    pub(in crate::layout) baseline_shift: f32,
+    pub(in crate::layout) baseline_placement: InlineBaselinePlacement,
     pub(in crate::layout) visual_offset: InlineVisualOffset,
     /// Placement resolved only after this atom has been selected into a parent
     /// inline line. Source ruby geometry remains independent of visual
     /// neighbors and bidi ordering.
     pub(in crate::layout) ruby_placement: Option<ruby::ResolvedRubyPlacement>,
+}
+
+/// Fully resolved parent-facing geometry for one atomic inline.
+///
+/// The physical margin box, exported baseline set, and eventual inline
+/// baseline placement are selected by the formatting context that produced
+/// the atom. [`InlineAtomContent`] describes semantics and paint only; it is
+/// deliberately absent from this record so changing paint representation
+/// cannot silently change line geometry.
+/// <https://drafts.csswg.org/css-inline-3/#atomic-inline>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct ResolvedInlineAtomGeometry {
+    pub(in crate::layout) physical_margin_box_size: MarginBoxSize,
+    pub(in crate::layout) baseline: InlineAtomBaseline,
+    pub(in crate::layout) baseline_placement: InlineBaselinePlacement,
+}
+
+impl ResolvedInlineAtomGeometry {
+    pub(in crate::layout) fn exported_from_logical_block_start(
+        style: &css::ZoomedLayoutStyle,
+        physical_margin_box_size: MarginBoxSize,
+        border_box_block_size: LayoutLength,
+        baseline_offset: LayoutLength,
+        baseline_placement: InlineBaselinePlacement,
+    ) -> Self {
+        Self {
+            physical_margin_box_size,
+            baseline: InlineAtomBaseline::Physical {
+                source: InlineAtomBaselineSource::BorderBox,
+                baselines: crate::layout::baseline::PhysicalBaselineSets::default()
+                    .with_first_from_logical_block_start(
+                        block_start_side(style.writing_mode),
+                        border_box_block_size,
+                        baseline_offset,
+                        BaselineMetric::Alphabetic,
+                    ),
+                missing_axis_synthesis: AtomicInlineBaselineSynthesisSource::MarginBox,
+            },
+            baseline_placement,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn from_resolved_boxes(
+        style: &css::ZoomedLayoutStyle,
+        content: ContentBoxSize,
+        horizontal_non_content: NonContentLength,
+        vertical_non_content: NonContentLength,
+        horizontal_margins: LayoutLength,
+        vertical_margins: LayoutLength,
+        baseline_offset: LayoutLength,
+        baseline_placement: InlineBaselinePlacement,
+    ) -> Self {
+        let width = content_box_to_margin_box_length(
+            content_box_pt(content.width),
+            horizontal_non_content,
+            horizontal_margins,
+        );
+        let height = content_box_to_margin_box_length(
+            content_box_pt(content.height),
+            vertical_non_content,
+            vertical_margins,
+        );
+        let border_box_block_size = if style.writing_mode.has_vertical_lines() {
+            content_box_to_border_box_length(content_box_pt(content.width), horizontal_non_content)
+        } else {
+            content_box_to_border_box_length(content_box_pt(content.height), vertical_non_content)
+        };
+        Self::exported_from_logical_block_start(
+            style,
+            margin_box_size_pt(width.points(), height.points()),
+            layout_pt(border_box_block_size.points()),
+            baseline_offset,
+            baseline_placement,
+        )
+    }
+
+    fn inline_layout_size(self) -> InlineSize {
+        InlineSize::new(
+            self.physical_margin_box_size.width,
+            self.physical_margin_box_size.height,
+        )
+    }
 }
 
 /// Input to the inline-atom used-value boundary.
@@ -368,14 +444,15 @@ impl IntoInlineAtomUsedStyle for ComputedStyle {
 /// <https://drafts.csswg.org/css-inline-3/#inline-block-baseline>.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) enum InlineAtomBaseline {
-    Exported {
+    /// Tate-chu-yoko does not export a child alphabetic baseline. Its one-em
+    /// square is aligned to the parent text's central baseline after parent
+    /// metrics are known.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+    TextCombineParentCentral,
+    Physical {
         source: InlineAtomBaselineSource,
-        offset_from_source_box_block_start: AtomicInlineBaselineSourceOffset,
-    },
-    /// Final Flex baseline sets retained in physical border-box coordinates
-    /// until the containing inline context selects its logical block axis.
-    FlexExported {
         baselines: crate::layout::baseline::PhysicalBaselineSets,
+        missing_axis_synthesis: AtomicInlineBaselineSynthesisSource,
     },
     /// An atom without a content-derived baseline defers synthesis until its
     /// enclosing alignment context selects a baseline metric.
@@ -431,32 +508,50 @@ impl InlineAtom {
         link_target: Option<String>,
         alt_text: Option<String>,
     ) -> Self {
-        let baseline = match &content {
-            InlineAtomContent::Canvas
-            | InlineAtomContent::Iframe(_)
-            | InlineAtomContent::Image(_)
-            | InlineAtomContent::Gradient { .. }
-            | InlineAtomContent::Svg { asset: Some(_) } => InlineAtomBaseline::Synthesized {
-                source: AtomicInlineBaselineSynthesisSource::MarginBox,
-            },
-            InlineAtomContent::Leader(_)
-            | InlineAtomContent::StaticPositionPlaceholder(_)
-            | InlineAtomContent::InlineBox { .. }
-            | InlineAtomContent::TextCombineUpright { .. }
-            | InlineAtomContent::InlineFragment { .. }
-            | InlineAtomContent::Ruby { .. }
-            | InlineAtomContent::InlineEdge(_)
-            | InlineAtomContent::Svg { asset: None } => InlineAtomBaseline::Exported {
-                source: InlineAtomBaselineSource::BorderBox,
-                offset_from_source_box_block_start: atomic_inline_baseline_source_pt(
-                    baseline_offset,
-                ),
-            },
+        let style = style.into_inline_atom_used_style();
+        let margin_box_block_size = if style.writing_mode.has_vertical_lines() {
+            size.width
+        } else {
+            size.height
         };
+        let block_margins = if style.writing_mode.has_vertical_lines() {
+            style.margin.left + style.margin.right
+        } else {
+            style.margin.top + style.margin.bottom
+        };
+        let geometry = ResolvedInlineAtomGeometry::exported_from_logical_block_start(
+            &style,
+            margin_box_size_pt(size.width, size.height),
+            layout_pt((margin_box_block_size - block_margins).max(0.0)),
+            layout_pt(baseline_offset),
+            InlineBaselinePlacement::from_inherited_glyph_displacement(
+                glyph_baseline_displacement_pt(baseline_shift),
+            ),
+        );
+        Self::from_resolved_geometry(
+            content,
+            style,
+            escaped_positioned_layers,
+            geometry,
+            link_target,
+            alt_text,
+        )
+    }
+
+    #[allow(clippy::arc_with_non_send_sync, clippy::too_many_arguments)]
+    pub(in crate::layout) fn from_resolved_geometry(
+        content: InlineAtomContent,
+        style: impl IntoInlineAtomUsedStyle,
+        escaped_positioned_layers: Option<Box<[PositionedPaintLayer]>>,
+        geometry: ResolvedInlineAtomGeometry,
+        link_target: Option<String>,
+        alt_text: Option<String>,
+    ) -> Self {
+        let style = style.into_inline_atom_used_style();
         Self {
             data: Rc::new(InlineAtomData {
                 content,
-                style: Rc::new(style.into_inline_atom_used_style()),
+                style: Rc::new(style),
                 outside_marker: None,
                 content_inline_offset: 0.0,
                 content_inline_paint_width: None,
@@ -466,9 +561,9 @@ impl InlineAtom {
                 tracking_scope: None,
                 current_color_override: None,
             }),
-            size,
-            baseline,
-            baseline_shift,
+            size: geometry.inline_layout_size(),
+            baseline: geometry.baseline,
+            baseline_placement: geometry.baseline_placement,
             visual_offset: InlineVisualOffset::zero(),
             ruby_placement: None,
         }
@@ -480,6 +575,14 @@ impl InlineAtom {
     ) -> Self {
         self.visual_offset = visual_offset;
         self
+    }
+
+    pub(in crate::layout) fn baseline_shift(&self) -> f32 {
+        self.baseline_placement.glyph_displacement().points()
+    }
+
+    pub(in crate::layout) fn add_baseline_placement(&mut self, placement: InlineBaselinePlacement) {
+        self.baseline_placement = self.baseline_placement.with_added(placement);
     }
 
     pub(in crate::layout) fn with_ruby_placement(
@@ -606,11 +709,10 @@ impl InlineAtom {
         containing_style: &ComputedStyle,
     ) -> AtomicInlineBaselineSourceOffset {
         match self.baseline {
-            InlineAtomBaseline::Exported {
-                source: InlineAtomBaselineSource::BorderBox | InlineAtomBaselineSource::TableBox,
-                offset_from_source_box_block_start,
-            } => offset_from_source_box_block_start,
-            InlineAtomBaseline::FlexExported { baselines } => baselines
+            InlineAtomBaseline::TextCombineParentCentral => {
+                unreachable!("text-combine baseline requires parent central-baseline geometry")
+            }
+            InlineAtomBaseline::Physical { baselines, .. } => baselines
                 .first_from_logical_block_start_with_metric(
                     block_start_side(containing_style.writing_mode),
                     layout_pt(border_box_block_size),
@@ -618,6 +720,10 @@ impl InlineAtom {
                 .map(|(baseline, _)| baseline)
                 .map(LayoutLength::points)
                 .map(atomic_inline_baseline_source_pt)
+                // The enclosing resolver observes the missing axis and uses
+                // the atom's explicit synthesis policy. This value is not
+                // consumed by margin-box synthesis, but retaining a valid
+                // coordinate keeps the shared coordinate adapter total.
                 .unwrap_or_else(|| atomic_inline_baseline_source_pt(border_box_block_size)),
             InlineAtomBaseline::Synthesized { .. } => {
                 atomic_inline_baseline_source_pt(border_box_block_size)
@@ -633,8 +739,8 @@ impl InlineAtom {
         containing_style: &ComputedStyle,
     ) -> Option<BaselineMetric> {
         match self.baseline {
-            InlineAtomBaseline::Exported { .. } => Some(BaselineMetric::Alphabetic),
-            InlineAtomBaseline::FlexExported { baselines } => baselines
+            InlineAtomBaseline::TextCombineParentCentral => Some(BaselineMetric::Central),
+            InlineAtomBaseline::Physical { baselines, .. } => baselines
                 .first_from_logical_block_start_with_metric(
                     block_start_side(containing_style.writing_mode),
                     layout_pt(inline_atom_logical_border_block_size(
@@ -666,19 +772,26 @@ impl InlineAtom {
         block_end_margin: f32,
         containing_style: &ComputedStyle,
     ) -> AtomicInlineBaselineCoordinates {
+        let exported_source_box = match self.baseline {
+            InlineAtomBaseline::Physical { source, .. } => Some(source),
+            InlineAtomBaseline::TextCombineParentCentral
+            | InlineAtomBaseline::Synthesized { .. } => None,
+        };
         let synthesized_source = match self.baseline {
-            InlineAtomBaseline::Synthesized { source } => Some(source),
-            InlineAtomBaseline::FlexExported { .. }
-                if self
-                    .content_derived_baseline_metric(containing_style)
-                    .is_none() =>
-            {
-                // Flexbox deliberately withholds a baseline set for an empty
-                // container. It is an atomic inline here, so CSS Inline owns
-                // the deferred margin-box synthesis.
-                Some(AtomicInlineBaselineSynthesisSource::MarginBox)
+            InlineAtomBaseline::TextCombineParentCentral => {
+                unreachable!("text-combine coordinates are resolved from parent text metrics")
             }
-            InlineAtomBaseline::Exported { .. } | InlineAtomBaseline::FlexExported { .. } => None,
+            InlineAtomBaseline::Synthesized { source } => Some(source),
+            InlineAtomBaseline::Physical {
+                missing_axis_synthesis,
+                ..
+            } if self
+                .content_derived_baseline_metric(containing_style)
+                .is_none() =>
+            {
+                Some(missing_axis_synthesis)
+            }
+            InlineAtomBaseline::Physical { .. } => None,
         };
         let source = self.baseline_offset_from_alignment_source_block_start(
             border_box_block_size,
@@ -693,10 +806,17 @@ impl InlineAtom {
                 // margin-box alignment coordinate above.
                 atomic_inline_paint_placement_baseline_pt(border_box_block_size + block_end_margin),
             ),
-            Some(AtomicInlineBaselineSynthesisSource::BorderBox) | None => (
+            Some(AtomicInlineBaselineSynthesisSource::BorderBox) => (
                 atomic_inline_margin_box_baseline_pt(block_start_margin + source.points()),
                 atomic_inline_paint_placement_baseline_pt(source.points()),
             ),
+            None => {
+                debug_assert!(exported_source_box.is_some());
+                (
+                    atomic_inline_margin_box_baseline_pt(block_start_margin + source.points()),
+                    atomic_inline_paint_placement_baseline_pt(source.points()),
+                )
+            }
         };
         AtomicInlineBaselineCoordinates {
             margin_box,
@@ -713,16 +833,18 @@ impl InlineAtom {
     /// table-box coordinate used for captured-fragment replay.
     /// <https://www.w3.org/TR/CSS22/tables.html#table-display>
     pub(in crate::layout) fn with_exported_table_box_baseline(mut self) -> Self {
-        let InlineAtomBaseline::Exported {
-            offset_from_source_box_block_start,
+        let InlineAtomBaseline::Physical {
+            baselines,
+            missing_axis_synthesis,
             ..
         } = self.baseline
         else {
             unreachable!("only an exported baseline can originate from a table box");
         };
-        self.baseline = InlineAtomBaseline::Exported {
+        self.baseline = InlineAtomBaseline::Physical {
             source: InlineAtomBaselineSource::TableBox,
-            offset_from_source_box_block_start,
+            baselines,
+            missing_axis_synthesis,
         };
         self
     }
@@ -734,7 +856,11 @@ impl InlineAtom {
         mut self,
         baselines: crate::layout::baseline::PhysicalBaselineSets,
     ) -> Self {
-        self.baseline = InlineAtomBaseline::FlexExported { baselines };
+        self.baseline = InlineAtomBaseline::Physical {
+            source: InlineAtomBaselineSource::BorderBox,
+            baselines,
+            missing_axis_synthesis: AtomicInlineBaselineSynthesisSource::MarginBox,
+        };
         self
     }
 
@@ -758,6 +884,14 @@ impl InlineAtom {
         self.baseline = InlineAtomBaseline::Synthesized {
             source: AtomicInlineBaselineSynthesisSource::MarginBox,
         };
+        self
+    }
+
+    /// Select the parent-dependent central baseline used by a tate-chu-yoko
+    /// square. This is explicit at construction so paint content cannot
+    /// determine line geometry implicitly.
+    pub(in crate::layout) fn with_text_combine_parent_central_baseline(mut self) -> Self {
+        self.baseline = InlineAtomBaseline::TextCombineParentCentral;
         self
     }
 
@@ -1016,24 +1150,88 @@ impl InlineFloat {
     }
 }
 
-/// Stable identity for a non-painting static-position source in an inline
-/// item stream.
+/// Stable identity for a static-position source in an inline item stream.
 ///
 /// Deferred positioned replay must select the exact normal-flow source that
 /// produced its line geometry. An item index is not stable across inline-box
-/// splitting, bidi reordering, or trimming; a source element identity is.
-/// The block marker is retained for block-in-inline compatibility paths that
-/// do not have an element-level source.
+/// splitting, bidi reordering, or trimming. Element identity alone is also
+/// insufficient because a principal box and its tree-abiding generated
+/// pseudos share the same originating element.
+///
+/// The block identity is retained for block-in-inline compatibility paths
+/// that do not yet have an element-level source marker.
 /// <https://drafts.csswg.org/css-position-3/#static-position>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in crate::layout) enum InlineStaticPositionMarkerId {
-    Element(crate::dom::ElementId),
+pub(in crate::layout) enum InlineStaticPositionSourceId {
+    Element {
+        element: crate::dom::ElementId,
+        source: InlineStaticPositionBoxSource,
+    },
     Block,
 }
 
-impl InlineStaticPositionMarkerId {
+/// The element-backed box role that owns an inline static-position source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) enum InlineStaticPositionBoxSource {
+    Principal,
+    GeneratedPseudo(box_tree::GeneratedPseudoKind),
+}
+
+/// CSS Text participation of a temporary static-position hypothetical box.
+/// Ordinary inline out-of-flow sources remain absent from text adjacency;
+/// genuinely atomic inline sources keep the atomic boundary policy while
+/// their measured margin box participates in fitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) enum StaticPositionHypotheticalBoundary {
+    Transparent,
+    Atomic,
+}
+
+impl InlineStaticPositionSourceId {
     pub(in crate::layout) fn for_element(element: &Element) -> Self {
-        Self::Element(element.id)
+        Self::Element {
+            element: element.id,
+            source: InlineStaticPositionBoxSource::Principal,
+        }
+    }
+
+    pub(in crate::layout) fn for_box_source(
+        element: &Element,
+        source: &box_tree::BoxSource<'_>,
+    ) -> Self {
+        let source = match source {
+            box_tree::BoxSource::Principal => InlineStaticPositionBoxSource::Principal,
+            box_tree::BoxSource::GeneratedPseudo(pseudo) => {
+                InlineStaticPositionBoxSource::GeneratedPseudo(pseudo.kind)
+            }
+        };
+        Self::Element {
+            element: element.id,
+            source,
+        }
+    }
+
+    pub(in crate::layout) fn for_generated_pseudo(
+        element: &Element,
+        kind: box_tree::GeneratedPseudoKind,
+    ) -> Self {
+        Self::Element {
+            element: element.id,
+            source: InlineStaticPositionBoxSource::GeneratedPseudo(kind),
+        }
+    }
+
+    /// Return the generated-box role only for its originating element.
+    /// Positioned descendants laid out while replaying a pseudo are principal
+    /// boxes of their own elements and must not inherit the pseudo's identity.
+    pub(in crate::layout) fn box_source_for_element(
+        self,
+        candidate: crate::dom::ElementId,
+    ) -> Option<InlineStaticPositionBoxSource> {
+        match self {
+            Self::Element { element, source } if element == candidate => Some(source),
+            Self::Element { .. } | Self::Block => None,
+        }
     }
 }
 
@@ -1054,17 +1252,20 @@ pub(in crate::layout) enum InlineAtomContent {
     Svg {
         asset: Option<SharedSvgAsset>,
     },
-    /// Non-painting inline-level placeholder for an out-of-flow positioned box.
+    /// Non-painting hypothetical normal-flow box for an out-of-flow source.
     ///
     /// CSS Positioned Layout resolves auto insets from the static-position
-    /// rectangle, the hypothetical normal-flow position the box would have
-    /// occupied before being taken out of flow. Inline layout carries this atom
-    /// only through temporary line selection and preparation so forced breaks,
-    /// wrapping, line metrics, and inline alignment choose the correct
-    /// static-position rectangle; it must never paint:
+    /// rectangle associated with the source's inline boundary. Inline layout
+    /// carries this atom only through temporary line selection and preparation.
+    /// Non-atomic sources use zero inline advance so a soft wrap cannot migrate
+    /// the anchor; atomic sources retain their indivisible hypothetical size.
+    /// The atom must never paint:
     /// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height> and
     /// <https://www.w3.org/TR/css-position-3/#staticpos-rect>.
-    StaticPositionPlaceholder(InlineStaticPositionMarkerId),
+    StaticPositionHypothetical {
+        source: InlineStaticPositionSourceId,
+        boundary: StaticPositionHypotheticalBoundary,
+    },
     InlineBox {
         sequence: inline_layout::InlineLineSequence,
     },
@@ -1101,9 +1302,7 @@ pub(in crate::layout) enum InlineAtomContent {
     /// to the used em square:
     /// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>.
     TextCombineUpright {
-        sequence: inline_layout::InlineLineSequence,
-        horizontal_style: Box<ComputedStyle>,
-        inline_scale: f32,
+        composition: Box<TextCombineComposition>,
     },
     /// Paint captured from an independent formatting context. Table-cell
     /// fragments retain their final content-coordinate context so replay does
@@ -1119,6 +1318,60 @@ pub(in crate::layout) enum InlineAtomContent {
     },
     InlineEdge(InlineEdgeRole),
     Leader(String),
+}
+
+/// Source semantics retained by a tate-chu-yoko composition.
+///
+/// The parent inline graph treats the composition as one measured item, but
+/// CSS Writing Modes requires line breaking at either edge to use the
+/// composition's actual text and requires its horizontal contents to form an
+/// independent bidi paragraph.
+/// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct TextCombineSource {
+    /// Text after CSS Text transformation and before TCY-only full-width
+    /// reversal. This is the text exposed to surrounding UAX #14 resolution.
+    pub(in crate::layout) boundary_text: String,
+    /// The computed source style owns the internal bidi controls and paragraph
+    /// direction. It is deliberately distinct from the horizontal used style.
+    pub(in crate::layout) style: Box<ComputedStyle>,
+}
+
+/// Horizontally formatted paint content of one tate-chu-yoko composition.
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct TextCombineLayout {
+    pub(in crate::layout) sequence: inline_layout::InlineLineSequence,
+    pub(in crate::layout) horizontal_style: Box<ComputedStyle>,
+    pub(in crate::layout) inline_scale: f32,
+}
+
+/// The one-em square exposed by a tate-chu-yoko composition to its parent.
+///
+/// This is a logical inline and block extent, not the uncompressed horizontal
+/// child width. Keeping it typed prevents paint measurement from escaping into
+/// parent line fitting.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct TextCombineSquareGeometry {
+    extent: LayoutLength,
+}
+
+impl TextCombineSquareGeometry {
+    pub(in crate::layout) fn new(extent: LayoutLength) -> Self {
+        debug_assert!(extent.points() >= 0.0);
+        Self { extent }
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.extent.points()
+    }
+}
+
+/// Complete retained representation of one tate-chu-yoko composition.
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct TextCombineComposition {
+    pub(in crate::layout) source: TextCombineSource,
+    pub(in crate::layout) layout: TextCombineLayout,
+    pub(in crate::layout) square: TextCombineSquareGeometry,
 }
 
 /// A raw captured atomic fragment's border-box origin on its scratch canvas.
@@ -1164,6 +1417,16 @@ impl AtomicInlineCaptureFrame {
         AtomicInlineFragmentReplayCoordinates {
             scratch_border_box_origin: self.scratch_border_box_origin,
         }
+    }
+
+    /// Bind a positioned layer's axis policy to this capture frame exactly
+    /// once. Final inline placement can then apply one typed translation to
+    /// the complete stacking context and its links.
+    pub(in crate::layout) fn resolve_positioned_replay(
+        self,
+        replay: EscapedAtomReplay,
+    ) -> EscapedAtomReplay {
+        replay.resolve_from_capture_origin(self.scratch_border_box_origin.0)
     }
 }
 
@@ -1284,12 +1547,56 @@ pub(in crate::layout) struct InlineBoxEdgeFragment {
 }
 
 impl InlineBoxEdgeFragment {
+    /// Whether this owned box edge makes an otherwise empty line box exist.
+    ///
+    /// CSS 2.2 treats an inline box with a non-zero inline-axis margin,
+    /// border, or padding as line-generating content. `advance` retains the
+    /// signed sum of those components, while `paint_extent` retains border
+    /// and padding when a negative margin cancels that sum. Together they
+    /// distinguish a structural zero-width marker from a decorated edge
+    /// without storing a second, potentially inconsistent flag.
+    /// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>
+    pub(in crate::layout) fn contributes_to_line_box(self) -> bool {
+        self.advance != 0.0 || self.paint_extent != 0.0
+    }
+
     /// Whether this atom is the zero-advance positioning marker placed inside
     /// a positioned bidi isolate rather than an inline box-decoration edge.
     pub(in crate::layout) fn is_positioning_marker(self) -> bool {
         self.positioning_containing_block_id.is_some()
             && self.advance == 0.0
             && self.paint_extent == 0.0
+    }
+}
+
+#[cfg(test)]
+mod inline_box_edge_fragment_tests {
+    use super::*;
+
+    fn edge(
+        advance: f32,
+        paint_extent: f32,
+        positioning_containing_block_id: Option<InlinePositioningContainingBlockId>,
+    ) -> InlineBoxEdgeFragment {
+        InlineBoxEdgeFragment {
+            logical_edge: InlineLogicalEdge::Start,
+            physical_side: PhysicalSide::Left,
+            positioning_containing_block_id,
+            advance,
+            paint_extent,
+        }
+    }
+
+    #[test]
+    fn box_edge_line_contribution_preserves_signed_and_painted_geometry() {
+        assert!(!edge(0.0, 0.0, None).contributes_to_line_box());
+        assert!(edge(10.0, 0.0, None).contributes_to_line_box());
+        assert!(edge(-10.0, 0.0, None).contributes_to_line_box());
+        assert!(edge(0.0, 10.0, None).contributes_to_line_box());
+
+        let marker = edge(0.0, 0.0, Some(InlinePositioningContainingBlockId(1)));
+        assert!(marker.is_positioning_marker());
+        assert!(!marker.contributes_to_line_box());
     }
 }
 
@@ -1343,6 +1650,44 @@ impl InlineTextBoundarySpacing {
 }
 
 impl InlineAtomContent {
+    /// Return source text whose first and last characters participate in CSS
+    /// Text line breaking at this atom's outer boundaries.
+    ///
+    /// Ruby columns and tate-chu-yoko remain indivisible layout participants,
+    /// but neither is a replacement character for UAX #14 at those edges.
+    /// No graph position is exposed inside the returned text.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+    /// <https://drafts.csswg.org/css-ruby-1/#line-breaks>
+    pub(in crate::layout) fn textual_boundary_text(&self) -> Option<&str> {
+        match self {
+            Self::Ruby { base_text, .. } => Some(base_text),
+            Self::TextCombineUpright { composition } => {
+                Some(composition.source.boundary_text.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the computed style that owns textual boundary policy when it is
+    /// more specific than the atom's ordinary used layout style.
+    pub(in crate::layout) fn textual_boundary_style(&self) -> Option<&ComputedStyle> {
+        match self {
+            Self::TextCombineUpright { composition } => Some(&composition.source.style),
+            _ => None,
+        }
+    }
+
+    /// Tracking used at this atom's typographic boundary, independently of
+    /// the lexical scope retained for boundary ownership.
+    ///
+    /// CSS Writing Modes requires spacing inside and after a tate-chu-yoko
+    /// composition to be zero; the preceding external unit still contributes
+    /// its own half of the surrounding tracking boundary.
+    /// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+    pub(in crate::layout) fn ignores_boundary_letter_spacing(&self) -> bool {
+        matches!(self, Self::TextCombineUpright { .. })
+    }
+
     pub(in crate::layout) fn is_inline_edge(&self) -> bool {
         matches!(self, Self::InlineEdge(_))
     }
@@ -1356,6 +1701,14 @@ impl InlineAtomContent {
 pub(in crate::layout) enum InlineItem {
     Word(Box<InlineWord>),
     Atom(Box<InlineAtom>),
+    /// Zero-advance source-order marker for deferred static-position replay.
+    ///
+    /// This is structural state rather than an inline atom: it is transparent
+    /// to CSS Text adjacency and line metrics, but remains in the collected
+    /// stream until hypothetical replay replaces the exact matching source
+    /// with a measured normal-flow atom.
+    /// <https://drafts.csswg.org/css-position-3/#static-position>
+    StaticPositionSourceMarker(InlineStaticPositionSourceId),
     Float(Box<InlineFloat>),
     Break(InlineBreak),
     PageScopeStart(Option<String>),

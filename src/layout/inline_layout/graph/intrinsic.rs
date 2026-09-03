@@ -169,7 +169,7 @@ impl InlineIntrinsicMeasurement {
                 // box. Counting it here would turn each discarded space into
                 // an additional vertical column during intrinsic sizing.
                 // <https://drafts.csswg.org/css-inline-3/#line-boxes>
-                .filter(|record| !record.is_phantom)
+                .filter(|record| !record.kind.is_phantom())
                 .map(|record| {
                     let line_block_size = record
                         .fragment

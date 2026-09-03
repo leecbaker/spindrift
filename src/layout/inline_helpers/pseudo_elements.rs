@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::{ModeledLonghandSet, copy_modeled_longhand, modeled_longhand_has_same_source};
 pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
     items: &mut Vec<InlineLineItem>,
     block_style: &ComputedStyle,
@@ -21,11 +22,17 @@ pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
                         fragment.style_mut(),
                         block_style,
                         first_line_style,
+                        &block_style.first_line_overrides,
                     ) {
                         fragment.set_force_inline_background_paint(true);
                     }
                     fragment.apply_to_ancestor_inline_decoration_styles(|style| {
-                        apply_first_line_style_delta(style, block_style, first_line_style);
+                        apply_first_line_style_delta(
+                            style,
+                            block_style,
+                            first_line_style,
+                            &block_style.first_line_overrides,
+                        );
                     });
                 }
                 InlineLineItem::Atom(atom) => {
@@ -45,7 +52,12 @@ pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
                         InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace(_))
                     ) {
                         let mut style = atom.style().clone();
-                        apply_first_line_style_delta(&mut style, block_style, first_line_style);
+                        apply_first_line_style_delta(
+                            &mut style,
+                            block_style,
+                            first_line_style,
+                            &block_style.first_line_overrides,
+                        );
                         let advance = font_system.ic_advance_for_style(&style) / 8.0;
                         atom.set_text_autospace_advance(&style, advance);
                         continue;
@@ -60,12 +72,18 @@ pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
                     else {
                         continue;
                     };
-                    apply_first_line_style_to_ruby_level(base, block_style, first_line_style);
+                    apply_first_line_style_to_ruby_level(
+                        base,
+                        block_style,
+                        first_line_style,
+                        &block_style.first_line_overrides,
+                    );
                     for (annotation, side) in annotations.iter_mut().zip(annotation_sides) {
                         apply_first_line_style_to_ruby_level(
                             annotation,
                             block_style,
                             first_line_style,
+                            &block_style.first_line_overrides,
                         );
                         *side = annotation.style.ruby_position.interlinear_side();
                     }
@@ -93,8 +111,14 @@ fn apply_first_line_style_to_ruby_level(
     level: &mut RubyInlineLevel,
     originating_style: &ComputedStyle,
     first_line_style: &ComputedStyle,
+    overrides: &ModeledLonghandSet,
 ) {
-    apply_first_line_style_delta(&mut level.style, originating_style, first_line_style);
+    apply_first_line_style_delta(
+        &mut level.style,
+        originating_style,
+        first_line_style,
+        overrides,
+    );
     for record in &mut level.sequence.records {
         let Some(fragment) = &mut record.fragment else {
             continue;
@@ -106,6 +130,7 @@ fn apply_first_line_style_to_ruby_level(
                         fragment.style_mut(),
                         originating_style,
                         first_line_style,
+                        overrides,
                     );
                 }
                 InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {}
@@ -114,70 +139,37 @@ fn apply_first_line_style_to_ruby_level(
     }
 }
 
-/// Apply properties established by `::first-line` without discarding a nested
-/// inline fragment's own cascade (such as `<strong>`'s font weight).
+/// Materialize the canonical properties established by `::first-line`
+/// without discarding a nested inline fragment's own cascade.
 ///
-/// A typographic pseudo style inherits from the originating block, while an
-/// inline fragment may inherit from a descendant of that block. Copy only a
-/// property whose pseudo computed value differs from its originating value:
-/// that difference represents the pseudo rule's cascaded effect.
+/// The cascade records both the pseudo's affected longhands and the source
+/// owner of every computed value. A descendant receives a generated-box value
+/// only while its source still traces to the originating block; an explicit
+/// descendant declaration therefore wins even when its computed value happens
+/// to equal the block's value.
 /// <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
 pub(in crate::layout) fn apply_first_line_style_delta(
     fragment_style: &mut ComputedStyle,
     originating_style: &ComputedStyle,
     first_line_style: &ComputedStyle,
+    overrides: &ModeledLonghandSet,
 ) -> bool {
     let mut background_changed = false;
-    if first_line_style.color != originating_style.color
-        && fragment_style.color == originating_style.color
-    {
-        // `::first-line` supplies an inherited color to its descendant
-        // fragments. A nested inline's specified color, including one whose
-        // principal box was suppressed by `display: contents`, wins over that
-        // inherited pseudo value.
-        // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
-        fragment_style.color = first_line_style.color;
-    }
-    if first_line_style.text_fill_color != originating_style.text_fill_color {
-        fragment_style.text_fill_color = first_line_style.text_fill_color;
-    }
-    if first_line_style.background.background_color != originating_style.background.background_color
-    {
-        fragment_style.background.background_color =
-            first_line_style.background.background_color.clone();
-        background_changed = true;
-    }
-    if first_line_style.font_weight != originating_style.font_weight {
-        fragment_style.font_weight = first_line_style.font_weight;
-    }
-    if first_line_style.font_style != originating_style.font_style {
-        fragment_style.font_style = first_line_style.font_style;
-    }
-    if first_line_style.font_width != originating_style.font_width {
-        fragment_style.font_width = first_line_style.font_width;
-    }
-    if first_line_style.font_size != originating_style.font_size {
-        fragment_style.font_size = first_line_style.font_size;
-    }
-    if first_line_style.line_height != originating_style.line_height {
-        fragment_style.line_height = first_line_style.line_height;
-    }
-    if first_line_style.letter_spacing != originating_style.letter_spacing {
-        fragment_style.letter_spacing = first_line_style.letter_spacing.clone();
-    }
-    if first_line_style.word_spacing != originating_style.word_spacing {
-        fragment_style.word_spacing = first_line_style.word_spacing.clone();
-    }
-    if first_line_style.text_transform != originating_style.text_transform {
-        fragment_style.text_transform = first_line_style.text_transform;
-    }
-    if first_line_style.vertical_align != originating_style.vertical_align {
-        fragment_style.vertical_align = first_line_style.vertical_align.clone();
-    }
-    if first_line_style.ruby_position != originating_style.ruby_position
-        && fragment_style.ruby_position == originating_style.ruby_position
-    {
-        fragment_style.ruby_position = first_line_style.ruby_position;
+    for longhand in overrides.iter() {
+        let is_background = longhand.css_name().starts_with("background");
+        // Non-inherited effects belong to the generated first-line box and
+        // are consumed by its dedicated paint scope. Only background geometry
+        // and vertical alignment need fragment-local materialization.
+        if !longhand.is_inherited() && !is_background && longhand.css_name() != "vertical-align" {
+            continue;
+        }
+        if !modeled_longhand_has_same_source(fragment_style, originating_style, longhand) {
+            continue;
+        }
+        if is_background {
+            background_changed = true;
+        }
+        copy_modeled_longhand(fragment_style, first_line_style, longhand);
     }
     background_changed
 }
@@ -366,11 +358,31 @@ mod first_line_autospace_tests {
     use super::*;
 
     #[test]
+    fn first_line_materializes_font_synthesis_subproperties() {
+        let originating = ComputedStyle::initial();
+        let mut pseudo = originating.clone();
+        pseudo.font_synthesis.weight = false;
+        pseudo.font_synthesis.style = false;
+        let mut overrides = ModeledLonghandSet::empty();
+        overrides.insert_css_name("font-synthesis-weight");
+        overrides.insert_css_name("font-synthesis-style");
+        let mut fragment = originating.clone();
+
+        apply_first_line_style_delta(&mut fragment, &originating, &pseudo, &overrides);
+
+        assert!(!fragment.font_synthesis.weight);
+        assert!(!fragment.font_synthesis.style);
+    }
+
+    #[test]
     fn first_line_remeasures_an_autospace_marker_with_its_font_style() {
         let mut block_style = ComputedStyle::initial();
         block_style.font_size = 12.0;
         let mut first_line_style = block_style.clone();
         first_line_style.font_size = 48.0;
+        block_style
+            .first_line_overrides
+            .insert_css_name("font-size");
         block_style.first_line_style = Some(Box::new(first_line_style));
         let mut font_system = FontSystem::new();
         let initial_advance = font_system.ic_advance_for_style(&block_style) / 8.0;

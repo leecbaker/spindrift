@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  @font-face {
+    font-family: sole-regular;
+    src: url(Ahem.ttf);
+  }
+  @page { size: 500px 240px; margin: 0 }
+  body { margin: 0; font-size: 12px }
+  p { margin: 0; font-family: sole-regular }
+  .style::first-line { font-style: italic; font-synthesis-style: none }
+  .weight::first-line { font-weight: bold; font-synthesis-weight: none }
+</style>
+<p class="style">directstyle</p>
+<p class="style"><span>nestedstyle</span></p>
+<p class="weight">directweight</p>
+<p class="weight"><span>nestedweight</span></p>

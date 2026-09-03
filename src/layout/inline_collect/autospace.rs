@@ -27,6 +27,9 @@ pub(in crate::layout) fn insert_text_autospace_items(
                 }
                 scratch.push(InlineItem::Atom(atom));
             }
+            InlineItem::StaticPositionSourceMarker(source) => {
+                scratch.push(InlineItem::StaticPositionSourceMarker(source));
+            }
             InlineItem::Float(float) => {
                 previous_text = None;
                 scratch.push(InlineItem::Float(float));
@@ -81,6 +84,7 @@ pub(in crate::layout) fn push_autospaced_word(
             mergeable: false,
             source: word.source,
             hanging_edges: word.hanging_edges,
+            excluded_positioning_geometry_source: word.excluded_positioning_geometry_source,
             ancestor_inline_decorations: Rc::clone(&word.ancestor_inline_decorations),
         };
         push_autospace_boundary(font_system, output, previous_text, &word);
@@ -315,6 +319,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         };
         let mut font_system = FontSystem::new();
@@ -353,6 +358,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         });
         let word_pointer: *const InlineWord = &*word;
@@ -382,6 +388,7 @@ mod tests {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
+                excluded_positioning_geometry_source: None,
                 ancestor_inline_decorations: Vec::new().into(),
             }))
         }
@@ -426,6 +433,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         };
         let mut font_system = FontSystem::new();
@@ -457,6 +465,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
+            excluded_positioning_geometry_source: None,
             ancestor_inline_decorations: Vec::new().into(),
         };
         let mut font_system = FontSystem::new();
@@ -482,6 +491,7 @@ mod tests {
             }
             InlineItem::Word(_)
             | InlineItem::Atom(_)
+            | InlineItem::StaticPositionSourceMarker(_)
             | InlineItem::Float(_)
             | InlineItem::Break(_)
             | InlineItem::PageScopeStart(_)
@@ -502,6 +512,7 @@ mod tests {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
+                excluded_positioning_geometry_source: None,
                 ancestor_inline_decorations: Vec::new().into(),
             }))
         }
@@ -564,6 +575,7 @@ mod tests {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
+                excluded_positioning_geometry_source: None,
                 ancestor_inline_decorations: Vec::new().into(),
             }))
         }

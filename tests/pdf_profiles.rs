@@ -68,10 +68,6 @@ async fn pdf_profiles_round_trip_and_select_expected_writer_output() {
     let profiles = [
         ("pdf", PdfProfile::Pdf, "%PDF-1.4", None),
         ("pdf/a-1b", PdfProfile::PdfA1B, "%PDF-1.4", Some(("1", "B"))),
-        ("pdf/a-2b", PdfProfile::PdfA2B, "%PDF-1.7", Some(("2", "B"))),
-        ("pdf/a-3b", PdfProfile::PdfA3B, "%PDF-1.7", Some(("3", "B"))),
-        ("pdf/a-2u", PdfProfile::PdfA2U, "%PDF-1.7", Some(("2", "U"))),
-        ("pdf/a-3u", PdfProfile::PdfA3U, "%PDF-1.7", Some(("3", "U"))),
     ];
 
     assert_eq!(PdfProfile::default(), PdfProfile::Pdf);
@@ -235,7 +231,7 @@ async fn ordinary_pdf_keeps_in_gamut_oklab_paint_in_srgb() {
 #[tokio::test]
 async fn pdfa_vector_paint_uses_tagged_srgb_output_intent() {
     let options = PdfOptions {
-        profile: PdfProfile::PdfA2B,
+        profile: PdfProfile::PdfA1B,
         compression: PdfCompression::Uncompressed,
         ..PdfOptions::default()
     };
@@ -311,7 +307,7 @@ async fn ordinary_pdf_wide_pcs_gradient_uses_its_p3_profile_for_the_shading() {
 #[tokio::test]
 async fn pdfa_raster_gradient_uses_only_tagged_srgb() {
     let options = PdfOptions {
-        profile: PdfProfile::PdfA2B,
+        profile: PdfProfile::PdfA1B,
         compression: PdfCompression::Uncompressed,
         ..PdfOptions::default()
     };
@@ -425,7 +421,7 @@ async fn pdfa_uniform_image_converts_embedded_profiles_to_tagged_srgb_fill() {
     let profile = wide_gamut_profile();
     let image = tagged_png_data_url(&profile);
     let options = PdfOptions {
-        profile: PdfProfile::PdfA2B,
+        profile: PdfProfile::PdfA1B,
         compression: PdfCompression::Uncompressed,
         ..PdfOptions::default()
     };

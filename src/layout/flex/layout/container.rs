@@ -2445,8 +2445,8 @@ impl<'a> LayoutBuilder<'a> {
                                         transaction_depth: self.positioned_paint_transaction_depth,
                                         source_element: None,
                                         source_style: placed_style.clone(),
-                                        source_style_identity: &placed_style as *const ComputedStyle
-                                            as usize,
+                                        source_style_identity: 0,
+                                        source_box: InlineStaticPositionBoxSource::Principal,
                                         multicol_fragment_index: None,
                                         source_is_target: false,
                                         stack_level: context.stack_level,
@@ -2455,7 +2455,8 @@ impl<'a> LayoutBuilder<'a> {
                                         // Flex replay already uses final page
                                         // coordinates, unlike atomic inline
                                         // scratch layout.
-                                        escaped_atom_translation: EscapedAtomTranslation::none(),
+                                        escaped_atom_replay: EscapedAtomReplay::none(),
+                                        overflow_clip_containing_block: None,
                                     }
                                 }));
                         }

@@ -102,6 +102,47 @@ impl Default for PhysicalBaselineSets {
 }
 
 impl PhysicalBaselineSets {
+    /// Build a baseline set from a coordinate measured along one logical
+    /// block axis.
+    ///
+    /// Atomic formatting contexts naturally export a coordinate from their
+    /// own logical block-start edge.  Store that coordinate on the matching
+    /// physical axis immediately so a perpendicular parent cannot later
+    /// reinterpret it as a baseline on its own block axis.
+    /// <https://drafts.csswg.org/css-align-3/#baseline-export>
+    pub(in crate::layout) fn with_first_from_logical_block_start(
+        mut self,
+        block_start: PhysicalSide,
+        border_box_block_size: LayoutLength,
+        offset_from_block_start: LayoutLength,
+        metric: BaselineMetric,
+    ) -> Self {
+        match block_start {
+            PhysicalSide::Top => {
+                self.vertical.first = Some(PhysicalTopBaselineOffset::new(offset_from_block_start));
+                self.vertical_metric = metric;
+            }
+            PhysicalSide::Bottom => {
+                self.vertical.first = Some(PhysicalTopBaselineOffset::new(
+                    border_box_block_size - offset_from_block_start,
+                ));
+                self.vertical_metric = metric;
+            }
+            PhysicalSide::Left => {
+                self.horizontal.first =
+                    Some(PhysicalLeftBaselineOffset::new(offset_from_block_start));
+                self.horizontal_metric = metric;
+            }
+            PhysicalSide::Right => {
+                self.horizontal.first = Some(PhysicalLeftBaselineOffset::new(
+                    border_box_block_size - offset_from_block_start,
+                ));
+                self.horizontal_metric = metric;
+            }
+        }
+        self
+    }
+
     /// Project the first compatible physical baseline and retain the metric
     /// that names its coordinate.
     ///
@@ -221,6 +262,22 @@ mod tests {
         assert_eq!(
             sets.first_from_logical_block_start_with_metric(PhysicalSide::Right, layout_pt(75.0)),
             Some((layout_pt(37.5), BaselineMetric::Central))
+        );
+    }
+
+    #[test]
+    fn perpendicular_axis_does_not_reinterpret_an_exported_coordinate() {
+        let vertical_only = PhysicalBaselineSets::default().with_first_from_logical_block_start(
+            PhysicalSide::Top,
+            layout_pt(40.0),
+            layout_pt(7.0),
+            BaselineMetric::Alphabetic,
+        );
+
+        assert_eq!(
+            vertical_only
+                .first_from_logical_block_start_with_metric(PhysicalSide::Left, layout_pt(40.0),),
+            None,
         );
     }
 }

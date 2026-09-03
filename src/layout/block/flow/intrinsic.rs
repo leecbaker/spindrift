@@ -487,6 +487,7 @@ impl<'a> LayoutBuilder<'a> {
                         stylesheets,
                         child_boxes,
                         width_inputs.available_outer_width.points(),
+                        Some(inline_size),
                     )
                 } else {
                     self.inline_items_logical_block_size(items, style, inline_size.points())
@@ -743,6 +744,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 child_boxes,
                 available_outer_width,
+                None,
             ));
         }
         content_box_pt(self.inline_items_logical_block_size(items, style, f32::MAX))
@@ -954,6 +956,22 @@ impl<'a> LayoutBuilder<'a> {
                                 )
                             };
                             (height, height)
+                        } else if child_style.writing_mode.has_vertical_lines() {
+                            // Parallel vertical flows share their physical
+                            // height with the logical inline axis. Preserve
+                            // the child's independent min/max inline
+                            // contributions directly; asking for complete
+                            // physical geometry here also measures an
+                            // unrelated logical block size and can collapse
+                            // both contributions to max-content.
+                            let (child_min, child_max) = self.block_intrinsic_content_inline_sizes(
+                                child_element,
+                                child_style,
+                                stylesheets,
+                                Some(child_children),
+                                available_outer_width,
+                            );
+                            (child_min.points(), child_max.points())
                         } else {
                             let child_sizes = self.block_intrinsic_content_sizes(
                                 child_element,
@@ -1130,6 +1148,7 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     child_boxes,
                     available_outer_width,
+                    Some(LogicalInlineContentSize::new(content_box_pt(min_inline))),
                 )
             } else {
                 self.estimate_block_child_intrinsic_content_height(
@@ -1186,23 +1205,28 @@ impl<'a> LayoutBuilder<'a> {
     /// can double the physical width of nested orthogonal boxes.
     /// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
     /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
-    fn estimate_block_child_intrinsic_logical_block_size(
+    pub(in crate::layout) fn estimate_block_child_intrinsic_logical_block_size(
         &mut self,
         _element: &Element,
         style: &ComputedStyle,
         stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_outer_width: f32,
+        selected_parent_logical_inline_measure: Option<LogicalInlineContentSize>,
     ) -> f32 {
         let Some(child_boxes) = child_boxes else {
             return 0.0;
         };
-        let parent_logical_inline_measure = used_content_box_size(
-            style.box_values.height.value().clone(),
-            style.box_sizing,
-            PercentageBasis::definite(content_box_pt(available_outer_width)),
-            intrinsic_box_metrics(style).vertical_non_content_length(),
-        );
+        let parent_logical_inline_measure = selected_parent_logical_inline_measure
+            .map(LogicalInlineContentSize::content_box_length)
+            .or_else(|| {
+                used_content_box_size(
+                    style.box_values.height.value().clone(),
+                    style.box_sizing,
+                    PercentageBasis::definite(content_box_pt(available_outer_width)),
+                    intrinsic_box_metrics(style).vertical_non_content_length(),
+                )
+            });
         let mut block_size = 0.0;
         for child in child_boxes {
             let Some((child_element, _, child_style, child_children)) = child.element_parts()
@@ -1270,6 +1294,89 @@ impl<'a> LayoutBuilder<'a> {
                 + metrics.margin.right.points();
         }
         block_size
+    }
+
+    /// Export the last compatible inline baseline from a vertical block-child
+    /// stack during intrinsic atomic sizing.
+    ///
+    /// This is the baseline half of the same geometry query above: it walks
+    /// the normalized block flow, ignores out-of-flow children, and never
+    /// creates committed fragments. A child with parallel axes can export its
+    /// last line; an orthogonal or layout-contained child cannot.
+    /// <https://drafts.csswg.org/css-align-3/#baseline-export>
+    pub(in crate::layout) fn estimate_block_child_intrinsic_last_baseline(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        available_outer_width: f32,
+        selected_parent_logical_inline_measure: LogicalInlineContentSize,
+    ) -> Option<LayoutLength> {
+        let child_boxes = child_boxes?;
+        for (index, child) in child_boxes.iter().enumerate().rev() {
+            let Some((child_element, _, child_style, child_children)) = child.element_parts()
+            else {
+                continue;
+            };
+            if !child_style.display.is_block_level()
+                || child_style.float != Float::None
+                || matches!(child_style.position, Position::Absolute | Position::Fixed)
+                || writing_modes_are_orthogonal(style.writing_mode, child_style.writing_mode)
+                || used_property_containment(child_element, child_style).layout
+            {
+                continue;
+            }
+            let preceding_extent = self.estimate_block_child_intrinsic_logical_block_size(
+                element,
+                style,
+                stylesheets,
+                Some(&child_boxes[..index]),
+                available_outer_width,
+                Some(selected_parent_logical_inline_measure),
+            );
+            let metrics = intrinsic_box_metrics(child_style);
+            let block_start_margin = match block_start_side(style.writing_mode) {
+                PhysicalSide::Right => metrics.margin.right.points(),
+                PhysicalSide::Left => metrics.margin.left.points(),
+                PhysicalSide::Top => metrics.margin.top.points(),
+                PhysicalSide::Bottom => metrics.margin.bottom.points(),
+            };
+            let items = self.intrinsic_inline_items_for_element(
+                child_element,
+                child_style,
+                stylesheets,
+                Some(child_children),
+            );
+            if !items.is_empty() {
+                let sequence = self.collect_inline_line_sequence_with_text_box_trim(
+                    items,
+                    child_style,
+                    selected_parent_logical_inline_measure.points(),
+                    0.0,
+                    0.0,
+                );
+                let baseline = self.inline_box_sequence_baseline_offset(
+                    &sequence,
+                    child_style,
+                    metrics.border.to_css_edges(),
+                )?;
+                return Some(layout_pt(preceding_extent + block_start_margin + baseline));
+            }
+            if let Some(descendant_baseline) = self.estimate_block_child_intrinsic_last_baseline(
+                child_element,
+                child_style,
+                stylesheets,
+                Some(child_children),
+                available_outer_width,
+                selected_parent_logical_inline_measure,
+            ) {
+                return Some(layout_pt(
+                    preceding_extent + block_start_margin + descendant_baseline.points(),
+                ));
+            }
+        }
+        None
     }
 
     fn estimate_block_child_intrinsic_content_height(
@@ -1376,6 +1483,7 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     child_boxes,
                     available_outer_width,
+                    Some(logical_inline_size),
                 ),
             ));
         }

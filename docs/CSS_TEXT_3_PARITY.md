@@ -58,9 +58,14 @@ except where existing code already implements draft properties.
   text runs' local `line-break`, `word-break`, and `overflow-wrap` behavior.
   The typed boundary resolver uses U+FFFC only as transient UAX #14 input for
   atomics, preserves the NBSP compatibility opportunity, and suppresses GL,
-  `WORD JOINER`, and ZWJ boundaries. Out-of-flow static-position placeholders
-  and regular inline box edges are transparent to the surrounding text stream
-  and never create U+FFFC-style opportunities. Whitespace normalization keeps
+  `WORD JOINER`, and ZWJ boundaries. Out-of-flow static-position source
+  markers and regular inline box edges are transparent to the surrounding
+  text stream and never create U+FFFC-style opportunities. Hypothetical
+  replay replaces only the selected source marker with a typed scratch atom;
+  a non-atomic source has zero inline footprint and remains transparent to
+  CSS Text, so its anchor cannot migrate across a soft break. A genuinely
+  atomic inline source retains both its measured footprint and ordinary atomic
+  boundary policy. Whitespace normalization keeps
   `box-decoration-break: slice` start/end ownership only on source-adjacent
   visible text, so a soft-wrapped continuation cannot repaint either side.
   `box-decoration-break: clone` instead materializes fragment-local start and
@@ -216,14 +221,15 @@ except where existing code already implements draft properties.
   document-space advance separately; U+00A0 remains a no-break inter-word
   separator rather than a hanging edge space; `break-spaces` remains
   non-hanging.
-- A selected `break-spaces` after-space boundary retains its full advance even
-  when it intentionally overflows the available measure, but only after every
+- A selected `break-spaces` boundary after a preserved document space, tab, or
+  breakable Unicode other-space separator retains its full advance even when
+  it intentionally overflows the available measure, but only after every
   fitting ordinary or overflow-wrap boundary has been exhausted. In RTL, the
   selected logical line-end space gets bidi-only context before UAX #9 visual
   ordering, keeping it at the visual inline start without changing source
   text, extraction, or the formatted measure.
 - When no boundary fits, line selection chooses the first overflowing
-  `break-spaces` after-space opportunity in source order. This retains the
+  `break-spaces` separator opportunity in source order. This retains the
   required overflowing separator without consuming later preserved spaces.
 - A collapsible document-space suffix is traversed as already removed before
   the same scan identifies a preceding Unicode other-space separator. That
@@ -244,6 +250,14 @@ except where existing code already implements draft properties.
   Decorative inline borders and padding remain materialized, while spaces in
   an otherwise-empty nested inline tail cannot shift those edges away from the
   final text content.
+- CSS Text adjacency is canonicalized independently of structural inline graph
+  runs. Consecutive box edges, text-autospace edges, and out-of-flow source
+  markers therefore expose at most one typographic
+  boundary between their neighboring textual or atomic participants. Its graph
+  cut keeps closing inline edges with the preceding line and opening inline
+  edges with the continuation; neutral markers retain source order without
+  selecting or duplicating the break. Floats keep a distinct placement
+  opportunity while remaining absent from CSS Text adjacency.
 - When collapsible spaces from adjacent inline styles merge, their one retained
   advance retains every source style's legal wrap ownership. In particular, a
   `normal` descendant's separator can wrap after a preceding `nowrap` run
@@ -253,12 +267,14 @@ except where existing code already implements draft properties.
   manufacture a break beside a preserved separator; `line-break:anywhere` and
   `overflow-wrap:anywhere` retain their separate graph ownership.
 - Unicode other-space separators remain visible source content. In
-  `break-spaces`, their after-separator opportunity and full advance are
-  retained; U+202F additionally keeps its ordinary UAX #14 `GL` protection at
-  non-overridden text and atomic boundaries. Legacy modes retain Phase II
-  trailing hanging without moving the separator to a line of its own. The
-  hanging suffix is excluded from fitting and alignment, but remains source
-  for inline backgrounds, decorations, and extraction.
+  `break-spaces`, breakable separators gain CSS-owned retained opportunities
+  after each character, including between adjacent U+3000 or U+1680
+  characters. U+2007 and U+202F retain their UAX #14 `GL` protection, and WJ
+  or ZWJ still protects a following boundary. The same boundary classifier is
+  used inside text runs and across transparent inline edges. Legacy modes
+  retain Phase II trailing hanging without moving the separator to a line of
+  its own. The hanging suffix is excluded from fitting and alignment, but
+  remains source for inline backgrounds, decorations, and extraction.
 - Unicode other-space separators remain ordinary shaped text: their selected
   glyph, shaping advance, and source mapping flow through to PDF paint and
   extraction. Line-edge hanging excludes their advance from fitting where CSS
@@ -388,7 +404,10 @@ except where existing code already implements draft properties.
   inline spans are not flattened during replay.
 - Selected inline line records classify CSS Inline phantom line boxes from the
   materialized line items, preserving forced empty lines while letting phantom
-  lines contribute no paint, baseline, or block-size.
+  lines contribute no paint, baseline, or block-size. A terminal forced break
+  upgrades an otherwise phantom structural inline-edge fragment to a real
+  forced-empty line, so a leading `<br>` inside an undecorated inline wrapper
+  retains its line-height in final layout and intrinsic measurement.
 - Typographic pseudo-element painting tracks the originating block container's
   first formatted line across CSS 2 block-in-inline anonymous block splits. Its
   initial anonymous inline sequence receives the originating pseudo style, and
@@ -402,8 +421,8 @@ except where existing code already implements draft properties.
 - Anonymous flex and grid item replay installs the assigned item content box
   as its inline formatting-context basis, so the same text-indent-aware line
   selection used for intrinsic sizing wraps against the resolved item width.
-- Prepared inline static-position placeholders retain their hypothetical
-  margin-box rectangle and prepared-line baseline in one shared line artifact.
+- Prepared inline static-position hypothetical boxes retain their margin-box
+  rectangle and prepared-line baseline in one shared line artifact.
   Margin-box static rectangles anchor positioned boxes directly; baseline-mode
   callers translate from the same prepared-line coordinate, keeping vertical
   and indented horizontal static positions consistent.

@@ -775,6 +775,7 @@ fn inline_scope_has_only_structural_items(items: &[InlineItem]) -> bool {
             InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
         ),
         InlineItem::Word(word) => word.source == InlineTextSource::BidiControl,
+        InlineItem::StaticPositionSourceMarker(_) => true,
         InlineItem::Float(_)
         | InlineItem::Break(_)
         | InlineItem::PageScopeStart(_)
@@ -863,6 +864,7 @@ impl<'a> LayoutBuilder<'a> {
                 // balance only these controls across a soft wrap.
                 source: InlineTextSource::BidiControl,
                 hanging_edges: InlineHangingEdges::default(),
+                excluded_positioning_geometry_source: None,
                 ancestor_inline_decorations: Vec::new().into(),
             })));
         }

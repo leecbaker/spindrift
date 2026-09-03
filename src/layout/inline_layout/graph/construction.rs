@@ -62,6 +62,12 @@ where
                     }
                 }
             }
+            InlineItem::StaticPositionSourceMarker(_) => {
+                // Source markers are structural ownership tokens. They are
+                // absent from CSS Text adjacency and line geometry; a
+                // hypothetical replay replaces its selected marker with an
+                // ordinary atomic inline before graph construction.
+            }
             InlineItem::Float(float) => {
                 // Floats participate in source-order placement but are out
                 // of flow for CSS Text. They therefore cannot split the word

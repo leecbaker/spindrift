@@ -1,6 +1,6 @@
 # CSS Inline Layout Parity
 
-Last updated: 2026-08-25
+Last updated: 2026-09-01
 
 CSS Inline Layout Level 3 and CSS Pseudo-Elements Level 4 are the conformance
 targets for inline line construction, typographic pseudo-elements, and initial
@@ -22,9 +22,32 @@ comparisons, but it is not a complete `initial-letter` model.
   measurement, so styled first letters participate in shaping, measured
   advances, line-break selection, shrink-to-fit sizing, and collected inline
   line records instead of being only a paint-time rewrite.
-- Inline and `::first-letter` text paint with `opacity` is emitted through the
-  normal PDF transparency-group path, preserving atomic compositing for glyphs,
-  shadows, decorations, color glyph paths, raster glyphs, and links.
+- Inline, `::first-letter`, and `::first-line` paint with `opacity` is emitted
+  through the normal PDF transparency-group path. The generated first-line box
+  owns one prepared paint subtree containing its backgrounds, text,
+  decorations, ruby, and atomic inline descendants; CSS Overflow's anonymous
+  block ellipsis and link hit-testing remain outside the graphical opacity
+  group.
+- The used `::first-line` style is materialized into the selected durable line
+  record. Font metrics, glyph advances, CSS Text edge effects, wrapping, line
+  box geometry, and paint therefore consume the same styled fragments. The
+  cascade supplies a typed set of canonical pseudo longhands, and source
+  provenance distinguishes inherited values from equal-valued descendant
+  declarations, so the layout transfer cannot drift from newly modeled properties or
+  overwrite a nested inline's declaration.
+- First-formatted-line ownership passes through floated and absolutely
+  positioned children and is consumed only by an in-flow descendant that
+  commits a non-phantom line. Ordinary nested inline and generated
+  `::before`/`::after` fragments inherit first-line values without replacing
+  their explicitly specified foregrounds.
+- Collapsible spaces retain boundary-shaping context and their selected
+  advance, but cannot bridge fragments with incompatible foreground/effect
+  state into one PDF text group. This preserves generated-content and
+  atomic-inline scope provenance without introducing a paint-only first-line
+  exception.
+- HTML `input` and `textarea` principal boxes are treated as replaced controls
+  for typographic pseudo applicability; their internally rendered values do
+  not become an author-selectable `::first-line` or `::first-letter`.
 - Non-replaced inline content areas use a stable primary-font em box for
   backgrounds, borders, and padding. That geometry is independent of
   `line-height` and glyph fallback; fallback faces may enlarge only a
@@ -37,6 +60,10 @@ comparisons, but it is not a complete `initial-letter` model.
   The record has zero block advance and no ordinary paint or fragmentation
   effect, but preserves its edge atoms so a positioned descendant can recover
   the required zero-height containing-block fragment and replay once.
+  <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
+- A forced break makes an otherwise structural-only terminal inline fragment a
+  real forced-empty line. Its inline-edge metadata remains available for
+  decoration and positioning while the line contributes its used line-height.
   <https://drafts.csswg.org/css-inline-3/#phantom-line-boxes>
 - Specified `initial-letter` values compute `drop` to a sink equal to
   `floor(size)`, compute `raise` to sink `1`, preserve explicit sink values,
@@ -91,6 +118,12 @@ comparisons, but it is not a complete `initial-letter` model.
   `vertical-lr` lines. Inline tables retain their CSS 2.2 table-box baseline
   reference so wrapper block-start margins are not applied to their first-row
   baseline a second time.
+- Atomic formatting contexts classify normalized descendant flow once for
+  intrinsic and committed layout. Vertical inline sequences and block-child
+  stacks resolve their physical margin-box dimensions from typed logical axes,
+  while exported baselines remain in physical baseline sets; a perpendicular
+  parent synthesizes its requested baseline instead of reinterpreting an
+  axisless coordinate.
 - Empty `inline-flex` boxes export their synthesized baseline from the border
   box; the shared atomic-inline margin-box adapter accounts for margins once,
   so a block-end margin moves the painted border box without moving its

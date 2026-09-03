@@ -576,6 +576,7 @@ impl<'a> LayoutBuilder<'a> {
                 mergeable: true,
                 source: InlineTextSource::Marker,
                 hanging_edges: InlineHangingEdges::default(),
+                excluded_positioning_geometry_source: None,
                 ancestor_inline_decorations: Vec::new().into(),
             })));
         }
@@ -589,6 +590,7 @@ impl<'a> LayoutBuilder<'a> {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
+                excluded_positioning_geometry_source: None,
                 ancestor_inline_decorations: Vec::new().into(),
             })));
         }

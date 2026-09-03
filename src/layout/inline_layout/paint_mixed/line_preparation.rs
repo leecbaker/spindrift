@@ -1,4 +1,140 @@
 use super::*;
+use crate::layout::inline_layout::mixed::measured_item_is_transparent_mixed_inline_edge;
+
+/// A final line-local position after visual bidi run placement.
+///
+/// This remains in the line's logical-inline coordinate system until
+/// [`InlineLineGeometry`] performs the one physical writing-mode projection.
+/// Keeping it distinct from measured advances prevents source-order fitting
+/// coordinates from being reused as prepared fragment geometry.
+#[derive(Debug, Clone, Copy)]
+struct PreparedInlineVisualPosition(LayoutLength);
+
+impl PreparedInlineVisualPosition {
+    fn points(self) -> f32 {
+        self.0.points()
+    }
+}
+
+/// Resolve source fragments and structural edges inside opposite-direction
+/// visual runs to their final line-local positions.
+///
+/// UAX #9 emits a visual run as one unit. Its source fragments retain logical
+/// source order for boundary shaping, so a vertical run whose resolved
+/// direction differs from the paragraph occupies the selected span from the
+/// opposite edge. This placement table is prepared before paint scopes or
+/// text groups are constructed and is therefore shared by backgrounds,
+/// positioned-inline geometry, and structural edge markers.
+/// <https://www.unicode.org/reports/tr9/#Reordering_Resolved_Levels>
+/// <https://drafts.csswg.org/css-writing-modes-4/#bidi-algo>
+fn prepared_inline_visual_positions(
+    line: &[MeasuredInlineItem],
+    block_style: &ComputedStyle,
+    paragraph_direction: Direction,
+    line_start: LayoutLength,
+    additional_advances: &[LayoutLength],
+) -> Vec<Option<PreparedInlineVisualPosition>> {
+    debug_assert_eq!(line.len(), additional_advances.len());
+    let item_advance = |index: usize, item: &MeasuredInlineItem| {
+        let content_advance = match &item.item {
+            InlineLineItem::Fragment(fragment) => fragment
+                .out_of_flow_paint_inline_advance()
+                .map(|advance| advance.points())
+                .unwrap_or(item.base_advance().points())
+                .max(0.0),
+            InlineLineItem::Atom(atom) => match atom.content() {
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => edge.advance,
+                InlineAtomContent::Leader(_) => 0.0,
+                _ => inline_atom_logical_inline_size(atom, block_style),
+            },
+            InlineLineItem::Float(_) => item.used_advance().points(),
+        };
+        content_advance + additional_advances[index].points()
+    };
+    let is_visual_run_item = |item: &MeasuredInlineItem| {
+        matches!(item.item, InlineLineItem::Fragment(_))
+            || measured_item_is_transparent_mixed_inline_edge(item)
+    };
+    let resolved_direction = |item: &MeasuredInlineItem| match &item.item {
+        InlineLineItem::Fragment(fragment) => {
+            fragment
+                .resolved_bidi_direction()
+                .unwrap_or(match paragraph_direction {
+                    Direction::Ltr => ResolvedBidiDirection::Ltr,
+                    Direction::Rtl => ResolvedBidiDirection::Rtl,
+                })
+        }
+        InlineLineItem::Atom(_) | InlineLineItem::Float(_) => match paragraph_direction {
+            Direction::Ltr => ResolvedBidiDirection::Ltr,
+            Direction::Rtl => ResolvedBidiDirection::Rtl,
+        },
+    };
+
+    let mut natural_starts = Vec::with_capacity(line.len());
+    let mut cursor = line_start.points();
+    for (index, item) in line.iter().enumerate() {
+        cursor += item.advance.boundary_before().points();
+        natural_starts.push(cursor);
+        cursor += item_advance(index, item);
+    }
+    // `None` deliberately preserves the existing shaped-group cursor for
+    // runs whose selected order is already their final visual order. That
+    // cursor can differ from graph measurement after final shaping. Only the
+    // opposite-direction vertical case needs an explicit source-fragment
+    // placement within its already selected visual run.
+    let mut placements = vec![None; line.len()];
+
+    if !block_style.writing_mode.has_vertical_lines() {
+        return placements;
+    }
+
+    let paragraph_resolved = match paragraph_direction {
+        Direction::Ltr => ResolvedBidiDirection::Ltr,
+        Direction::Rtl => ResolvedBidiDirection::Rtl,
+    };
+    let mut run_start = 0;
+    while run_start < line.len() {
+        if !is_visual_run_item(&line[run_start]) {
+            run_start += 1;
+            continue;
+        }
+        let first_fragment = (run_start..line.len()).find(|&index| {
+            matches!(line[index].item, InlineLineItem::Fragment(_))
+                && line[run_start..index].iter().all(&is_visual_run_item)
+        });
+        let Some(first_fragment) = first_fragment else {
+            break;
+        };
+        let run_direction = resolved_direction(&line[first_fragment]);
+        let mut run_end = first_fragment + 1;
+        while run_end < line.len() && is_visual_run_item(&line[run_end]) {
+            if matches!(line[run_end].item, InlineLineItem::Fragment(_))
+                && resolved_direction(&line[run_end]) != run_direction
+            {
+                break;
+            }
+            run_end += 1;
+        }
+        if run_direction != paragraph_resolved {
+            let start = natural_starts[run_start];
+            let end = if run_end == line.len() {
+                cursor
+            } else {
+                natural_starts[run_end]
+            };
+            let extent = (end - start).max(0.0);
+            for index in run_start..run_end {
+                let local_start = natural_starts[index] - start;
+                let width = item_advance(index, &line[index]);
+                placements[index] = Some(PreparedInlineVisualPosition(layout_pt(
+                    start + extent - local_start - width,
+                )));
+            }
+        }
+        run_start = run_end;
+    }
+    placements
+}
 
 impl<'a> LayoutBuilder<'a> {
     /// Prepare one inline line fragment for painting.
@@ -29,6 +165,15 @@ impl<'a> LayoutBuilder<'a> {
             && context.is_first_line
             && !first_letter_is_initial
             && block_style.first_line_style.is_some();
+        // A prepared text group has one foreground/effect owner. On the
+        // generated first line, a collapsible space can carry different
+        // descendant or generated-pseudo provenance from the visible text on
+        // either side. Keep its selected advance, but do not let it bridge
+        // incompatible first-line paint states into one group.
+        // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+        // <https://www.w3.org/TR/css-text-3/#boundary-shaping>
+        let preserve_first_line_paint_boundaries =
+            context.is_first_line && block_style.first_line_style.is_some();
         let line = if apply_typographic_pseudos {
             let mut source_items = measured_inline_items(line_fragment.items());
             // First-letter splitting is already part of the opportunity graph:
@@ -262,9 +407,37 @@ impl<'a> LayoutBuilder<'a> {
         let mut pending_inline_position = inline_position;
         let mut pending_visual_offset = InlineVisualOffset::zero();
         let mut pending_preserve_leading_summary_space = false;
+        let mut pending_synthesize_leading_summary_space = false;
         let mut pending_horizontal_content_bottom_y = None;
         let mut previous_item_was_opaque_atom = false;
+        let mut pending_started_after_opaque_atom = false;
         let mut paint_items = Vec::new();
+        let mut positioning_geometry = Vec::new();
+        let additional_visual_advances = line
+            .iter()
+            .enumerate()
+            .map(|(item_index, _)| {
+                let inter_character_expansion_count =
+                    justification_plan.inter_character_expansion_count_after_item(item_index);
+                let fragment_expansion_count =
+                    justification_plan.expansion_count_after_item(item_index);
+                let count = if justification_plan.justifies_inter_character()
+                    && inter_character_expansion_count > 0
+                {
+                    inter_character_expansion_count
+                } else {
+                    fragment_expansion_count
+                };
+                layout_pt(extra_space_width * count as f32)
+            })
+            .collect::<Vec<_>>();
+        let visual_positions = prepared_inline_visual_positions(
+            &line,
+            block_style,
+            context.direction,
+            layout_pt(inline_position),
+            &additional_visual_advances,
+        );
         for (item_index, measured_item) in line.iter().enumerate() {
             match &measured_item.item {
                 InlineLineItem::Fragment(fragment) => {
@@ -288,6 +461,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_horizontal_content_bottom_y,
                                 extra_space_width,
                                 pending_preserve_leading_summary_space,
+                                pending_synthesize_leading_summary_space,
                             )
                         } else {
                             self.prepare_inline_text_group_at_inline_position(
@@ -301,6 +475,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_visual_offset,
                                 pending_horizontal_content_bottom_y,
                                 pending_preserve_leading_summary_space,
+                                pending_synthesize_leading_summary_space,
                             )
                         } {
                             inline_position = pending_inline_position + group.width();
@@ -315,6 +490,7 @@ impl<'a> LayoutBuilder<'a> {
                         pending_horizontal_content_bottom_y = None;
                         pending_visual_offset = InlineVisualOffset::zero();
                         pending_preserve_leading_summary_space = false;
+                        pending_synthesize_leading_summary_space = false;
                     }
                     inline_position += leading_tracking;
                     let out_of_flow_paint_inline_advance = fragment
@@ -328,6 +504,7 @@ impl<'a> LayoutBuilder<'a> {
                         if pending_fragments.is_empty() {
                             pending_inline_position = inline_position;
                             pending_visual_offset = fragment.visual_offset();
+                            pending_started_after_opaque_atom = previous_item_was_opaque_atom;
                             pending_preserve_leading_summary_space =
                                 item_index > 0 || previous_item_was_opaque_atom;
                         }
@@ -359,13 +536,16 @@ impl<'a> LayoutBuilder<'a> {
                     let width = out_of_flow_paint_inline_advance
                         .unwrap_or(measured_item.base_advance().points())
                         .max(0.0);
+                    let prepared_inline_position = visual_positions[item_index]
+                        .map(PreparedInlineVisualPosition::points)
+                        .unwrap_or(inline_position);
                     let fragment_expansion_count =
                         justification_plan.expansion_count_after_item(item_index);
                     let fragment_rect = trim_inline_content_rect(
                         line_geometry.visual_line_item_rect(
                             line_logical_inline_start,
                             line_physical_origin,
-                            inline_position,
+                            prepared_inline_position,
                             width + extra_space_width * fragment_expansion_count as f32,
                             fragment_background_y,
                             fragment_content_block_size,
@@ -374,6 +554,28 @@ impl<'a> LayoutBuilder<'a> {
                         fragment_content_trim,
                     )
                     .translated(fragment.visual_offset());
+                    for decoration in fragment.ancestor_inline_decorations() {
+                        if let Some(source) = decoration.positioning_containing_block_id {
+                            if fragment.excluded_positioning_geometry_source() == Some(source) {
+                                continue;
+                            }
+                            let axes = WritingModeAxes::new(
+                                decoration.style.writing_mode,
+                                decoration.style.used_direction(),
+                            );
+                            prepared_inline_positioning_geometry_mut(
+                                &mut positioning_geometry,
+                                source,
+                                axes,
+                            )
+                            .record_content_rect(PageTopRect::new(
+                                fragment_rect.x(),
+                                fragment_rect.y() + fragment_rect.height(),
+                                fragment_rect.width(),
+                                fragment_rect.height(),
+                            ));
+                        }
+                    }
                     for decoration in fragment.ancestor_inline_decorations() {
                         if !decoration.paints_background_or_border {
                             continue;
@@ -388,7 +590,7 @@ impl<'a> LayoutBuilder<'a> {
                             line_geometry.visual_line_item_rect(
                                 line_logical_inline_start,
                                 line_physical_origin,
-                                inline_position,
+                                prepared_inline_position,
                                 width + extra_space_width * fragment_expansion_count as f32,
                                 fragment_background_y,
                                 fragment_content_block_size,
@@ -429,6 +631,24 @@ impl<'a> LayoutBuilder<'a> {
                     // terminates paint-time shaping: allowing Parley to join
                     // the fragments would place glyphs as though no boundary
                     // advance existed (and can re-enable contextual forms).
+                    let enforce_space_paint_boundary =
+                        preserve_first_line_paint_boundaries || pending_started_after_opaque_atom;
+                    let collapsible_space_can_append =
+                        pending_fragments.last().is_some_and(|previous| {
+                            inline_fragment_can_append_collapsible_space(previous, &fragment)
+                                && (!enforce_space_paint_boundary
+                                    || can_paint_inline_fragments_together(previous, &fragment))
+                        });
+                    let pending_spaces_can_append =
+                        pending_inline_fragments_are_collapsible_space(&pending_fragments)
+                            && (!enforce_space_paint_boundary
+                                || pending_fragments.iter().all(|pending| {
+                                    can_paint_inline_fragments_together(pending, &fragment)
+                                }));
+                    let synthesize_pending_space_in_current_summary =
+                        pending_preserve_leading_summary_space
+                            && pending_inline_fragments_are_collapsible_space(&pending_fragments)
+                            && !inline_fragment_is_collapsible_space(&fragment);
                     let can_append = leading_tracking == 0.0
                         && preserves_justification_policy
                         && pending_fragments.last().is_none_or(|previous| {
@@ -439,44 +659,49 @@ impl<'a> LayoutBuilder<'a> {
                             && pending_fragments.last().is_some_and(|previous| {
                                 can_queue_inline_fragments_for_shaping(previous, &fragment)
                             })
-                            || pending_fragments.last().is_some_and(|previous| {
-                                inline_fragment_can_append_collapsible_space(previous, &fragment)
-                            })
-                            || pending_inline_fragments_are_collapsible_space(&pending_fragments));
+                            || collapsible_space_can_append
+                            || pending_spaces_can_append);
                     if pending_fragments.is_empty() {
-                        pending_inline_position = inline_position;
+                        pending_synthesize_leading_summary_space = false;
+                        pending_inline_position = prepared_inline_position;
                         pending_visual_offset = fragment.visual_offset();
+                        pending_started_after_opaque_atom = previous_item_was_opaque_atom;
                         pending_preserve_leading_summary_space = previous_item_was_opaque_atom
+                            || (preserve_first_line_paint_boundaries && inline_position > 0.0)
                             || (item_index > 0 && !inline_fragment_is_collapsible_space(&fragment));
                     } else if !can_append {
-                        if let Some(group) = if justification_plan.justifies_inter_word() {
-                            self.prepare_justified_inline_text_group_at_inline_position(
-                                &pending_fragments,
-                                block_style,
-                                line_geometry,
-                                line_layout_baseline_y,
-                                line_logical_inline_start,
-                                line_physical_origin,
-                                pending_inline_position,
-                                pending_visual_offset,
-                                pending_horizontal_content_bottom_y,
-                                extra_space_width,
-                                pending_preserve_leading_summary_space,
-                            )
-                        } else {
-                            self.prepare_inline_text_group_at_inline_position(
-                                &pending_fragments,
-                                block_style,
-                                line_geometry,
-                                line_layout_baseline_y,
-                                line_logical_inline_start,
-                                line_physical_origin,
-                                pending_inline_position,
-                                pending_visual_offset,
-                                pending_horizontal_content_bottom_y,
-                                pending_preserve_leading_summary_space,
-                            )
-                        } {
+                        if !synthesize_pending_space_in_current_summary
+                            && let Some(group) = if justification_plan.justifies_inter_word() {
+                                self.prepare_justified_inline_text_group_at_inline_position(
+                                    &pending_fragments,
+                                    block_style,
+                                    line_geometry,
+                                    line_layout_baseline_y,
+                                    line_logical_inline_start,
+                                    line_physical_origin,
+                                    pending_inline_position,
+                                    pending_visual_offset,
+                                    pending_horizontal_content_bottom_y,
+                                    extra_space_width,
+                                    pending_preserve_leading_summary_space,
+                                    pending_synthesize_leading_summary_space,
+                                )
+                            } else {
+                                self.prepare_inline_text_group_at_inline_position(
+                                    &pending_fragments,
+                                    block_style,
+                                    line_geometry,
+                                    line_layout_baseline_y,
+                                    line_logical_inline_start,
+                                    line_physical_origin,
+                                    pending_inline_position,
+                                    pending_visual_offset,
+                                    pending_horizontal_content_bottom_y,
+                                    pending_preserve_leading_summary_space,
+                                    pending_synthesize_leading_summary_space,
+                                )
+                            }
+                        {
                             // The final visual group is the authoritative
                             // inline advance.  The selected line's measured
                             // slices can differ after bidi reordering and
@@ -492,13 +717,21 @@ impl<'a> LayoutBuilder<'a> {
                         }
                         pending_fragments.clear();
                         pending_horizontal_content_bottom_y = None;
-                        pending_inline_position = inline_position;
+                        pending_inline_position = prepared_inline_position;
                         pending_visual_offset = fragment.visual_offset();
+                        pending_started_after_opaque_atom = previous_item_was_opaque_atom;
+                        pending_synthesize_leading_summary_space =
+                            synthesize_pending_space_in_current_summary;
                         pending_preserve_leading_summary_space = previous_item_was_opaque_atom
+                            || (preserve_first_line_paint_boundaries && inline_position > 0.0)
                             || (item_index > 0 && !inline_fragment_is_collapsible_space(&fragment));
                     }
                     if pending_inline_fragments_are_join_control_only(&pending_fragments) {
                         pending_visual_offset = fragment.visual_offset();
+                    }
+                    if !pending_fragments.is_empty() {
+                        pending_inline_position =
+                            pending_inline_position.min(prepared_inline_position);
                     }
                     if fragment.style().visibility == Visibility::Visible
                         && inline_fragment_has_visible_text_paint(&fragment)
@@ -528,6 +761,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_visual_offset,
                                 pending_horizontal_content_bottom_y,
                                 pending_preserve_leading_summary_space,
+                                pending_synthesize_leading_summary_space,
                             ) {
                                 inline_position = pending_inline_position + group.width();
                                 Self::update_line_rendered_baseline_shift(
@@ -541,6 +775,7 @@ impl<'a> LayoutBuilder<'a> {
                             pending_horizontal_content_bottom_y = None;
                             pending_visual_offset = InlineVisualOffset::zero();
                             pending_preserve_leading_summary_space = false;
+                            pending_synthesize_leading_summary_space = false;
                         }
                         inline_position += if add_inter_character_gap {
                             extra_space_width * inter_character_expansion_count as f32
@@ -583,6 +818,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_horizontal_content_bottom_y,
                                 extra_space_width,
                                 pending_preserve_leading_summary_space,
+                                pending_synthesize_leading_summary_space,
                             )
                         } else {
                             self.prepare_inline_text_group_at_inline_position(
@@ -596,6 +832,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_visual_offset,
                                 pending_horizontal_content_bottom_y,
                                 pending_preserve_leading_summary_space,
+                                pending_synthesize_leading_summary_space,
                             )
                         }
                     {
@@ -612,13 +849,14 @@ impl<'a> LayoutBuilder<'a> {
                         pending_horizontal_content_bottom_y = None;
                         pending_visual_offset = InlineVisualOffset::zero();
                         pending_preserve_leading_summary_space = false;
+                        pending_synthesize_leading_summary_space = false;
                     }
                     inline_position += boundary_before;
                     if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) =
                         atom.content()
                     {
                         let atom_metrics =
-                            self.inline_text_box_metrics(atom.style(), atom.baseline_shift);
+                            self.inline_text_box_metrics(atom.style(), atom.baseline_shift());
                         let content_block_size = atom_metrics.content_block_size;
                         let content_trim =
                             self.inline_text_box_content_trim_for_style(atom.style(), atom_metrics);
@@ -638,8 +876,10 @@ impl<'a> LayoutBuilder<'a> {
                                 *edge,
                             )
                         {
-                            let paint_inline_start =
-                                inline_position + inline_box_edge_paint_offset(*edge);
+                            let paint_inline_start = visual_positions[item_index]
+                                .map(PreparedInlineVisualPosition::points)
+                                .unwrap_or(inline_position)
+                                + inline_box_edge_paint_offset(*edge);
                             let border_box = trim_inline_content_rect(
                                 line_geometry.visual_line_item_rect(
                                     line_logical_inline_start,
@@ -653,6 +893,26 @@ impl<'a> LayoutBuilder<'a> {
                                 content_trim,
                             )
                             .translated(atom.visual_offset);
+                            if let Some(source) = edge.positioning_containing_block_id {
+                                let axes = WritingModeAxes::new(
+                                    atom.style().writing_mode,
+                                    atom.style().used_direction(),
+                                );
+                                prepared_inline_positioning_geometry_mut(
+                                    &mut positioning_geometry,
+                                    source,
+                                    axes,
+                                )
+                                .record_marker(
+                                    edge.logical_edge,
+                                    PageTopRect::new(
+                                        border_box.x(),
+                                        border_box.y() + border_box.height(),
+                                        border_box.width(),
+                                        border_box.height(),
+                                    ),
+                                );
+                            }
                             paint_items.push(PreparedInlinePaintItem::Atom(PreparedInlineAtom {
                                 atom: atom.clone(),
                                 border_box,
@@ -697,7 +957,7 @@ impl<'a> LayoutBuilder<'a> {
                     let atom_uses_box_edge_baseline =
                         matches!(
                             atom.content(),
-                            InlineAtomContent::StaticPositionPlaceholder(_)
+                            InlineAtomContent::StaticPositionHypothetical { .. }
                                 | InlineAtomContent::InlineFragment { .. }
                         ) || matches!(atom.content(), InlineAtomContent::InlineBox { .. })
                             && atom.style().overflow != css::Overflow::Visible;
@@ -766,6 +1026,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_horizontal_content_bottom_y,
                                 extra_space_width,
                                 pending_preserve_leading_summary_space,
+                                pending_synthesize_leading_summary_space,
                             )
                         } else {
                             self.prepare_inline_text_group_at_inline_position(
@@ -779,6 +1040,7 @@ impl<'a> LayoutBuilder<'a> {
                                 pending_visual_offset,
                                 pending_horizontal_content_bottom_y,
                                 pending_preserve_leading_summary_space,
+                                pending_synthesize_leading_summary_space,
                             )
                         } {
                             inline_position = pending_inline_position + group.width();
@@ -814,6 +1076,7 @@ impl<'a> LayoutBuilder<'a> {
                 pending_horizontal_content_bottom_y,
                 extra_space_width,
                 pending_preserve_leading_summary_space,
+                pending_synthesize_leading_summary_space,
             )
         } else {
             self.prepare_inline_text_group_at_inline_position(
@@ -827,6 +1090,7 @@ impl<'a> LayoutBuilder<'a> {
                 pending_visual_offset,
                 pending_horizontal_content_bottom_y,
                 pending_preserve_leading_summary_space,
+                pending_synthesize_leading_summary_space,
             )
         } {
             Self::update_line_rendered_baseline_shift(
@@ -836,10 +1100,181 @@ impl<'a> LayoutBuilder<'a> {
             );
             paint_items.push(PreparedInlinePaintItem::TextGroup(group));
         }
+        let paint_items = first_line_effect_scoped_paint_items(
+            paint_items,
+            context
+                .is_first_line
+                .then_some(block_style.first_line_style.as_deref())
+                .flatten()
+                .map(|style| style.opacity),
+        );
         Some(PreparedInlineLine {
             metrics: line_metrics,
             paint_items,
+            positioning_geometry,
             decoration_origin_fragments: Rc::default(),
         })
+    }
+}
+
+fn prepared_inline_positioning_geometry_mut(
+    geometries: &mut Vec<PreparedInlinePositioningGeometry>,
+    source: InlinePositioningContainingBlockId,
+    axes: WritingModeAxes,
+) -> &mut PreparedInlinePositioningGeometry {
+    if let Some(index) = geometries
+        .iter()
+        .position(|geometry| geometry.source == source)
+    {
+        debug_assert_eq!(geometries[index].axes, axes);
+        return &mut geometries[index];
+    }
+    geometries.push(PreparedInlinePositioningGeometry::new(source, axes));
+    geometries
+        .last_mut()
+        .expect("a positioning geometry record was just appended")
+}
+
+/// Materialize the generated `::first-line` box as one prepared paint subtree.
+///
+/// Opacity is non-inherited and applies after the pseudo-element and all of
+/// its descendants have painted. CSS Overflow's block ellipsis is a sibling
+/// anonymous inline inserted after first-line selection, so it deliberately
+/// remains outside this scope even when bidi places it at the visual start.
+/// <https://drafts.csswg.org/css-pseudo-4/#first-line-styling>
+/// <https://drafts.csswg.org/css-color-4/#transparency>
+/// <https://drafts.csswg.org/css-overflow-4/#block-ellipsis>
+fn first_line_effect_scoped_paint_items(
+    paint_items: Vec<PreparedInlinePaintItem>,
+    opacity: Option<css::Opacity>,
+) -> Vec<PreparedInlinePaintItem> {
+    let Some(opacity) = opacity.filter(|opacity| opacity.value() < 1.0) else {
+        return paint_items;
+    };
+    let mut first_line_items = Vec::with_capacity(paint_items.len());
+    let mut following_anonymous_items = Vec::new();
+    for item in paint_items {
+        if prepared_paint_item_is_block_ellipsis(&item) {
+            following_anonymous_items.push(item);
+        } else {
+            first_line_items.push(item);
+        }
+    }
+    if first_line_items.is_empty() {
+        return following_anonymous_items;
+    }
+    let mut scoped = Vec::with_capacity(1 + following_anonymous_items.len());
+    scoped.push(PreparedInlinePaintItem::Scope(Box::new(
+        PreparedInlinePaintScope {
+            kind: PreparedInlinePaintScopeKind::FirstLine,
+            opacity,
+            items: first_line_items,
+        },
+    )));
+    scoped.extend(following_anonymous_items);
+    scoped
+}
+
+fn prepared_paint_item_is_block_ellipsis(item: &PreparedInlinePaintItem) -> bool {
+    match item {
+        PreparedInlinePaintItem::FragmentBackground(fragment) => {
+            matches!(fragment.fragment.source(), InlineTextSource::BlockEllipsis)
+        }
+        PreparedInlinePaintItem::TextGroup(group) => {
+            matches!(group.source, InlineTextSource::BlockEllipsis)
+        }
+        PreparedInlinePaintItem::Atom(_) => false,
+        PreparedInlinePaintItem::Scope(scope) => scope
+            .items
+            .iter()
+            .all(prepared_paint_item_is_block_ellipsis),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn measured_fragment(
+        text: &str,
+        width: f32,
+        direction: ResolvedBidiDirection,
+    ) -> MeasuredInlineItem {
+        let mut fragment = InlineFragment::new(
+            text,
+            ComputedStyle::initial(),
+            0.0,
+            None,
+            true,
+            InlineTextSource::Normal,
+            false,
+            InlineHangingEdges::default(),
+            Vec::new(),
+        );
+        fragment.set_resolved_bidi_direction(Some(direction));
+        MeasuredInlineItem::new(InlineLineItem::Fragment(fragment), width, None)
+    }
+
+    fn starts(
+        writing_mode: WritingMode,
+        paragraph_direction: Direction,
+        run_direction: ResolvedBidiDirection,
+    ) -> Vec<Option<f32>> {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = writing_mode;
+        prepared_inline_visual_positions(
+            &[
+                measured_fragment("aa", 20.0, run_direction),
+                measured_fragment("bbb", 30.0, run_direction),
+            ],
+            &style,
+            paragraph_direction,
+            layout_pt(0.0),
+            &[layout_pt(0.0), layout_pt(0.0)],
+        )
+        .into_iter()
+        .map(|position| position.map(PreparedInlineVisualPosition::points))
+        .collect()
+    }
+
+    #[test]
+    fn opposite_direction_vertical_run_places_source_fragments_from_opposite_edge() {
+        for writing_mode in [
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            assert_eq!(
+                starts(writing_mode, Direction::Rtl, ResolvedBidiDirection::Ltr),
+                vec![Some(30.0), Some(0.0)],
+                "{writing_mode:?}"
+            );
+            assert_eq!(
+                starts(writing_mode, Direction::Ltr, ResolvedBidiDirection::Rtl),
+                vec![Some(30.0), Some(0.0)],
+                "{writing_mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_direction_and_horizontal_runs_keep_visual_sequence_positions() {
+        assert_eq!(
+            starts(
+                WritingMode::VerticalRl,
+                Direction::Rtl,
+                ResolvedBidiDirection::Rtl
+            ),
+            vec![None, None]
+        );
+        assert_eq!(
+            starts(
+                WritingMode::HorizontalTb,
+                Direction::Rtl,
+                ResolvedBidiDirection::Ltr
+            ),
+            vec![None, None]
+        );
     }
 }

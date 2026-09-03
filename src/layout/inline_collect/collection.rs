@@ -5,7 +5,7 @@ use super::generated_content::{
 };
 use super::positioned::{
     DeferredInlinePositionedDescendant, DeferredInlineStaticPositionedDescendant,
-    DeferredStaticPositionSource, DeferredStaticPositionedContent,
+    DeferredPositionedBoxSource, DeferredStaticPositionSource, DeferredStaticPositionedContent,
 };
 use super::ruby::{
     inline_item_has_typographic_content, ruby_has_out_of_flow_descendant, ruby_out_of_flow_overlay,
@@ -419,6 +419,7 @@ impl<'a> LayoutBuilder<'a> {
                                 element: child_element.clone(),
                                 signature: child_signature.clone(),
                                 style: child_style,
+                                box_source: DeferredPositionedBoxSource::Principal,
                                 static_position_container_style: style.clone(),
                                 containing_block_source: containing_block_source.into_owned(),
                             });
@@ -440,12 +441,10 @@ impl<'a> LayoutBuilder<'a> {
                                 if child_style.abspos_static_source.is_inline_level()
                                     || child_style.display.is_inline_level()
                                 {
-                                    let marker =
-                                        InlineStaticPositionMarkerId::for_element(child_element);
-                                    DeferredStaticPositionSource::InlineMarker {
-                                        marker,
-                                        fallback_source_order_index: output.len(),
-                                    }
+                                    let source =
+                                        InlineStaticPositionSourceId::for_element(child_element);
+                                    output.push(InlineItem::StaticPositionSourceMarker(source));
+                                    DeferredStaticPositionSource::InlineSource(source)
                                 } else {
                                     DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(
                                         output.len(),
@@ -455,6 +454,7 @@ impl<'a> LayoutBuilder<'a> {
                                 element: child_element.clone(),
                                 signature: child_signature.clone(),
                                 style: child_style,
+                                box_source: DeferredPositionedBoxSource::Principal,
                                 line_formatting_context_style: line_formatting_context_style
                                     .clone(),
                                 static_position_container_style: style.clone(),
@@ -480,6 +480,7 @@ impl<'a> LayoutBuilder<'a> {
                         self.layout_positioned_inline_descendant(
                             child_element,
                             &child_style,
+                            DeferredPositionedBoxSource::Principal,
                             stylesheets,
                             None,
                             None,
@@ -582,11 +583,8 @@ impl<'a> LayoutBuilder<'a> {
                                 link.clone(),
                             );
                             layout.end_counter_scope(counter_scope);
-                            if let Some(mut atom) = atom {
-                                atom.baseline_shift += layout
-                                    .vertical_align_baseline_shift_for_atom(&atom, style)
-                                    .glyph_displacement()
-                                    .get();
+                            if let Some(atom) = atom {
+                                let atom = layout.finish_inline_atom_for_parent(atom, style);
                                 output.push(InlineItem::Atom(Box::new(atom)));
                             }
                             return;
@@ -826,6 +824,12 @@ impl<'a> LayoutBuilder<'a> {
             if let Some((element, signature, style, child_boxes)) = child.element_parts()
                 && matches!(style.position, Position::Absolute | Position::Fixed)
             {
+                let box_source = DeferredPositionedBoxSource::from_box_source(
+                    &child
+                        .element_core()
+                        .expect("an element-backed formatting box has a source")
+                        .source,
+                );
                 if positioned_descendant_has_explicit_inset(style)
                     && let Some(containing_block_source) = active_float_containing_block
                     && let Some(deferred) = deferred_positioned_descendants.as_deref_mut()
@@ -834,6 +838,7 @@ impl<'a> LayoutBuilder<'a> {
                         element: element.clone(),
                         signature: signature.clone(),
                         style: style.clone(),
+                        box_source,
                         static_position_container_style: static_position_container_style.clone(),
                         containing_block_source: containing_block_source.into_owned(),
                     });
@@ -846,11 +851,15 @@ impl<'a> LayoutBuilder<'a> {
                     let static_position_source = if style.abspos_static_source.is_inline_level()
                         || style.display.is_inline_level()
                     {
-                        let marker = InlineStaticPositionMarkerId::for_element(element);
-                        DeferredStaticPositionSource::InlineMarker {
-                            marker,
-                            fallback_source_order_index: output.len(),
-                        }
+                        let source = InlineStaticPositionSourceId::for_box_source(
+                            element,
+                            &child
+                                .element_core()
+                                .expect("an element-backed formatting box has a source")
+                                .source,
+                        );
+                        output.push(InlineItem::StaticPositionSourceMarker(source));
+                        DeferredStaticPositionSource::InlineSource(source)
                     } else {
                         DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(output.len())
                     };
@@ -858,6 +867,7 @@ impl<'a> LayoutBuilder<'a> {
                         element: element.clone(),
                         signature: signature.clone(),
                         style: style.clone(),
+                        box_source,
                         line_formatting_context_style: block_style.clone(),
                         static_position_container_style: static_position_container_style.clone(),
                         static_position_containing_block: self
@@ -878,6 +888,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.layout_positioned_inline_descendant(
                     element,
                     style,
+                    box_source,
                     stylesheets,
                     Some(child_boxes),
                     table_fragment,
@@ -1301,11 +1312,8 @@ impl<'a> LayoutBuilder<'a> {
                         link.clone(),
                     );
                     self.end_counter_scope(counter_scope);
-                    if let Some(mut atom) = atom {
-                        atom.baseline_shift += self
-                            .vertical_align_baseline_shift_for_atom(&atom, parent_baseline_style)
-                            .glyph_displacement()
-                            .get();
+                    if let Some(atom) = atom {
+                        let atom = self.finish_inline_atom_for_parent(atom, parent_baseline_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
                     } else {
                         let text = inline_text_for_style(box_.core.element, &box_.core.style);
@@ -1351,11 +1359,8 @@ impl<'a> LayoutBuilder<'a> {
                         link.clone(),
                     );
                     self.end_counter_scope(counter_scope);
-                    if let Some(mut atom) = atom {
-                        atom.baseline_shift += self
-                            .vertical_align_baseline_shift_for_atom(&atom, parent_baseline_style)
-                            .glyph_displacement()
-                            .get();
+                    if let Some(atom) = atom {
+                        let atom = self.finish_inline_atom_for_parent(atom, parent_baseline_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
                     }
                 }
@@ -1403,11 +1408,8 @@ impl<'a> LayoutBuilder<'a> {
                         link.clone(),
                     );
                     self.end_counter_scope(counter_scope);
-                    if let Some(mut atom) = atom {
-                        atom.baseline_shift += self
-                            .vertical_align_baseline_shift_for_atom(&atom, parent_baseline_style)
-                            .glyph_displacement()
-                            .get();
+                    if let Some(atom) = atom {
+                        let atom = self.finish_inline_atom_for_parent(atom, parent_baseline_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
                     } else {
                         let text = inline_text_for_style(box_.core.element, &box_.core.style);

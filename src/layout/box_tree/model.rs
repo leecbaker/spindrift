@@ -793,7 +793,7 @@ pub(crate) struct GeneratedPseudoBox<'a> {
 }
 
 /// Supported tree-abiding generated pseudo-element kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum GeneratedPseudoKind {
     Before,
     After,

@@ -259,6 +259,30 @@ impl<'a> LayoutBuilder<'a> {
         };
         let consuming_root_canvas =
             !style.display.is_block_level() && self.begin_root_inline_canvas_continuation(element);
+        let previous_positioned_generated_source = self.positioned_generated_source;
+        self.positioned_generated_source = match source {
+            box_tree::CounterEventSource::Before => {
+                Some(InlineStaticPositionSourceId::for_generated_pseudo(
+                    element,
+                    box_tree::GeneratedPseudoKind::Before,
+                ))
+            }
+            box_tree::CounterEventSource::After => {
+                Some(InlineStaticPositionSourceId::for_generated_pseudo(
+                    element,
+                    box_tree::GeneratedPseudoKind::After,
+                ))
+            }
+            box_tree::CounterEventSource::FootnoteCall => {
+                Some(InlineStaticPositionSourceId::for_generated_pseudo(
+                    element,
+                    box_tree::GeneratedPseudoKind::FootnoteCall,
+                ))
+            }
+            box_tree::CounterEventSource::Principal
+            | box_tree::CounterEventSource::Marker
+            | box_tree::CounterEventSource::FootnoteMarker => None,
+        };
         let previous_root_pseudo_block_projection = self.root_pseudo_block_projection;
         let root_before_principal_track_start = (element.tag.eq_ignore_ascii_case("html")
             && source == box_tree::CounterEventSource::Before
@@ -333,6 +357,7 @@ impl<'a> LayoutBuilder<'a> {
             self.finish_root_inline_canvas_continuation();
         }
         self.root_pseudo_block_projection = previous_root_pseudo_block_projection;
+        self.positioned_generated_source = previous_positioned_generated_source;
         self.element_side_effect_suppression_depth -= 1;
         self.end_counter_scope(counter_scope);
     }

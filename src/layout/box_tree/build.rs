@@ -85,6 +85,7 @@ fn flattened_contents_text_style(parent_style: &ComputedStyle) -> Box<ComputedSt
     // <https://drafts.csswg.org/css-display-3/#valdef-display-contents>
     // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
     style.first_line_style = None;
+    style.first_line_overrides = css::ModeledLonghandSet::empty();
     style.first_letter_style = None;
     Box::new(style)
 }

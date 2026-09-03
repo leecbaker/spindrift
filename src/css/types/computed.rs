@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use super::*;
+use crate::css::cascade::ModeledLonghandSet;
 use crate::units::{ContentBoxLength, LayoutLength, LayoutSize};
 
 macro_rules! non_negative_css_factor {
@@ -1606,8 +1607,28 @@ pub(crate) enum MarkerCounterOrigin {
     After,
 }
 
+/// Cascade-only source ownership for canonical longhands.
+///
+/// This metadata is deliberately excluded from computed-style equality: two
+/// styles with equal computed values remain equal even when one value was
+/// specified and the other inherited. Layout uses the ownership only when a
+/// generated `::first-line` box becomes the inheritance parent of selected
+/// inline descendants.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ComputedLonghandProvenance {
+    pub(crate) current_source: u16,
+    pub(crate) sources: Arc<[u16]>,
+}
+
+impl PartialEq for ComputedLonghandProvenance {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
+    pub(crate) longhand_provenance: ComputedLonghandProvenance,
     pub custom_properties: HashMap<String, ComputedCustomPropertyValue>,
     pub(crate) registered_custom_properties: Arc<RegisteredCustomProperties>,
     /// Computed author support declared by CSS Color Adjustment's
@@ -1867,6 +1888,9 @@ pub(crate) struct ComputedStyle {
     /// counter content is created only when the element is a footnote.
     pub footnote_marker_style: Option<Box<ComputedStyle>>,
     pub first_line_style: Option<Box<ComputedStyle>>,
+    /// Canonical longhands addressed by winning `::first-line` declarations.
+    /// Layout replays these through the typed computed-value copier.
+    pub(crate) first_line_overrides: ModeledLonghandSet,
     pub first_letter_style: Option<Box<ComputedStyle>>,
     pub quotes: Quotes,
     pub counter_resets: Vec<CounterReset>,
@@ -2246,6 +2270,7 @@ impl ComputedStyle {
     pub fn initial() -> Self {
         let font_size = 12.0;
         Self {
+            longhand_provenance: ComputedLonghandProvenance::default(),
             custom_properties: HashMap::new(),
             registered_custom_properties: Arc::default(),
             color_scheme: ComputedColorScheme::Normal,
@@ -2452,6 +2477,7 @@ impl ComputedStyle {
             footnote_call_style: None,
             footnote_marker_style: None,
             first_line_style: None,
+            first_line_overrides: ModeledLonghandSet::empty(),
             first_letter_style: None,
             quotes: Quotes::auto(),
             counter_resets: Vec::new(),

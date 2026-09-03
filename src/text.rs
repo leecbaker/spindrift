@@ -456,10 +456,11 @@ pub(crate) use bidi::{
 };
 pub(crate) use breaking::{
     DiscretionaryOpportunity, LanguageDiscretionaryReplacement, TextBreakPolicy,
-    automatic_hyphenation_opportunities, collect_auto_phrase_relaxed_wrap_opportunities,
-    collect_grapheme_cluster_inner_boundaries, collect_keep_all_relaxed_wrap_opportunities,
-    collect_measured_break_opportunities, contains_bidi_text, hyphenator_for_language,
-    manual_hyphenation_opportunities, text_with_hyphenation_controls,
+    automatic_hyphenation_opportunities, break_spaces_retains_separator_boundary,
+    collect_auto_phrase_relaxed_wrap_opportunities, collect_grapheme_cluster_inner_boundaries,
+    collect_keep_all_relaxed_wrap_opportunities, collect_measured_break_opportunities,
+    contains_bidi_text, hyphenator_for_language, manual_hyphenation_opportunities,
+    text_with_hyphenation_controls,
 };
 #[cfg(test)]
 pub(crate) use breaking::{

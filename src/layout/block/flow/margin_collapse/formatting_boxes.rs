@@ -175,6 +175,149 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_from_boxes(
     None
 }
 
+/// Return the complete adjoining start-margin set used for a box's CSS2
+/// `clear:none` hypothetical position.
+///
+/// Unlike ordinary child placement, this probe must continue through a
+/// self-collapsing first child and its following siblings. Floats and
+/// positioned boxes are outside normal flow and do not close that adjoining
+/// chain.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+pub(in crate::layout) fn clear_none_hypothetical_start_margin_from_boxes(
+    element: &Element,
+    style: &ComputedStyle,
+    child_boxes: &[box_tree::FormattingBox<'_>],
+    overflow_context: DocumentCanvasResolution,
+) -> Option<LayoutLength> {
+    if style.margin_trim.block_start {
+        return None;
+    }
+    let mut set = AdjoiningMarginSet::from_margin(layout_pt(style.margin.top));
+    complete_adjoining_child_margin_set_from_boxes(&mut set, child_boxes, element, overflow_context)
+        .found_adjoining_child()
+        .then(|| set.collapsed())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdjoiningChildMarginScan {
+    NoAdjoiningChild,
+    Open,
+    Closed,
+}
+
+impl AdjoiningChildMarginScan {
+    fn found_adjoining_child(self) -> bool {
+        self != Self::NoAdjoiningChild
+    }
+}
+
+fn complete_adjoining_child_margin_set_from_boxes(
+    set: &mut AdjoiningMarginSet,
+    child_boxes: &[box_tree::FormattingBox<'_>],
+    parent: &Element,
+    overflow_context: DocumentCanvasResolution,
+) -> AdjoiningChildMarginScan {
+    let mut found_in_flow_child = false;
+    let mut has_preceding_css_float = false;
+    for child_box in child_boxes {
+        if let box_tree::FormattingBox::InlineSplitBlockContext(context) = child_box {
+            match complete_adjoining_child_margin_set_from_boxes(
+                set,
+                &context.core.children,
+                parent,
+                overflow_context,
+            ) {
+                AdjoiningChildMarginScan::NoAdjoiningChild => {}
+                AdjoiningChildMarginScan::Open => found_in_flow_child = true,
+                AdjoiningChildMarginScan::Closed => {
+                    return AdjoiningChildMarginScan::Closed;
+                }
+            }
+            continue;
+        }
+        let Some((child_element, _, child_style, child_children)) = child_box.element_parts()
+        else {
+            if matches!(
+                child_box,
+                box_tree::FormattingBox::Inline(_) | box_tree::FormattingBox::Text(_)
+            ) && !formatting_box_can_only_create_phantom_line_boxes(child_box)
+            {
+                return if found_in_flow_child {
+                    AdjoiningChildMarginScan::Closed
+                } else {
+                    AdjoiningChildMarginScan::NoAdjoiningChild
+                };
+            }
+            continue;
+        };
+        if child_style.float != Float::None {
+            has_preceding_css_float = true;
+            continue;
+        }
+        if matches!(child_style.position, Position::Absolute | Position::Fixed) {
+            continue;
+        }
+        let is_flow_child = is_normal_block_flow_child(child_element, child_style)
+            || overflow_context.is_document_canvas_flow_element(parent)
+            || is_replaced_element(child_element);
+        if !is_flow_child {
+            if !inline_text(child_element).is_empty() {
+                return if found_in_flow_child {
+                    AdjoiningChildMarginScan::Closed
+                } else {
+                    AdjoiningChildMarginScan::NoAdjoiningChild
+                };
+            }
+            continue;
+        }
+        if child_style.clear != Clear::None && has_preceding_css_float {
+            return if found_in_flow_child {
+                AdjoiningChildMarginScan::Closed
+            } else {
+                AdjoiningChildMarginScan::NoAdjoiningChild
+            };
+        }
+
+        found_in_flow_child = true;
+        let child_collapses_through = is_self_collapsing_block_box(
+            child_element,
+            child_style,
+            child_children,
+            overflow_context,
+        );
+        let mut child_set = AdjoiningMarginSet::from_margin(layout_pt(child_style.margin.top));
+        if !child_style.margin_trim.block_start
+            && can_collapse_block_start_margin(
+                child_element,
+                child_style,
+                UsedEdges::from_css_edges(used_border_widths(child_style)),
+                has_direct_inline_content_box(child_children),
+                overflow_context.used_overflow(child_element, child_style),
+            )
+        {
+            complete_adjoining_child_margin_set_from_boxes(
+                &mut child_set,
+                child_children,
+                child_element,
+                overflow_context,
+            );
+        }
+        if child_collapses_through {
+            child_set.include(layout_pt(child_style.margin.bottom));
+        }
+        set.merge(child_set);
+        if !child_collapses_through {
+            return AdjoiningChildMarginScan::Closed;
+        }
+    }
+    if found_in_flow_child {
+        AdjoiningChildMarginScan::Open
+    } else {
+        AdjoiningChildMarginScan::NoAdjoiningChild
+    }
+}
+
 pub(in crate::layout) fn collapsible_start_margin_for_box(
     element: &Element,
     style: &ComputedStyle,

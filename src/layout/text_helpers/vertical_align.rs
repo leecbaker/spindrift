@@ -57,6 +57,23 @@ impl InlineBaselinePlacement {
 }
 
 impl<'a> LayoutBuilder<'a> {
+    /// Finalize an atomic inline's parent-relative baseline placement once its
+    /// own physical geometry and baseline sets are complete.
+    ///
+    /// Both intrinsic and committed collection cross this boundary. Keeping
+    /// the operation here prevents either path from flattening baseline-table
+    /// alignment into the inherited displacement early or applying it twice.
+    /// <https://drafts.csswg.org/css-inline-3/#baseline-alignment>
+    pub(in crate::layout) fn finish_inline_atom_for_parent(
+        &mut self,
+        mut atom: InlineAtom,
+        parent_style: &ComputedStyle,
+    ) -> InlineAtom {
+        let placement = self.vertical_align_baseline_shift_for_atom(&atom, parent_style);
+        atom.add_baseline_placement(placement);
+        atom
+    }
+
     /// Resolve the inline-level `vertical-align` shift for text fragments.
     ///
     /// CSS 2.2 defines most `vertical-align` values in terms of the parent

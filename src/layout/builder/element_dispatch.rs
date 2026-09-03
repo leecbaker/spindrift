@@ -140,13 +140,21 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let replayed_flex_item_percentage_height_basis =
             self.take_replayed_flex_item_percentage_height_basis();
-        let replayed_item_logical_inline_size = replayed_flex_item_percentage_height_basis
-            .is_some()
-            .then(|| {
-                LogicalInlineContentSize::new(content_box_pt(
-                    self.current_content_logical_inline_size(),
-                ))
-            });
+        let replayed_float_logical_inline_size = self.replayed_float_logical_inline_size.take();
+        debug_assert!(
+            replayed_float_logical_inline_size.is_none()
+                || replayed_flex_item_percentage_height_basis.is_none(),
+            "a principal replay has one logical inline-size owner"
+        );
+        let replayed_item_logical_inline_size = replayed_float_logical_inline_size.or_else(|| {
+            replayed_flex_item_percentage_height_basis
+                .is_some()
+                .then(|| {
+                    LogicalInlineContentSize::new(content_box_pt(
+                        self.current_content_logical_inline_size(),
+                    ))
+                })
+        });
         match layout_kind {
             ElementLayoutKind::None => (),
             ElementLayoutKind::Positioned
@@ -410,13 +418,15 @@ impl<'a> LayoutBuilder<'a> {
                                 transaction_depth: self.positioned_paint_transaction_depth,
                                 source_element: None,
                                 source_style: style.clone(),
-                                source_style_identity: style as *const ComputedStyle as usize,
+                                source_style_identity: 0,
+                                source_box: InlineStaticPositionBoxSource::Principal,
                                 multicol_fragment_index: None,
                                 source_is_target: false,
                                 stack_level: context.stack_level,
                                 context,
                                 links: Vec::new(),
-                                escaped_atom_translation: EscapedAtomTranslation::none(),
+                                escaped_atom_replay: EscapedAtomReplay::none(),
+                                overflow_clip_containing_block: None,
                             }),
                     );
             }
@@ -701,8 +711,8 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 table_fragment,
                 style,
-                InlineStaticPositionMarkerId::for_element(element),
-                None,
+                InlineStaticPositionSourceId::for_element(element),
+                true,
                 &[],
             );
             self.layout_positioned_block_with_inline_static_position(

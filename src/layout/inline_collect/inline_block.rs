@@ -236,7 +236,10 @@ impl<'a> LayoutBuilder<'a> {
         padding: (f32, f32),
         link_target: Option<&str>,
         marker: Option<&ListMarker>,
-    ) -> Option<inline_layout::InlineLineSequence> {
+    ) -> (
+        Option<inline_layout::InlineLineSequence>,
+        inline_layout::InlineLayoutOutcome,
+    ) {
         let (padding_left, padding_right) = padding;
         let available_width =
             (self.current_content_logical_inline_size() - padding_left - padding_right).max(1.0);
@@ -364,7 +367,7 @@ impl<'a> LayoutBuilder<'a> {
         // the block children are laid out.
         // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
         if items.is_empty() {
-            return None;
+            return (None, inline_layout::InlineLayoutOutcome::default());
         }
         // A simple vertical inline stream can supply both final paint and its
         // enclosing block's logical-inline extent. Retain that committed
@@ -387,9 +390,10 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
             )
         {
-            return Some(sequence);
+            let outcome = sequence.layout_outcome();
+            return (Some(sequence), outcome);
         }
-        let _ = self.layout_inline_items(
+        let outcome = self.layout_inline_items(
             items,
             style,
             available_width,
@@ -397,7 +401,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             stylesheets,
         );
-        None
+        (None, outcome)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -355,6 +355,7 @@ impl<'a> LayoutBuilder<'a> {
             style.padding.left + style.padding.right,
             style.line_height + style.padding.top + style.padding.bottom,
         ));
+        let containing_block = self.positioned_containing_block_context(containing_block);
         self.containing_blocks.push(containing_block);
         true
     }

@@ -128,15 +128,6 @@ Primary references:
   positions; it is an exact-raster interoperability gap, not line-breaking or
   font-subsetting substitution.
   <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
-- Divergence: `trailing-other-space-separators-break-spaces-013` still differs
-  from its Ahem-font reference when U+202F is followed by CJK text. Quire
-  preserves U+202F's ordinary `GL` protection at text and atomic boundaries
-  and keeps its `break-spaces` advance, but fallback-glyph line widths select
-  different CJK line packing. This is a remaining font-fallback/line-measure
-  interoperability divergence, not permission to split French U+202F
-  punctuation pairs.
-  <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
-  <https://www.unicode.org/reports/tr14/#GL>
 - Divergence: tab stops use a shared logical cursor through text and atomic
   inline content, but float-displaced lines do not yet carry their block
   content-edge coordinate through graph fitting and painting.
@@ -817,10 +808,12 @@ Primary references:
 
 - Spec area: CSS Inline Layout, CSS Text, CSS Text Decoration, CSS
   Pseudo-Elements.
-- Divergence: nested `::first-line` inheritance remains incomplete for
-  fragmented generated content and complex ruby/positioned-inline replay;
-  fragment-local `currentcolor` resolution for text, inline edges, border,
-  outline, background, and shadow paint is implemented.
+- Divergence: nested `::first-line` inheritance is implemented for ordinary
+  inline descendants and non-fragmented generated `::before`/`::after`
+  content, but remains incomplete for fragmented generated content and complex
+  ruby/positioned-inline replay. Fragment-local `currentcolor` resolution for
+  text, inline edges, border, outline, background, and shadow paint is
+  implemented.
 - Divergence: CSS Inline 3 `initial-letter` is incomplete beyond first-letter
   graph splitting, used-size calculation, line-height isolation, and a
   page-local exclusion participant that is distinct from CSS
@@ -1022,14 +1015,17 @@ Primary references:
   through an aspect ratio do not yet feed their final inline contribution back
   into auto-column sizing.
 - Divergence: `text-combine-upright` forms normalized tate-chu-yoko atoms from
-  contiguous compatible text words, gives the measured one-em square the
-  parent central baseline, reverses full-width forms in multi-unit
-  compositions, and replays its horizontally shaped content without clipping
-  ink to the measured square. Generated-content atoms do not yet raster-match
-  equivalent authored inline content, and inherited compositions cannot carry
-  run-boundary provenance through nested atomic formatting contexts. Full bidi
-  isolation and source ranges through every synthetic atomic boundary also
-  remain incomplete.
+  compatible source ranges in a separate analysis/materialization phase. Each
+  atom retains transformed source text for UAX #14 boundaries independently
+  from its isolated horizontal bidi sequence and one-em square geometry;
+  generic atomic wrapping is not applied at its textual boundaries, and used
+  tracking is zero without discarding lexical scope ownership. The square's
+  parent-central baseline and paint placement share one resolver, while the
+  captured horizontal subtree is compressed and replayed without clipping its
+  ink. Two executed single-character value reftests remain divergent: their
+  geometry is equivalent, but horizontal and vertical text matrices
+  antialias differently at rasterized glyph edges. Dynamic DOM coverage and
+  the currently skipped ruby/decoration cases also remain unsupported.
 
 ### Box Alignment
 
@@ -1503,18 +1499,24 @@ Primary references:
   Direct single-line inline abspos sources and collected inline descendants
   use the same prepared hypothetical placeholder. Non-atomic inline sources
   reset the subject to `position: static`, `float: none`, and `clear: none`;
-  preceding physical floats, clearance, text alignment, indentation, and
-  direction remain part of the surrounding line context. The single-line
+  their stable source marker has zero inline footprint, while preceding
+  physical floats, structural inline edges, clearance, text alignment,
+  indentation, and direction remain part of the surrounding line context.
+  Principal and generated-pseudo sources retain distinct replay identities.
+  The single-line
   `{htb,vlr,vrl}` static-position matrix covers same- and cross-direction bidi
   inline and block sources, including indentation and relatively positioned
   inline ancestors. Atomic inline source display restoration is still
   incomplete.
-- Divergence: positioned inline containing blocks use collected first/last
-  edge markers, including zero-height phantom-line fragments, for ordinary
-  single-line horizontal and vertical block-level absolute descendants. The
-  covered `{htb,vlr,vrl}` matrix includes cross-direction bidi; multiline,
-  transformed, table, and fragmented inline contexts do not yet retain one
-  final fragmentainer-aware rectangle.
+- Divergence: positioned inline containing blocks retain prepared, source-keyed
+  logical content-edge extrema and reduce them through one writing-mode
+  adapter for horizontal, vertical, and sideways flows, including disjoint
+  bidi content and zero-height marker-only fragments. Prepared vertical and
+  sideways lines assign opposite-direction source fragments and structural
+  edge markers from one typed visual-placement table before paint scopes are
+  formed. Atomic inline descendants, block-in-inline splits, transforms,
+  tables, and committed fragmentainer placement still do not supply complete
+  final fragment geometry.
 - Divergence: ordinary block and inline abspos static-position alignment is
   covered for same-page, single-line source geometry, including degenerate
   block/inline rectangles, applicable `justify-items` defaults,
@@ -1530,12 +1532,20 @@ Primary references:
   definite grid container commits each page or column fragment, including
   paintless continuation slices. Ordinary transparent absolute paint retains
   its resolved destination page, and viewport-fixed layers replay across
-  retained positive absolute spans independently of source order. A nested
-  absolute descendant of a positioned box replayed from an atomic inline can
-  still retain the positioned parent's scratch coordinate space instead of
-  following that parent to the atom's final page position; the reference
+  retained positive absolute spans independently of source order. Atomic
+  inline scratch formatting contexts retain explicit coordinate-space
+  provenance for nested positioned containing blocks and install the atom's
+  writing mode, direction, and content rectangle while capturing automatic
+  static positions. Atom-owned positioned layers normalize their physical
+  horizontal replay from the atomic capture origin, preserving displacement
+  introduced by intermediate positioned ancestors. Escaped replay remains
+  incomplete for automatic positioned subtrees in sideways writing modes:
+  their physical block-side placement can still be projected from the wrong
+  side of the atomic scratch formatting context. The sideways reference
   overlays in `text-decoration-inset-017` through `-023` expose this remaining
-  escaped-atom translation gap.
+  ownership/projection gap.
+  <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+  <https://drafts.csswg.org/css-writing-modes-4/#logical-to-physical>
 - Divergence: `isolation`, blend modes, filters, masks (including
   `mask-border-source`), and `clip-path`, containment-triggered paint
   isolation, `content-visibility`, and `will-change` lack full visual

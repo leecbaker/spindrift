@@ -2364,35 +2364,75 @@ impl FloatPlacementAxes {
     }
 }
 
-/// Signed paint-space origin adjustment used while replaying a physically
-/// placed float in its own formatting axes.
+/// Source-to-destination projection for an isolated float replay.
 ///
 /// A bottom-origin vertical containing block expresses its inline coordinates
-/// relative to the containing content bottom. Isolated replay uses the page's
-/// top-based block cursor instead, so crossing that boundary requires one
-/// explicit paint translation. Keeping the adjustment typed prevents it from
-/// escaping into the containing flow's committed layout geometry.
+/// relative to the containing content bottom. Isolated float layout therefore
+/// uses the containing block's stable page-top scratch cursor, then projects
+/// the complete captured subtree to the independently selected float border
+/// box. Keeping both origins in one record ensures ordinary paint and escaped
+/// positioned descendants cross that coordinate boundary exactly once.
 /// <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
 /// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct FloatReplayBlockOriginAdjustment(LayoutLength);
+pub(in crate::layout) struct FloatReplayProjection {
+    scratch_border_box_top: PageTopBlockPosition,
+    destination_border_box_top_left: PageTopPoint,
+    projects_from_scratch: bool,
+}
 
-impl FloatReplayBlockOriginAdjustment {
-    pub(in crate::layout) fn for_containing_inline_axis(
+impl FloatReplayProjection {
+    pub(in crate::layout) fn new(
         axes: FloatPlacementAxes,
-        containing_physical_top: PageTopBlockPosition,
-        containing_logical_inline_size: LogicalInlineContentSize,
+        containing_scratch_top: PageTopBlockPosition,
+        destination_border_box_top_left: PageTopPoint,
     ) -> Self {
-        let adjustment = if axes.inline_start_side() == PhysicalSide::Bottom {
-            containing_physical_top.points() - containing_logical_inline_size.points()
+        let projects_from_scratch = axes.inline_start_side() == PhysicalSide::Bottom;
+        let scratch_border_box_top = if projects_from_scratch {
+            containing_scratch_top
         } else {
-            0.0
+            PageTopBlockPosition::new(destination_border_box_top_left.top_y())
         };
-        Self(layout_pt(adjustment))
+        Self {
+            scratch_border_box_top,
+            destination_border_box_top_left,
+            projects_from_scratch,
+        }
     }
 
-    pub(in crate::layout) fn paint_translation(self) -> PaintTranslation {
-        PaintTranslation::new(0.0, self.0.points())
+    pub(in crate::layout) fn scratch_border_box_top(self) -> PageTopBlockPosition {
+        self.scratch_border_box_top
+    }
+
+    pub(in crate::layout) fn projects_from_scratch(self) -> bool {
+        self.projects_from_scratch
+    }
+
+    pub(in crate::layout) fn source_to_destination(
+        self,
+        source_border_box: PaintRect,
+    ) -> PaintTranslation {
+        if !self.projects_from_scratch {
+            return PaintTranslation::identity();
+        }
+        let source_top_left = PaintPoint::new(
+            source_border_box.origin.x,
+            source_border_box.origin.y + source_border_box.size.height,
+        );
+        PaintTranslation::new(
+            self.destination_border_box_top_left.x() - source_top_left.x,
+            self.destination_border_box_top_left.top_y() - source_top_left.y,
+        )
+    }
+
+    pub(in crate::layout) fn cursor_source_to_destination(self) -> PaintTranslation {
+        if !self.projects_from_scratch {
+            return PaintTranslation::identity();
+        }
+        PaintTranslation::new(
+            0.0,
+            self.destination_border_box_top_left.top_y() - self.scratch_border_box_top.points(),
+        )
     }
 }
 

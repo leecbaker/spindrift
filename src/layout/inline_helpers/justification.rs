@@ -499,14 +499,12 @@ pub(in crate::layout) fn inline_atom_is_inter_character_unit(atom: &InlineAtom) 
             | InlineAtomContent::TextCombineUpright { .. }
             | InlineAtomContent::InlineFragment { .. }
             | InlineAtomContent::Ruby { .. }
+            | InlineAtomContent::StaticPositionHypothetical { .. }
     )
 }
 
 pub(in crate::layout) fn inline_atom_is_inter_character_transparent(atom: &InlineAtom) -> bool {
-    matches!(
-        atom.content(),
-        InlineAtomContent::InlineEdge(_) | InlineAtomContent::StaticPositionPlaceholder(_)
-    )
+    matches!(atom.content(), InlineAtomContent::InlineEdge(_))
 }
 
 /// Count the inter-word justification opportunities within an inline fragment.

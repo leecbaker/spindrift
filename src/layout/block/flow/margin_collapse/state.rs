@@ -30,18 +30,58 @@ pub(in crate::layout) fn collapse_margins(
 pub(in crate::layout) fn collapse_margin_set(
     margins: impl IntoIterator<Item = LayoutLength>,
 ) -> LayoutLength {
-    let mut max_positive = 0.0f32;
-    let mut min_negative = 0.0f32;
+    let mut set = AdjoiningMarginSet::new();
     for margin in margins {
-        let margin = margin.points();
-        if margin > max_positive {
-            max_positive = margin;
-        }
-        if margin < min_negative {
-            min_negative = margin;
+        set.include(margin);
+    }
+    set.collapsed()
+}
+
+/// A complete adjoining set of CSS block-axis margins.
+///
+/// CSS 2.2 collapses an arbitrary adjoining set by combining its greatest
+/// positive margin with its most-negative margin. Retaining those extrema,
+/// rather than repeatedly collapsing scalar pairs, preserves the result when
+/// transparent descendants and self-collapsing siblings contribute later
+/// margins to the same set.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct AdjoiningMarginSet {
+    greatest_positive: LayoutLength,
+    most_negative: LayoutLength,
+}
+
+impl AdjoiningMarginSet {
+    pub(in crate::layout) fn new() -> Self {
+        Self {
+            greatest_positive: layout_pt(0.0),
+            most_negative: layout_pt(0.0),
         }
     }
-    layout_pt(max_positive + min_negative)
+
+    pub(in crate::layout) fn from_margin(margin: LayoutLength) -> Self {
+        let mut set = Self::new();
+        set.include(margin);
+        set
+    }
+
+    pub(in crate::layout) fn include(&mut self, margin: LayoutLength) {
+        if margin > self.greatest_positive {
+            self.greatest_positive = margin;
+        }
+        if margin < self.most_negative {
+            self.most_negative = margin;
+        }
+    }
+
+    pub(in crate::layout) fn merge(&mut self, other: Self) {
+        self.include(other.greatest_positive);
+        self.include(other.most_negative);
+    }
+
+    pub(in crate::layout) fn collapsed(self) -> LayoutLength {
+        self.greatest_positive + self.most_negative
+    }
 }
 
 pub(in crate::layout) fn page_start_margin(
@@ -99,15 +139,16 @@ pub(in crate::layout) struct InheritedAdjoiningStartMargin {
 }
 
 impl InheritedAdjoiningStartMargin {
-    pub(in crate::layout) fn new(
+    /// Preserve the earliest parent edge in one transparent adjoining chain.
+    /// Replacing it at each wrapper would make a deeply nested cleared box
+    /// query a border edge already shifted by part of the same margin set.
+    pub(in crate::layout) fn with_parent_start_hypothesis(
         complete_margin: LayoutLength,
-        parent_border_edge: PageTopBlockPosition,
+        parent_start_clearance_hypothesis: ParentStartClearanceHypothesis,
     ) -> Self {
         Self {
             complete_margin,
-            parent_start_clearance_hypothesis: ParentStartClearanceHypothesis::new(
-                parent_border_edge,
-            ),
+            parent_start_clearance_hypothesis,
         }
     }
 
@@ -225,4 +266,19 @@ pub(in crate::layout) fn trim_adjoining_block_start_margin(
         .unwrap_or(child_style.margin.top);
     child_style.margin.top -= adjoining_start_margin;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adjoining_margin_set_preserves_extrema_across_merges() {
+        let mut outer = AdjoiningMarginSet::from_margin(layout_pt(-20.0));
+        outer.include(layout_pt(40.0));
+        let inner = AdjoiningMarginSet::from_margin(layout_pt(-30.0));
+        outer.merge(inner);
+
+        assert_eq!(outer.collapsed(), layout_pt(10.0));
+    }
 }

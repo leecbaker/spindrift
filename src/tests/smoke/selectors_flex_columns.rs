@@ -141,6 +141,41 @@ async fn supports_first_line_and_first_letter_pseudo_elements() {
 }
 
 #[tokio::test]
+async fn first_line_inheritance_preserves_equal_valued_descendant_declarations() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 240pt 100pt; margin: 10pt }\
+         body, p { margin: 0; font-size: 12pt; line-height: 14pt }\
+         p { color: black }\
+         p::first-line { color: red }\
+         .specified { color: black }\
+         </style>\
+         <p><span>Inherited</span> <span class='specified'>Specified</span><br>Later</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let inherited = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text.contains("Inherited"))
+        .unwrap_or_else(|| {
+            panic!(
+                "inherited first-line fragment should render: {:?}",
+                document.pages[0].lines()
+            )
+        });
+    let specified = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text.contains("Specified"))
+        .expect("specified first-line fragment should render");
+    assert_eq!(inherited.color, CssColor::new(255, 0, 0));
+    assert_eq!(specified.color, CssColor::BLACK);
+}
+
+#[tokio::test]
 async fn block_in_inline_split_does_not_restart_originating_first_line() {
     let document = Html::from_string(
         "<style>\

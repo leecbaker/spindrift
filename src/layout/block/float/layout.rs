@@ -192,13 +192,6 @@ impl<'a> LayoutBuilder<'a> {
         }
         let placement_top =
             PageTopBlockPosition::new(self.adjoining_float_origin_y.unwrap_or(self.cursor_y));
-        let replay_paint_translation =
-            FloatReplayBlockOriginAdjustment::for_containing_inline_axis(
-                placement_axes,
-                placement_top,
-                placement_logical_inline_size,
-            )
-            .paint_translation();
         // Negative block-start/end margins can make a float's mathematical
         // margin-box height zero or negative while its border box still
         // occupies a substantial exclusion slab. Float placement must test
@@ -353,9 +346,17 @@ impl<'a> LayoutBuilder<'a> {
         // isolated replay must begin at the border box with those margins
         // suppressed.
         let replay_style = float_replay_style(&placed_style);
-        self.content_left = margin_box_left + placed_style.margin.left;
+        let selected_margin_box = logical_placement.margin_box;
+        let destination_border_box_left = selected_margin_box.x() + placed_style.margin.left;
+        let destination_border_box_top = selected_margin_box.top_y() - placed_style.margin.top;
+        let replay_projection = FloatReplayProjection::new(
+            placement_axes,
+            PageTopBlockPosition::new(previous_cursor_y),
+            PageTopPoint::new(destination_border_box_left, destination_border_box_top),
+        );
+        self.content_left = destination_border_box_left;
         self.content_right = self.content_left + inline_size.border_box_width.points().max(1.0);
-        self.cursor_y = top - placed_style.margin.top;
+        self.cursor_y = replay_projection.scratch_border_box_top().points();
         // Placement has already projected the floated margin box through the
         // parent's axes, and sizing has frozen both physical replay
         // dimensions. Enter the isolated BFC in the float's own axes so block
@@ -365,6 +366,33 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
         self.containing_block_direction = placed_style.used_direction();
         self.containing_block_writing_mode = placed_style.writing_mode;
+        let scratch_replay_logical_inline_size = (replay_projection.projects_from_scratch()
+            && placed_style.writing_mode.has_vertical_lines())
+        .then(|| {
+            let borders = used_border_widths(&placed_style);
+            let vertical_non_content = non_content_pt(
+                placed_style.padding.top
+                    + placed_style.padding.bottom
+                    + borders.top
+                    + borders.bottom,
+            );
+            let measured_border_box_height = border_box_pt(
+                (margin_box_height.points() - placed_style.margin.top - placed_style.margin.bottom)
+                    .max(0.0),
+            );
+            LogicalInlineContentSize::new(border_box_to_content_box_length(
+                measured_border_box_height,
+                vertical_non_content,
+            ))
+        });
+        let principal_publishes_static_border_box = matches!(
+            placed_style.display.inner,
+            DisplayInner::Flow | DisplayInner::FlowRoot
+        );
+        let previous_replayed_float_logical_inline_size = std::mem::replace(
+            &mut self.replayed_float_logical_inline_size,
+            scratch_replay_logical_inline_size.filter(|_| principal_publishes_static_border_box),
+        );
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let paint_page_index = self.pages.len();
         let positioned_layer_start = self.positioned_layers.len();
@@ -375,6 +403,7 @@ impl<'a> LayoutBuilder<'a> {
         self.float_paint_capture_depth += 1;
         let previous_preserve_scoped_paint_public_order = self.preserve_scoped_paint_public_order;
         self.preserve_scoped_paint_public_order = true;
+        self.last_block_layout_outcome = BlockLayoutOutcome::default();
         if let Some(pseudo_source) = pseudo_source {
             self.layout_generated_pseudo_box(
                 child_element,
@@ -395,9 +424,40 @@ impl<'a> LayoutBuilder<'a> {
                 table_fragment,
             );
         }
-        let replayed_border_box_height = (top - placed_style.margin.top - self.cursor_y).max(0.0);
-        let actual_bottom = top
-            - (placed_style.margin.top + replayed_border_box_height + placed_style.margin.bottom);
+        self.replayed_float_logical_inline_size = previous_replayed_float_logical_inline_size;
+        let cursor_replayed_border_box_height =
+            (replay_projection.scratch_border_box_top().points() - self.cursor_y).max(0.0);
+        let replay_source_border_box = principal_publishes_static_border_box
+            .then_some(self.last_block_layout_outcome.static_border_box)
+            .flatten();
+        if let Some(border_box) = replay_source_border_box {
+            if placed_style.writing_mode == WritingMode::HorizontalTb
+                && self.pages.len() == paint_page_index
+            {
+                debug_assert!(
+                    (border_box.size.height - cursor_replayed_border_box_height).abs()
+                        <= FLOAT_EPSILON,
+                    "unfragmented horizontal block-flow float replay geometry must agree with its cursor: border box {}, cursor {}",
+                    border_box.size.height,
+                    cursor_replayed_border_box_height,
+                );
+            }
+            debug_assert!(
+                (border_box.size.width - inline_size.border_box_width.points()).abs()
+                    <= FLOAT_EPSILON,
+                "block-flow float replay width must agree with its frozen size: border box {}, frozen {}",
+                border_box.size.width,
+                inline_size.border_box_width.points(),
+            );
+        }
+        let replayed_border_box_height = replay_source_border_box
+            .map(|border_box| border_box.size.height)
+            .unwrap_or(cursor_replayed_border_box_height);
+        let replay_paint_translation = replay_source_border_box
+            .map(|border_box| replay_projection.source_to_destination(border_box))
+            .unwrap_or_else(|| replay_projection.cursor_source_to_destination());
+        let replayed_destination_border_box = replay_source_border_box
+            .map(|border_box| replay_paint_translation.transform_rect(&border_box));
         self.preserve_scoped_paint_public_order = previous_preserve_scoped_paint_public_order;
         self.float_paint_capture_depth = self.float_paint_capture_depth.saturating_sub(1);
         self.pop_float_context();
@@ -421,12 +481,34 @@ impl<'a> LayoutBuilder<'a> {
         // of comparing two differently scoped cursors.
         // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
         // <https://www.w3.org/TR/CSS22/visuren.html#floats>
-        let float_margin_box = PageTopRect::new(
-            margin_box_left,
-            top,
-            inline_size.margin_box_width.points(),
-            (top - actual_bottom).max(0.0),
-        );
+        let (float_margin_box, replayed_margin_box_inline_extent) = if let Some(border_box) =
+            replayed_destination_border_box
+        {
+            let margin_box_inline_extent = margin_box_pt(
+                placed_style.margin.left + border_box.size.width + placed_style.margin.right,
+            );
+            (
+                PageTopRect::new(
+                    border_box.origin.x - placed_style.margin.left,
+                    border_box.origin.y + border_box.size.height + placed_style.margin.top,
+                    margin_box_inline_extent.points(),
+                    placed_style.margin.top + border_box.size.height + placed_style.margin.bottom,
+                ),
+                margin_box_inline_extent,
+            )
+        } else {
+            (
+                PageTopRect::new(
+                    margin_box_left,
+                    top,
+                    inline_size.margin_box_width.points(),
+                    placed_style.margin.top
+                        + replayed_border_box_height
+                        + placed_style.margin.bottom,
+                ),
+                inline_size.margin_box_width,
+            )
+        };
         logical_placement =
             logical_placement.with_margin_box(logical_placement.containing, float_margin_box);
         let float_bounds = float_margin_box.paint_clip();
@@ -438,7 +520,7 @@ impl<'a> LayoutBuilder<'a> {
             paint_page_index,
             float_margin_box,
         );
-        float_shape.outer_inline_extent = inline_size.margin_box_width;
+        float_shape.outer_inline_extent = replayed_margin_box_inline_extent;
         float_shape.placement = Some(logical_placement);
         float_shape.area = resolve_float_area(
             &placed_style,
@@ -469,9 +551,16 @@ impl<'a> LayoutBuilder<'a> {
         let has_out_of_flow_descendants =
             child_children.is_some_and(has_out_of_flow_formatting_box);
         if !fragmented_float {
+            // Same-page fragments retain operation nodes that index the
+            // page's concrete primitive arrays. Move that recorded suffix at
+            // the projection boundary; translating the fragment below then
+            // handles only still-unrecorded primitive nodes.
+            self.current_page
+                .translate_recorded_primitives_since(&paint_checkpoint, replay_paint_translation);
             let fragment = self
                 .current_page
-                .paint_tree_fragment_since(&paint_checkpoint);
+                .paint_tree_fragment_since(&paint_checkpoint)
+                .translated(replay_paint_translation);
             let child_contexts = child_layers
                 .iter()
                 .filter(|layer| layer.page_index == paint_page_index)
@@ -488,7 +577,7 @@ impl<'a> LayoutBuilder<'a> {
                 float_side,
                 paint_source_order,
                 logical_placement,
-                inline_size.margin_box_width,
+                replayed_margin_box_inline_extent,
                 float_bounds,
                 &replay_style,
                 replaced_element_kind(child_element).is_some(),
@@ -514,6 +603,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
             let mut float_fragments = Vec::new();
             for (page_index, fragment) in fragments {
+                let fragment = fragment.translated(replay_paint_translation);
                 let child_contexts = child_layers
                     .iter()
                     .filter(|layer| layer.page_index == page_index)
@@ -530,7 +620,7 @@ impl<'a> LayoutBuilder<'a> {
                     float_side,
                     paint_source_order,
                     logical_placement,
-                    inline_size.margin_box_width,
+                    replayed_margin_box_inline_extent,
                     float_bounds,
                     &replay_style,
                     replaced_element_kind(child_element).is_some(),

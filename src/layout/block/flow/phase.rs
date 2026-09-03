@@ -25,6 +25,53 @@ pub(in crate::layout) enum ChildTraversalMode {
     BlockChildren,
 }
 
+/// Parent-facing name for the descendant flow established inside an atomic
+/// formatting context. Atomic intrinsic measurement and committed block
+/// layout deliberately share this classifier so normalized block children
+/// cannot be flattened into an inline-only probe.
+pub(in crate::layout) type AtomicPrincipalFlow = ChildTraversalMode;
+
+pub(in crate::layout) fn classify_atomic_principal_flow(
+    ordered_mixed_flow_required: bool,
+    direct_float_children: bool,
+    inline_sequence_required: bool,
+) -> AtomicPrincipalFlow {
+    if ordered_mixed_flow_required {
+        AtomicPrincipalFlow::OrderedMixed
+    } else if direct_float_children {
+        AtomicPrincipalFlow::DirectFloatChildren
+    } else if inline_sequence_required {
+        AtomicPrincipalFlow::InlineSequence
+    } else {
+        AtomicPrincipalFlow::BlockChildren
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_principal_flow_precedence_matches_committed_block_traversal() {
+        assert_eq!(
+            classify_atomic_principal_flow(true, true, true),
+            AtomicPrincipalFlow::OrderedMixed,
+        );
+        assert_eq!(
+            classify_atomic_principal_flow(false, true, true),
+            AtomicPrincipalFlow::DirectFloatChildren,
+        );
+        assert_eq!(
+            classify_atomic_principal_flow(false, false, true),
+            AtomicPrincipalFlow::InlineSequence,
+        );
+        assert_eq!(
+            classify_atomic_principal_flow(false, false, false),
+            AtomicPrincipalFlow::BlockChildren,
+        );
+    }
+}
+
 pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     pub(in crate::layout) fragmentainer_kind: FragmentainerKind,
     pub(in crate::layout) element: &'a Element,

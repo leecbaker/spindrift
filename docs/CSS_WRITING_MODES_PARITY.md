@@ -22,6 +22,14 @@ than text shaping alone.
   physical left for `vertical-lr`. Vertical line boxes use the same typed
   block-start projection when selecting their float-exclusion slab, so a
   `vertical-rl` line no longer samples the containing box's leftmost column.
+- Bottom-origin vertical and sideways floats use a typed replay projection
+  from a stable page-top scratch border box to the selected physical border
+  box. The projection is applied once to the complete ordinary float subtree,
+  separately captured positioned descendants, and each fragmented page-local
+  subtree; horizontal and top-origin flows retain direct destination replay.
+  The replayed principal border box also supplies the final margin-box and
+  exclusion extent. The exact WPT evaluation for
+  `css/css-logical/logical-values-float-clear-4.html` is raster-exact.
 - Bottom-origin anonymous-block scratch projection is confined to the
   document principal flow. Ordinary fixed-size nested vertical containers
   retain their local inline origin, so their descendants advance in physical
@@ -309,13 +317,22 @@ than text shaping alone.
   blocks project through the table root exactly once; the horizontal, vertical,
   and sideways `table-progression-*` WPT matrix passes.
 - `text-combine-upright` now parses, cascades, and inherits `none`, `all`, and
-  `digits 2..4`; normalized eligible runs form horizontal child sequences in a
-  one-em atomic inline and their captured paint subtree is compressed and
-  replayed as a unit. Contiguous normalized words now form one composition
-  when their style, link, decoration, bidi, and source metadata match. The
-  horizontal child sequence centers in its em square, applies `hwid`, `twid`,
-  and `qwid` alternatives for two through four characters, and reverses the
-  full-width ASCII transform before multi-character compression. Inline box
-  scope markers retain their stored logical advance instead of using their
-  physical line-height in vertical lines. Exact baseline alignment and
-  explicit nested-inline scope tracking remain incomplete.
+  `digits 2..4`. A pure source-range analysis pass and a separate
+  materialization pass form horizontal child sequences inside one-em atomic
+  squares; intrinsic and final layout use the same formation path. Each atom
+  retains its transformed boundary text, isolated nested bidi sequence, and
+  square geometry separately. Text-combine and ruby bases expose one shared
+  textual-boundary interface to UAX #14, while the atom remains indivisible to
+  the parent graph. Used tracking is zero at the composition's outgoing edge
+  without losing source-scope ownership. One resolver supplies both the
+  parent-central line extents and paint placement, and the captured paint
+  subtree is centered, compressed only in its horizontal axis, and replayed
+  without an ink clip. The sequence applies `hwid`, `twid`, and `qwid`
+  alternatives for two through four characters and reverses the full-width
+  ASCII transform before multi-character compression.
+- A complete release run on 2026-09-03 passes 33 of the 35 executed
+  `text-combine-upright*` reftests. The remaining failures are the two
+  single-character value tests, whose geometrically equivalent
+  horizontal/vertical glyph paths differ at rasterized edges.
+  Dynamic DOM tests and the currently skipped ruby and decoration tests remain
+  outside this coverage.

@@ -98,14 +98,15 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 10_000.0
             };
-            layout
-                .containing_blocks
-                .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
+            let containing_block = layout.positioned_containing_block_context(
+                ContainingBlock::from_page_top_rect(PageTopRect::new(
                     layout.content_left,
                     layout.cursor_y,
                     layout.content_right - layout.content_left,
                     measurement_height,
-                )));
+                )),
+            );
+            layout.containing_blocks.push(containing_block);
             // Scope the established absolute-position containing block for the
             // principal. Entering its automatic formatting context creates the
             // separate descendant basis, preserving cyclic descendant percentages.
@@ -242,7 +243,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn current_containing_block(&self) -> ContainingBlock {
         self.containing_blocks
             .last()
-            .cloned()
+            .map(|context| context.geometry)
             .unwrap_or_else(|| self.page_containing_block())
     }
 }

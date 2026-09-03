@@ -287,6 +287,7 @@ pub(in crate::layout) fn push_text_graph_run_segment(
         Rc::clone(&word.ancestor_inline_decorations),
     )
     .with_visual_offset(word.visual_offset)
+    .with_excluded_positioning_geometry_source(word.excluded_positioning_geometry_source)
     .with_source_run(source_run)
     .with_tracking_scope(tracking_scope);
     if word.style.content.is_generated() && word.style.display.is_flex() {

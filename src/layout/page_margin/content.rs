@@ -145,7 +145,10 @@ fn page_margin_generated_inline_advance(items: &[InlineItem], font_system: &mut 
                 max_advance = max_advance.max(paragraph_advance);
                 paragraph_advance = 0.0;
             }
-            InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => {}
+            InlineItem::StaticPositionSourceMarker(_)
+            | InlineItem::Float(_)
+            | InlineItem::PageScopeStart(_)
+            | InlineItem::PageScopeEnd => {}
         }
     }
     max_advance.max(paragraph_advance)

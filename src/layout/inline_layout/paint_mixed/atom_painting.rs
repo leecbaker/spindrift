@@ -21,7 +21,7 @@ impl<'a> LayoutBuilder<'a> {
             atom.content(),
             InlineAtomContent::InlineEdge(_)
                 | InlineAtomContent::Leader(_)
-                | InlineAtomContent::StaticPositionPlaceholder(_)
+                | InlineAtomContent::StaticPositionHypothetical { .. }
         ) {
             self.replay_escaped_inline_atom_positioned_layers(prepared);
             return;
@@ -132,13 +132,16 @@ impl<'a> LayoutBuilder<'a> {
     fn replay_escaped_inline_atom_positioned_layers(&mut self, prepared: &PreparedInlineAtom) {
         if let Some(layers) = prepared.atom.escaped_positioned_layers() {
             for layer in layers.iter() {
-                let atom_offset = layer
-                    .escaped_atom_translation
-                    .atom_offset(prepared.border_box.x(), prepared.border_box.y());
-                let mut layer = layer.clone().translated(atom_offset);
-                layer.page_index = layer
-                    .escaped_atom_translation
-                    .replay_page_index(self.pages.len(), layer.page_index);
+                let final_origin =
+                    PaintPoint::new(prepared.border_box.x(), prepared.border_box.y());
+                let replay = layer.escaped_atom_replay;
+                let mut layer = layer
+                    .clone()
+                    .translated(replay.translation_to(final_origin));
+                layer.page_index = replay.replay_page_index(self.pages.len(), layer.page_index);
+                if self.escaped_atom_positioning_depth > 0 {
+                    layer.escaped_atom_replay = replay.pending_in_enclosing_atomic_space();
+                }
                 // The atomic inline was measured on a scratch page, so a
                 // descendant's original source order predates the atom's
                 // final normal-flow paint.  Its containing block is a
@@ -176,7 +179,7 @@ impl<'a> LayoutBuilder<'a> {
             atom.content(),
             InlineAtomContent::InlineEdge(_)
                 | InlineAtomContent::Leader(_)
-                | InlineAtomContent::StaticPositionPlaceholder(_)
+                | InlineAtomContent::StaticPositionHypothetical { .. }
         ) && (atom
             .style()
             .background
@@ -193,7 +196,7 @@ impl<'a> LayoutBuilder<'a> {
         match atom.content() {
             InlineAtomContent::InlineEdge(_)
             | InlineAtomContent::Leader(_)
-            | InlineAtomContent::StaticPositionPlaceholder(_) => {}
+            | InlineAtomContent::StaticPositionHypothetical { .. } => {}
             InlineAtomContent::Canvas => {}
             InlineAtomContent::Iframe(element_id) => {
                 let Some(document) = self.iframe_documents.get(element_id) else {
@@ -568,15 +571,11 @@ impl<'a> LayoutBuilder<'a> {
                     );
                 }
             }
-            InlineAtomContent::TextCombineUpright {
-                sequence,
-                horizontal_style,
-                inline_scale,
-            } => {
+            InlineAtomContent::TextCombineUpright { composition } => {
                 self.paint_text_combine_upright(
-                    sequence,
-                    horizontal_style,
-                    *inline_scale,
+                    &composition.layout.sequence,
+                    &composition.layout.horizontal_style,
+                    composition.layout.inline_scale,
                     prepared.border_box,
                 );
             }
@@ -639,6 +638,24 @@ impl<'a> LayoutBuilder<'a> {
         inline_scale: f32,
         content_rect: PhysicalInlineRect,
     ) {
+        let scaled_width = sequence.available_width * inline_scale;
+        let centered_x = content_rect.x() + (content_rect.width() - scaled_width) / 2.0;
+        if (inline_scale - 1.0).abs() <= f32::EPSILON
+            && (centered_x - content_rect.x()).abs() <= f32::EPSILON
+        {
+            // An identity transform must remain a true no-op. Capturing it in
+            // an otherwise unnecessary stacking context changes opaque-glyph
+            // coverage grouping (notably Ahem text shadows) and can impose a
+            // finite group bound on ink that CSS permits to overflow.
+            self.paint_inline_box_sequence(
+                sequence,
+                horizontal_style,
+                content_rect.x(),
+                sequence.available_width,
+                content_rect.y() + content_rect.height(),
+            );
+            return;
+        }
         let checkpoint = self.current_page.paint_checkpoint();
         self.paint_inline_box_sequence(
             sequence,
@@ -651,8 +668,6 @@ impl<'a> LayoutBuilder<'a> {
         if fragment.is_empty() {
             return;
         }
-        let scaled_width = sequence.available_width * inline_scale;
-        let centered_x = content_rect.x() + (content_rect.width() - scaled_width) / 2.0;
         let transform = PaintTransform::translate(PaintTranslation::new(centered_x, 0.0))
             .multiply(PaintTransform::scale(inline_scale, 1.0))
             .multiply(PaintTransform::translate(PaintTranslation::new(

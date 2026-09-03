@@ -10,6 +10,7 @@ use super::state::{
     DomAutomaticBlockSizeReplayCheckpoint,
 };
 use super::*;
+use crate::layout::block::ParentStartClearanceHypothesis;
 use crate::layout::inline_collect::TextDecorationPropagationContext;
 
 impl<'a> LayoutBuilder<'a> {
@@ -422,6 +423,7 @@ impl<'a> LayoutBuilder<'a> {
                 &mut child_style,
                 parent_inline_percentage_basis,
             );
+            let uncollapsed_child_start_margin = child_style.margin.top;
             let block_end_margin_trim = BlockEndMarginTrim::for_child(style, is_flow_child, || {
                 has_later_normal_block_flow_child_with_font_metrics(
                     element,
@@ -535,6 +537,7 @@ impl<'a> LayoutBuilder<'a> {
             let mut collapses_with_parent_end = false;
             let mut adjoining_start_margin_paint_offset = None;
             let mut inherited_adjoining_start_margin = None;
+            let mut start_margin_without_descendant = None;
             if is_flow_child {
                 let collapses_with_parent = is_collapsible_block_child(child_element, &child_style);
                 let collapses_with_sibling =
@@ -551,11 +554,76 @@ impl<'a> LayoutBuilder<'a> {
                     && collapses_with_parent;
                 let adjoins_parent_start =
                     counterfactually_adjoins_parent_start && child_style.clear == Clear::None;
+                if !self_collapsing_child && descendant_start_margin.is_some() {
+                    let own_start_margin = AdjoiningBlockStartMargin::from_child_and_descendant(
+                        layout_pt(uncollapsed_child_start_margin),
+                        None,
+                    );
+                    start_margin_without_descendant = Some(if adjoins_parent_start {
+                        if let Some(previous_margin) = dom_state.previous_flow_bottom_margin {
+                            own_start_margin
+                                .child_delta_after_sibling(collapse_margins(
+                                    applied_start_margin,
+                                    layout_pt(previous_margin),
+                                ))
+                                .points()
+                        } else {
+                            own_start_margin
+                                .child_delta_at_parent_start(
+                                    applied_start_margin,
+                                    starts_at_page_top,
+                                )
+                                .points()
+                        }
+                    } else if !trimmed_block_start_margin
+                        && collapses_with_sibling
+                        && FragmentBreakContext::for_standalone_box(&child_style)
+                            .forced_break_before_in(fragmentainer_kind)
+                            .is_none()
+                    {
+                        dom_state
+                            .previous_flow_bottom_margin
+                            .map(|previous_margin| {
+                                own_start_margin
+                                    .child_delta_after_sibling(layout_pt(previous_margin))
+                                    .points()
+                            })
+                            .unwrap_or(uncollapsed_child_start_margin)
+                    } else {
+                        uncollapsed_child_start_margin
+                    });
+                }
                 if counterfactually_adjoins_parent_start {
-                    inherited_adjoining_start_margin = Some(InheritedAdjoiningStartMargin::new(
-                        adjoining_start_margin.value(),
-                        PageTopBlockPosition::new(self.cursor_y),
-                    ));
+                    let complete_margin = if child_style.clear != Clear::None {
+                        let mut resolver =
+                            DomStyleResolver::with_font_system(&mut self.font_system);
+                        clear_none_hypothetical_start_margin_dom_with_resolver(
+                            child_element,
+                            &child_style,
+                            stylesheets,
+                            &child_ancestors,
+                            &mut resolver,
+                            self.document_canvas_overflow,
+                        )
+                        .unwrap_or_else(|| adjoining_start_margin.value())
+                    } else {
+                        adjoining_start_margin.value()
+                    };
+                    let parent_start_hypothesis = self
+                        .inherited_adjoining_start_margins
+                        .last()
+                        .copied()
+                        .map(InheritedAdjoiningStartMargin::parent_start_clearance_hypothesis)
+                        .unwrap_or_else(|| {
+                            ParentStartClearanceHypothesis::new(PageTopBlockPosition::new(
+                                self.cursor_y,
+                            ))
+                        });
+                    inherited_adjoining_start_margin =
+                        Some(InheritedAdjoiningStartMargin::with_parent_start_hypothesis(
+                            complete_margin,
+                            parent_start_hypothesis,
+                        ));
                 }
                 if adjoins_parent_start {
                     if let Some(previous_margin) = dom_state.previous_flow_bottom_margin {
@@ -929,68 +997,88 @@ impl<'a> LayoutBuilder<'a> {
                 && traversal_state.has_automatic_block_size_clamp())
             .then_some(self.cursor_y);
             self.last_block_layout_outcome = BlockLayoutOutcome::default();
-            if child_style.display.is_block_level() {
-                let captures_direct_out_of_flow_static_position =
-                    matches!(child_style.position, Position::Absolute | Position::Fixed)
-                        && !child_style.abspos_static_source.is_inline_level();
-                let previous_direct_out_of_flow_static_position = self.absolute_static_position;
-                let previous_block_static_position_y_offset =
+            let mut descendant_clearance_retry_snapshot = start_margin_without_descendant
+                .filter(|margin| (margin - child_style.margin.top).abs() > FLOAT_EPSILON)
+                .map(|_| Box::new(self.snapshot()));
+            loop {
+                if child_style.display.is_block_level() {
+                    let captures_direct_out_of_flow_static_position =
+                        matches!(child_style.position, Position::Absolute | Position::Fixed)
+                            && !child_style.abspos_static_source.is_inline_level();
+                    let previous_direct_out_of_flow_static_position = self.absolute_static_position;
+                    let previous_block_static_position_y_offset =
+                        if captures_direct_out_of_flow_static_position {
+                            let previous = self.block_static_position_y_offset;
+                            self.block_static_position_y_offset = None;
+                            Some(previous)
+                        } else {
+                            None
+                        };
                     if captures_direct_out_of_flow_static_position {
-                        let previous = self.block_static_position_y_offset;
-                        self.block_static_position_y_offset = None;
-                        Some(previous)
-                    } else {
-                        None
-                    };
-                if captures_direct_out_of_flow_static_position {
-                    let capture = dom_state.out_of_flow_static_capture.unwrap_or_else(|| {
-                        StaticPositionCapture {
-                            rectangle: self.block_static_position_rectangle_at(
-                                PageTopBlockPosition::new(self.cursor_y),
-                            ),
-                        }
+                        let capture = dom_state.out_of_flow_static_capture.unwrap_or_else(|| {
+                            StaticPositionCapture {
+                                rectangle: self.block_static_position_rectangle_at(
+                                    PageTopBlockPosition::new(self.cursor_y),
+                                ),
+                            }
+                        });
+                        dom_state.out_of_flow_static_capture = Some(capture);
+                        let rectangle = capture.rectangle;
+                        self.absolute_static_position = Some(
+                            self.absolute_static_position
+                                .unwrap_or_else(|| {
+                                    AbsoluteStaticPosition::from_page_rect(
+                                        self.content_left,
+                                        self.content_right,
+                                        rectangle.area.top_y(),
+                                    )
+                                })
+                                .with_static_position_rectangle(rectangle),
+                        );
+                    }
+                    if let Some(margin) = inherited_adjoining_start_margin {
+                        self.inherited_adjoining_start_margins.push(margin);
+                    }
+                    let previous_direct_block_layout_constraint = self
+                        .replace_direct_block_layout_constraint(
+                            child_element,
+                            principal_vertical_placement,
+                        );
+                    self.push_ancestor_signature(child_signature.clone());
+                    self.with_text_box_line_trim_scope(child_text_box_line_trim, |layout| {
+                        layout.layout_element(child_element, &child_style, stylesheets);
                     });
-                    dom_state.out_of_flow_static_capture = Some(capture);
-                    let rectangle = capture.rectangle;
-                    self.absolute_static_position = Some(
-                        self.absolute_static_position
-                            .unwrap_or_else(|| {
-                                AbsoluteStaticPosition::from_page_rect(
-                                    self.content_left,
-                                    self.content_right,
-                                    rectangle.area.top_y(),
-                                )
-                            })
-                            .with_static_position_rectangle(rectangle),
+                    self.ancestors.pop();
+                    self.restore_direct_block_layout_constraint(
+                        previous_direct_block_layout_constraint,
                     );
+                    if inherited_adjoining_start_margin.is_some() {
+                        self.inherited_adjoining_start_margins.pop();
+                    }
+                    if let Some(previous) = previous_block_static_position_y_offset {
+                        self.block_static_position_y_offset = previous;
+                    }
+                    if captures_direct_out_of_flow_static_position {
+                        self.absolute_static_position = previous_direct_out_of_flow_static_position;
+                    }
                 }
-                if let Some(margin) = inherited_adjoining_start_margin {
-                    self.inherited_adjoining_start_margins.push(margin);
+                if child_uses_block_layout
+                    && self.last_block_layout_outcome.margin_collapse_boundary
+                        == BlockMarginCollapseBoundary::SeparatedByClearance
+                    && let (Some(snapshot), Some(retry_margin)) = (
+                        descendant_clearance_retry_snapshot.take(),
+                        start_margin_without_descendant,
+                    )
+                {
+                    self.restore(*snapshot);
+                    child_style.margin.top = retry_margin;
+                    preserve_adjusted_block_margins(&mut child_style);
+                    self.last_block_layout_outcome = BlockLayoutOutcome::default();
+                    continue;
                 }
-                let previous_direct_block_layout_constraint = self
-                    .replace_direct_block_layout_constraint(
-                        child_element,
-                        principal_vertical_placement,
-                    );
-                self.push_ancestor_signature(child_signature);
-                self.with_text_box_line_trim_scope(child_text_box_line_trim, |layout| {
-                    layout.layout_element(child_element, &child_style, stylesheets);
-                });
-                self.ancestors.pop();
-                self.restore_direct_block_layout_constraint(
-                    previous_direct_block_layout_constraint,
-                );
-                if inherited_adjoining_start_margin.is_some() {
-                    self.inherited_adjoining_start_margins.pop();
-                }
-                if let Some(previous) = previous_block_static_position_y_offset {
-                    self.block_static_position_y_offset = previous;
-                }
-                if captures_direct_out_of_flow_static_position {
-                    self.absolute_static_position = previous_direct_out_of_flow_static_position;
-                }
-                self.flush_float_run(&mut dom_state.float_run);
+                break;
             }
+            self.flush_float_run(&mut dom_state.float_run);
             if let (Some(checkpoint), Some(placement)) = (
                 principal_flow_paint_checkpoint,
                 principal_vertical_placement,

@@ -10,6 +10,7 @@ pub(super) struct DeferredInlinePositionedDescendant {
     pub(super) element: Element,
     pub(super) signature: ElementSignature,
     pub(super) style: ComputedStyle,
+    pub(super) box_source: DeferredPositionedBoxSource,
     /// The inline source whose hypothetical-flow geometry defines the
     /// static-position rectangle. This is distinct from the enclosing block
     /// formatting context used to lay out the descendant itself.
@@ -35,6 +36,7 @@ pub(super) struct DeferredInlineStaticPositionedDescendant {
     /// this element while resolving automatic sizes and final layout.
     pub(super) signature: ElementSignature,
     pub(super) style: ComputedStyle,
+    pub(super) box_source: DeferredPositionedBoxSource,
     /// The block formatting context that selected the hypothetical line.
     /// This is deliberately distinct from the lexical inline ancestor: the
     /// latter may reset `text-indent`, direction, or writing mode without
@@ -66,6 +68,27 @@ pub(super) enum DeferredStaticPositionedContent {
     Frozen,
 }
 
+/// Owned provenance for an element-backed positioned formatting box.
+///
+/// A generated pseudo borrows its originating element in the box tree, so a
+/// deferred record cannot retain `BoxSource` directly. This compact owned
+/// form preserves the semantic box role needed for generated content,
+/// counters, and stable static-position source identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::layout) enum DeferredPositionedBoxSource {
+    Principal,
+    GeneratedPseudo(box_tree::GeneratedPseudoKind),
+}
+
+impl DeferredPositionedBoxSource {
+    pub(in crate::layout) fn from_box_source(source: &box_tree::BoxSource<'_>) -> Self {
+        match source {
+            box_tree::BoxSource::Principal => Self::Principal,
+            box_tree::BoxSource::GeneratedPseudo(pseudo) => Self::GeneratedPseudo(pseudo.kind),
+        }
+    }
+}
+
 /// The immutable normal-flow provenance for a deferred positioned source.
 ///
 /// Inline sources use an element-stable marker that survives line processing.
@@ -73,60 +96,32 @@ pub(super) enum DeferredStaticPositionedContent {
 /// block-in-inline split marker can be materialized by block layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::layout) enum DeferredStaticPositionSource {
-    InlineMarker {
-        marker: InlineStaticPositionMarkerId,
-        fallback_source_order_index: usize,
-    },
+    InlineSource(InlineStaticPositionSourceId),
     LegacyBlockSourceOrderIndex(usize),
 }
 
-/// The generated fragment that owns one source-order edge of a positioned
-/// inline's padding-box containing block.
-///
-/// CSS 2.2 selects the first and last generated inline boxes, rather than the
-/// union of every painted fragment. Keeping the edge role with its prepared
-/// line geometry prevents visual/bidi order from becoming an accidental
-/// containing-block rule.
-/// <https://www.w3.org/TR/CSS22/visudet.html#containing-block-details>
-#[derive(Debug, Clone, Copy)]
-struct InlinePositioningFragmentEdgeCapture {
-    logical_edge: InlineLogicalEdge,
-    rect: PageTopRect,
-}
-
-/// The source-order fragment edges that form an inline absolute-positioning
-/// containing block.
-///
-/// CSS Positioned Layout selects logical start edges from the first fragment
-/// and logical end edges from the end-most fragment. A physical bounding union
-/// is wrong for vertical writing modes (and bidi fragments), because it can
-/// take both sides of either source fragment instead of the required logical
-/// corner. Keep the fragment roles and their axes together until this named
-/// geometry conversion.
+/// The two logical corners that form an inline absolute-positioning containing
+/// block. Keeping coordinates associated with their logical axes avoids
+/// inventing a bounding rectangle for disjoint bidi fragments.
 /// <https://drafts.csswg.org/css-position-3/#def-cb>
 #[derive(Debug, Clone, Copy)]
-struct InlineContainingBlockContentEdges {
-    first_fragment: PageTopRect,
-    end_fragment: PageTopRect,
+struct InlineContainingBlockLogicalCorners {
+    start: InlinePositioningLogicalCorner,
+    end: InlinePositioningLogicalCorner,
     axes: WritingModeAxes,
 }
 
-impl InlineContainingBlockContentEdges {
-    /// Form the positioned containing block from the first fragment's logical
-    /// start edges and the end fragment's logical end edges.
+impl InlineContainingBlockLogicalCorners {
+    /// Form the positioned containing block from the first fragment's
+    /// start-most content edges and the end-most fragment's end-most edges.
     ///
     /// This is the only adapter that projects those logical edges into a
     /// physical `PageTopRect`; callers retain a `ContainingBlock` rather than
     /// recombining page coordinates themselves.
     /// <https://drafts.csswg.org/css-position-3/#def-cb>
     fn to_containing_block(self) -> ContainingBlock {
-        let (horizontal_start, horizontal_end) = self.physical_axis_edges(PhysicalAxis::Horizontal);
-        let (vertical_start, vertical_end) = self.physical_axis_edges(PhysicalAxis::Vertical);
-
-        let first_x = Self::coordinate_on_side(self.first_fragment, horizontal_start);
-        let end_x = Self::coordinate_on_side(self.end_fragment, horizontal_end);
-        let first_y = Self::coordinate_on_side(self.first_fragment, vertical_start);
-        let end_y = Self::coordinate_on_side(self.end_fragment, vertical_end);
+        let (first_x, first_y) = self.physical_coordinates(self.start);
+        let (end_x, end_y) = self.physical_coordinates(self.end);
 
         let left = first_x.min(end_x);
         let right = first_x.max(end_x);
@@ -135,27 +130,69 @@ impl InlineContainingBlockContentEdges {
         ContainingBlock::from_page_top_rect(PageTopRect::new(left, top, right - left, top - bottom))
     }
 
-    fn physical_axis_edges(self, axis: PhysicalAxis) -> (PhysicalSide, PhysicalSide) {
-        let logical_axis = if self.axes.physical_axis(LogicalAxis::Inline) == axis {
-            LogicalAxis::Inline
+    fn physical_coordinates(self, corner: InlinePositioningLogicalCorner) -> (f32, f32) {
+        let inline = corner.inline.physical_page_coordinate();
+        let block = corner.block.physical_page_coordinate();
+        if self.axes.physical_axis(LogicalAxis::Inline) == PhysicalAxis::Horizontal {
+            (inline, block)
         } else {
-            debug_assert_eq!(self.axes.physical_axis(LogicalAxis::Block), axis);
-            LogicalAxis::Block
-        };
-        let (start, end) = match logical_axis {
-            LogicalAxis::Inline => (LogicalSide::InlineStart, LogicalSide::InlineEnd),
-            LogicalAxis::Block => (LogicalSide::BlockStart, LogicalSide::BlockEnd),
-        };
-        (self.axes.physical_side(start), self.axes.physical_side(end))
+            debug_assert_eq!(
+                self.axes.physical_axis(LogicalAxis::Block),
+                PhysicalAxis::Horizontal
+            );
+            (block, inline)
+        }
+    }
+}
+
+/// Reduce source-keyed prepared fragment geometry to the two logical corners
+/// required by CSS Positioned Layout.
+///
+/// The producer can be hypothetical line replay today or committed
+/// fragmentainer layout later; selection depends only on prepared geometry.
+/// <https://drafts.csswg.org/css-position-3/#def-cb>
+#[derive(Debug)]
+struct PreparedInlinePositioningGeometryReducer {
+    source: InlinePositioningContainingBlockId,
+    axes: WritingModeAxes,
+    first_fragment_start: Option<InlinePositioningLogicalCorner>,
+    last_fragment_end: Option<InlinePositioningLogicalCorner>,
+}
+
+impl PreparedInlinePositioningGeometryReducer {
+    fn new(source: InlinePositioningContainingBlockId, axes: WritingModeAxes) -> Self {
+        Self {
+            source,
+            axes,
+            first_fragment_start: None,
+            last_fragment_end: None,
+        }
     }
 
-    fn coordinate_on_side(rect: PageTopRect, side: PhysicalSide) -> f32 {
-        match side {
-            PhysicalSide::Left => rect.x(),
-            PhysicalSide::Right => rect.x() + rect.width(),
-            PhysicalSide::Top => rect.top_y(),
-            PhysicalSide::Bottom => rect.bottom_y(),
+    fn observe_line(&mut self, line: &PreparedInlineLine) {
+        let Some(geometry) = line
+            .positioning_geometry
+            .iter()
+            .find(|geometry| geometry.source == self.source)
+        else {
+            return;
+        };
+        debug_assert_eq!(geometry.axes, self.axes);
+        if geometry.start_marker.is_some() {
+            self.first_fragment_start
+                .get_or_insert_with(|| geometry.start_corner().expect("marker supplies a corner"));
         }
+        if geometry.end_marker.is_some() {
+            self.last_fragment_end = geometry.end_corner();
+        }
+    }
+
+    fn finish(self) -> Option<InlineContainingBlockLogicalCorners> {
+        Some(InlineContainingBlockLogicalCorners {
+            start: self.first_fragment_start?,
+            end: self.last_fragment_end?,
+            axes: self.axes,
+        })
     }
 }
 
@@ -164,18 +201,176 @@ impl InlineContainingBlockContentEdges {
 mod tests {
     use super::*;
 
-    #[test]
-    fn vertical_rl_inline_containing_block_uses_logical_fragment_edges() {
-        let containing_block = InlineContainingBlockContentEdges {
-            first_fragment: PageTopRect::new(40.0, 100.0, 20.0, 30.0),
-            end_fragment: PageTopRect::new(10.0, 60.0, 15.0, 10.0),
-            axes: WritingModeAxes::new(WritingMode::VerticalRl, Direction::Ltr),
+    fn prepared_line(geometry: PreparedInlinePositioningGeometry) -> PreparedInlineLine {
+        PreparedInlineLine {
+            metrics: InlineLineMetrics {
+                width: 0.0,
+                height: 0.0,
+                baseline_offset: 0.0,
+            },
+            // Positioning geometry is deliberately independent of paint scope
+            // nesting, so the reducer has no paint tree to inspect.
+            paint_items: Vec::new(),
+            positioning_geometry: vec![geometry],
+            decoration_origin_fragments: Default::default(),
         }
-        .to_containing_block();
+    }
+
+    fn geometry_with_marker(
+        axes: WritingModeAxes,
+        edge: InlineLogicalEdge,
+        content: PageTopRect,
+    ) -> PreparedInlinePositioningGeometry {
+        let mut geometry =
+            PreparedInlinePositioningGeometry::new(InlinePositioningContainingBlockId(1), axes);
+        geometry.record_content_rect(content);
+        geometry.record_marker(edge, content);
+        geometry
+    }
+
+    fn reduced_rect(writing_mode: WritingMode, direction: Direction) -> PageTopRect {
+        let axes = WritingModeAxes::new(writing_mode, direction);
+        let mut reducer = PreparedInlinePositioningGeometryReducer::new(
+            InlinePositioningContainingBlockId(1),
+            axes,
+        );
+        reducer.observe_line(&prepared_line(geometry_with_marker(
+            axes,
+            InlineLogicalEdge::Start,
+            PageTopRect::new(40.0, 100.0, 20.0, 30.0),
+        )));
+        reducer.observe_line(&prepared_line(geometry_with_marker(
+            axes,
+            InlineLogicalEdge::End,
+            PageTopRect::new(10.0, 60.0, 15.0, 10.0),
+        )));
+        reducer.finish().unwrap().to_containing_block().rect
+    }
+
+    #[test]
+    fn reducer_selects_vertical_and_sideways_logical_corners() {
+        let cases = [
+            (
+                WritingMode::VerticalRl,
+                Direction::Ltr,
+                PageTopRect::new(10.0, 100.0, 50.0, 50.0),
+            ),
+            (
+                WritingMode::VerticalRl,
+                Direction::Rtl,
+                PageTopRect::new(10.0, 70.0, 50.0, 10.0),
+            ),
+            (
+                WritingMode::VerticalLr,
+                Direction::Ltr,
+                PageTopRect::new(25.0, 100.0, 15.0, 50.0),
+            ),
+            (
+                WritingMode::VerticalLr,
+                Direction::Rtl,
+                PageTopRect::new(25.0, 70.0, 15.0, 10.0),
+            ),
+            (
+                WritingMode::SidewaysRl,
+                Direction::Ltr,
+                PageTopRect::new(10.0, 100.0, 50.0, 50.0),
+            ),
+            (
+                WritingMode::SidewaysRl,
+                Direction::Rtl,
+                PageTopRect::new(10.0, 70.0, 50.0, 10.0),
+            ),
+            (
+                WritingMode::SidewaysLr,
+                Direction::Ltr,
+                PageTopRect::new(25.0, 70.0, 15.0, 10.0),
+            ),
+            (
+                WritingMode::SidewaysLr,
+                Direction::Rtl,
+                PageTopRect::new(25.0, 100.0, 15.0, 50.0),
+            ),
+        ];
+
+        for (writing_mode, direction, expected) in cases {
+            assert_eq!(
+                reduced_rect(writing_mode, direction),
+                expected,
+                "{writing_mode:?} {direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_horizontal_ltr_geometry_selects_independent_logical_extrema() {
+        let axes = WritingModeAxes::new(WritingMode::HorizontalTb, Direction::Ltr);
+        let mut geometry =
+            PreparedInlinePositioningGeometry::new(InlinePositioningContainingBlockId(1), axes);
+        geometry.record_content_rect(PageTopRect::new(40.0, 100.0, 20.0, 30.0));
+        geometry.record_content_rect(PageTopRect::new(10.0, 90.0, 15.0, 50.0));
 
         assert_eq!(
-            containing_block.rect,
-            PageTopRect::new(10.0, 100.0, 50.0, 50.0)
+            geometry.start_corner(),
+            Some(InlinePositioningLogicalCorner {
+                inline: InlinePositioningInlineCoordinate::new(10.0),
+                block: InlinePositioningBlockCoordinate::new(100.0),
+            })
+        );
+        assert_eq!(
+            geometry.end_corner(),
+            Some(InlinePositioningLogicalCorner {
+                inline: InlinePositioningInlineCoordinate::new(60.0),
+                block: InlinePositioningBlockCoordinate::new(40.0),
+            })
+        );
+    }
+
+    #[test]
+    fn prepared_horizontal_rtl_geometry_reverses_inline_extrema() {
+        let axes = WritingModeAxes::new(WritingMode::HorizontalTb, Direction::Rtl);
+        let mut geometry =
+            PreparedInlinePositioningGeometry::new(InlinePositioningContainingBlockId(1), axes);
+        geometry.record_content_rect(PageTopRect::new(40.0, 100.0, 20.0, 30.0));
+        geometry.record_content_rect(PageTopRect::new(10.0, 90.0, 15.0, 50.0));
+
+        assert_eq!(
+            geometry.start_corner().unwrap().inline,
+            InlinePositioningInlineCoordinate::new(60.0)
+        );
+        assert_eq!(
+            geometry.end_corner().unwrap().inline,
+            InlinePositioningInlineCoordinate::new(10.0)
+        );
+    }
+
+    #[test]
+    fn prepared_positioning_geometry_uses_marker_only_without_content() {
+        let axes = WritingModeAxes::new(WritingMode::HorizontalTb, Direction::Rtl);
+        let mut geometry =
+            PreparedInlinePositioningGeometry::new(InlinePositioningContainingBlockId(1), axes);
+        geometry.record_marker(
+            InlineLogicalEdge::Start,
+            PageTopRect::new(80.0, 100.0, 0.0, 20.0),
+        );
+        geometry.record_marker(
+            InlineLogicalEdge::End,
+            PageTopRect::new(30.0, 80.0, 0.0, 20.0),
+        );
+
+        let line = prepared_line(geometry);
+        let mut reducer = PreparedInlinePositioningGeometryReducer::new(
+            InlinePositioningContainingBlockId(1),
+            axes,
+        );
+        reducer.observe_line(&line);
+        let corners = reducer.finish().unwrap();
+        assert_eq!(
+            corners.start.inline,
+            InlinePositioningInlineCoordinate::new(80.0)
+        );
+        assert_eq!(
+            corners.end.inline,
+            InlinePositioningInlineCoordinate::new(30.0)
         );
     }
 }
@@ -230,6 +425,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
+        box_source: DeferredPositionedBoxSource,
         stylesheets: &Stylesheets<'_>,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -243,6 +439,49 @@ impl<'a> LayoutBuilder<'a> {
         hypothetical_ancestor_offset: InlineVisualOffset,
         output: &[InlineItem],
     ) {
+        if let DeferredPositionedBoxSource::GeneratedPseudo(kind) = box_source {
+            let counter_scope =
+                self.begin_pseudo_counter_scope(element, kind.counter_event_source(), style);
+            self.element_side_effect_suppression_depth += 1;
+            let previous_positioned_generated_source = self.positioned_generated_source;
+            self.positioned_generated_source = Some(
+                InlineStaticPositionSourceId::for_generated_pseudo(element, kind),
+            );
+            let mut generated_content_style;
+            let style = if matches!(
+                style.content,
+                css::Content::Replacement {
+                    image: css::GeneratedContentPart::Image { .. },
+                    ..
+                }
+            ) {
+                generated_content_style = style.clone();
+                generated_content_style.object_fit = css::ObjectFit::None;
+                generated_content_style.object_position = css::BackgroundPosition::INITIAL;
+                &generated_content_style
+            } else {
+                style
+            };
+            self.layout_positioned_inline_descendant(
+                element,
+                style,
+                DeferredPositionedBoxSource::Principal,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                block_style,
+                static_position_container_style,
+                positioning_containing_block_source,
+                static_position_containing_block,
+                static_position_source,
+                hypothetical_ancestor_offset,
+                output,
+            );
+            self.positioned_generated_source = previous_positioned_generated_source;
+            self.element_side_effect_suppression_depth -= 1;
+            self.end_counter_scope(counter_scope);
+            return;
+        }
         if self.positioned_auto_size_child_participation(style)
             == PositionedAutoSizeChildParticipation::ExcludeOutOfFlow
         {
@@ -298,29 +537,22 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 css::StaticPositionSource::Inline
             };
-            let mut static_position =
-                self.inline_static_position_from_hypothetical_placeholder(
-                    element,
-                    &positioned_style,
-                    stylesheets,
-                    child_boxes,
-                    table_fragment,
-                    block_style,
-                    match static_position_source {
-                        Some(DeferredStaticPositionSource::InlineMarker { marker, .. }) => marker,
-                        Some(DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(_))
-                        | None => InlineStaticPositionMarkerId::for_element(element),
-                    },
-                    match static_position_source {
-                        Some(DeferredStaticPositionSource::InlineMarker {
-                            fallback_source_order_index,
-                            ..
-                        }) => Some(fallback_source_order_index),
-                        Some(DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(_))
-                        | None => None,
-                    },
-                    output,
-                );
+            let mut static_position = self.inline_static_position_from_hypothetical_placeholder(
+                element,
+                &positioned_style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                block_style,
+                match static_position_source {
+                    Some(DeferredStaticPositionSource::InlineSource(marker)) => marker,
+                    Some(DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(_)) | None => {
+                        InlineStaticPositionSourceId::for_element(element)
+                    }
+                },
+                static_position_source.is_none(),
+                output,
+            );
             let static_area = static_position.rectangle.area;
             static_position.rectangle.area = PageTopRect::new(
                 static_area.x() + hypothetical_ancestor_offset.x(),
@@ -341,7 +573,6 @@ impl<'a> LayoutBuilder<'a> {
                 static_area.width(),
                 static_area.height(),
             );
-            let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
             let positioned_containing_block_scope =
                 positioning_containing_block_source.and_then(|source| {
                     let mode = PositionedContainingBlockMode::for_style(source.style)?;
@@ -357,9 +588,6 @@ impl<'a> LayoutBuilder<'a> {
                     // escape with the atom rather than retain the temporary
                     // page coordinates.
                     // <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks>
-                    if self.escaped_atom_positioning_depth > 0 {
-                        self.escaped_atom_containing_block = Some(containing_block);
-                    }
                     Some(self.push_positioned_containing_block(mode, containing_block))
                 });
             self.out_of_flow_prebreak_suppression_depth += 1;
@@ -374,7 +602,6 @@ impl<'a> LayoutBuilder<'a> {
             self.out_of_flow_prebreak_suppression_depth -= 1;
             if let Some(scope) = positioned_containing_block_scope {
                 self.pop_positioned_containing_block(scope);
-                self.escaped_atom_containing_block = previous_escaped_atom_containing_block;
             }
             self.absolute_static_position = previous_principal_static_position;
             return;
@@ -393,7 +620,7 @@ impl<'a> LayoutBuilder<'a> {
                 block_style,
                 placeholder_geometry,
                 static_position_source.and_then(|source| match source {
-                    DeferredStaticPositionSource::InlineMarker { .. } => None,
+                    DeferredStaticPositionSource::InlineSource(_) => None,
                     DeferredStaticPositionSource::LegacyBlockSourceOrderIndex(index) => Some(index),
                 }),
             )
@@ -433,7 +660,6 @@ impl<'a> LayoutBuilder<'a> {
             self.absolute_static_position = previous;
             return;
         }
-        let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
         let previous_block_static_rectangle = self.absolute_static_position;
         // A block-level positioned source reached from an inline collection
         // (for example after whitespace in an otherwise block container)
@@ -546,9 +772,6 @@ impl<'a> LayoutBuilder<'a> {
                 // See the corresponding inline-level branch above.  The
                 // source containing block is expressed in the temporary
                 // atom page and therefore moves with that atom on escape.
-                if self.escaped_atom_positioning_depth > 0 {
-                    self.escaped_atom_containing_block = Some(containing_block);
-                }
                 Some(self.push_positioned_containing_block(mode, containing_block))
             });
         self.out_of_flow_prebreak_suppression_depth += 1;
@@ -556,7 +779,6 @@ impl<'a> LayoutBuilder<'a> {
         self.out_of_flow_prebreak_suppression_depth -= 1;
         if let Some(scope) = positioned_containing_block_scope {
             self.pop_positioned_containing_block(scope);
-            self.escaped_atom_containing_block = previous_escaped_atom_containing_block;
         }
         self.absolute_static_position = previous_block_static_rectangle;
     }
@@ -637,15 +859,16 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    /// Resolves the padding-box rectangle established by a positioned inline.
+    /// Resolves the content-edge rectangle established by a positioned inline.
     ///
     /// Inline collection retains zero-advance edge atoms for positioned
     /// ancestors. Replaying those source markers through normal line
     /// preparation gives the first and last generated inline fragments their
     /// final physical coordinates, including bidi reordering, fragmentation,
-    /// and writing-mode transforms. CSS 2.2 defines the absolute containing
-    /// block from exactly those padding edges:
-    /// <https://www.w3.org/TR/CSS22/visudet.html#containing-block-details>.
+    /// and writing-mode transforms. CSS Positioned Layout defines the absolute
+    /// containing block from the start-most content edges of the first fragment
+    /// and the end-most content edges of the end-most fragment:
+    /// <https://drafts.csswg.org/css-position-3/#def-cb>.
     fn inline_positioning_containing_block_from_items(
         &mut self,
         source: BorrowedInlinePositioningContainingBlockSource<'_>,
@@ -688,123 +911,36 @@ impl<'a> LayoutBuilder<'a> {
             self.content_right,
             self.cursor_y,
         );
-        if matches!(
-            block_style.writing_mode,
-            WritingMode::VerticalRl | WritingMode::SidewaysRl
-        ) {
-            stack.advance(records.first().map(|record| record.height()).unwrap_or(0.0));
-        }
-        let mut start = None;
-        let mut end = None;
+        let source_axes =
+            WritingModeAxes::new(source.style.writing_mode, source.style.used_direction());
+        let mut reducer = PreparedInlinePositioningGeometryReducer::new(source.id, source_axes);
         for record in &records {
-            stack.apply(self);
+            let placement = stack.place_line(record);
+            placement.apply(self);
             self.apply_line_block_start_trim_for_paint(record, block_style.writing_mode);
             if let Some(prepared) = self.prepare_inline_line_record(record, context) {
-                // The prepared line is layout output, even though it is
-                // shared with painting. Capture only the fragment(s) on the
-                // source-order start/end lines; a union of all painted
-                // fragments incorrectly turns multiline and bidi fragments
-                // into a physical bounding box.
-                let mut source_fragment_bounds: Option<(f32, f32, f32, f32)> = None;
-                for item in &prepared.paint_items {
-                    if let PreparedInlinePaintItem::FragmentBackground(fragment) = item
-                        && fragment.fragment.ancestor_inline_decorations().iter().any(
-                            |decoration| {
-                                decoration.positioning_containing_block_id == Some(source.id)
-                            },
-                        )
-                    {
-                        let rect = fragment.rect;
-                        let bounds = (rect.x(), rect.y(), rect.width(), rect.height());
-                        source_fragment_bounds = Some(match source_fragment_bounds {
-                            Some((left, bottom, right, top)) => (
-                                left.min(bounds.0),
-                                bottom.min(bounds.1),
-                                right.max(bounds.0 + bounds.2),
-                                top.max(bounds.1 + bounds.3),
-                            ),
-                            None => (bounds.0, bounds.1, bounds.0 + bounds.2, bounds.1 + bounds.3),
-                        });
-                    }
-                }
-                for item in &prepared.paint_items {
-                    let PreparedInlinePaintItem::Atom(atom) = item else {
-                        continue;
-                    };
-                    let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) =
-                        atom.atom.content()
-                    else {
-                        continue;
-                    };
-                    if edge.positioning_containing_block_id != Some(source.id) {
-                        continue;
-                    }
-                    let rect = atom.border_box;
-                    // Horizontal containing-block replay has long used the
-                    // explicit edge atoms successfully. In vertical flow an
-                    // edge atom is zero-advance on the physical inline axis,
-                    // so pair it with the prepared source fragment on that
-                    // line to retain the padding-box block extent.
-                    let atom_bounds = (
-                        rect.x(),
-                        rect.y(),
-                        rect.x() + rect.width(),
-                        rect.y() + rect.height(),
-                    );
-                    let bounds =
-                        WritingModeAxes::new(source.style.writing_mode, source.style.direction)
-                            .swaps_physical_axes()
-                            .then_some(source_fragment_bounds)
-                            .flatten()
-                            .unwrap_or(atom_bounds);
-                    let edge_capture = InlinePositioningFragmentEdgeCapture {
-                        logical_edge: edge.logical_edge,
-                        rect: PageTopRect::new(
-                            bounds.0,
-                            bounds.3,
-                            (bounds.2 - bounds.0).max(0.0),
-                            (bounds.3 - bounds.1).max(0.0),
-                        ),
-                    };
-                    match edge.logical_edge {
-                        InlineLogicalEdge::Start => {
-                            start.get_or_insert(edge_capture);
-                        }
-                        InlineLogicalEdge::End => end = Some(edge_capture),
-                    };
-                }
+                reducer.observe_line(&prepared);
             }
-            stack.advance(record.height());
         }
         self.cursor_y = saved_cursor_y;
         self.content_left = saved_left;
         self.content_right = saved_right;
 
-        let start = start?;
-        let end = end?;
-        debug_assert_eq!(start.logical_edge, InlineLogicalEdge::Start);
-        debug_assert_eq!(end.logical_edge, InlineLogicalEdge::End);
-        let containing_block_edges = InlineContainingBlockContentEdges {
-            first_fragment: start.rect,
-            end_fragment: end.rect,
-            axes: WritingModeAxes::new(source.style.writing_mode, source.style.used_direction()),
-        };
+        let containing_block_edges = reducer.finish()?;
+        let trace_start = containing_block_edges.physical_coordinates(containing_block_edges.start);
+        let trace_end = containing_block_edges.physical_coordinates(containing_block_edges.end);
         let containing_block = containing_block_edges.to_containing_block();
         let containing_rect = containing_block.rect;
         log::trace!(
             target: "quire::layout::static_position",
-            "checkpoint=positioned-inline-containing-block source={:?} axes=({:?},{:?}) start=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) end=(x:{:.2},top:{:.2},width:{:.2},height:{:.2}) containing_block=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
+            "checkpoint=positioned-inline-containing-block source={:?} axes=({:?},{:?}) start=(x:{:.2},y:{:.2}) end=(x:{:.2},y:{:.2}) containing_block=(x:{:.2},top:{:.2},width:{:.2},height:{:.2})",
             source.id,
             source.style.writing_mode,
             source.style.used_direction(),
-            start.rect.x(),
-            start.rect.top_y(),
-            start.rect.width(),
-            start.rect.height(),
-            end.rect.x(),
-            end.rect.top_y(),
-            end.rect.width(),
-            end.rect.height(),
+            trace_start.0,
+            trace_start.1,
+            trace_end.0,
+            trace_end.1,
             containing_rect.x(),
             containing_rect.top_y(),
             containing_rect.width(),
@@ -826,15 +962,20 @@ impl<'a> LayoutBuilder<'a> {
                 // containing block can be measured from a complete item
                 // stream. Retain the positioned source on the selector stack
                 // throughout both child-box construction and layout.
-                let child_boxes = layout.build_frozen_child_boxes_with_current_ancestors(
-                    &descendant.element,
-                    stylesheets,
-                    &descendant.style,
-                );
+                let child_boxes = match descendant.box_source {
+                    DeferredPositionedBoxSource::Principal => layout
+                        .build_frozen_child_boxes_with_current_ancestors(
+                            &descendant.element,
+                            stylesheets,
+                            &descendant.style,
+                        ),
+                    DeferredPositionedBoxSource::GeneratedPseudo(_) => Vec::new(),
+                };
                 let positioned_layer_start = layout.positioned_layers.len();
                 layout.layout_positioned_inline_descendant(
                     &descendant.element,
                     &descendant.style,
+                    descendant.box_source,
                     stylesheets,
                     Some(&child_boxes),
                     None,
@@ -868,19 +1009,25 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         for descendant in descendants {
             self.with_ancestor_signature(descendant.signature, |layout| {
-                let frozen_child_boxes =
-                    matches!(descendant.content, DeferredStaticPositionedContent::Frozen).then(
-                        || {
-                            layout.build_frozen_child_boxes_with_current_ancestors(
-                                &descendant.element,
-                                stylesheets,
-                                &descendant.style,
-                            )
-                        },
-                    );
+                let frozen_child_boxes = match (descendant.content, descendant.box_source) {
+                    (DeferredStaticPositionedContent::Dom, _) => None,
+                    (
+                        DeferredStaticPositionedContent::Frozen,
+                        DeferredPositionedBoxSource::Principal,
+                    ) => Some(layout.build_frozen_child_boxes_with_current_ancestors(
+                        &descendant.element,
+                        stylesheets,
+                        &descendant.style,
+                    )),
+                    (
+                        DeferredStaticPositionedContent::Frozen,
+                        DeferredPositionedBoxSource::GeneratedPseudo(_),
+                    ) => Some(Vec::new()),
+                };
                 layout.layout_positioned_inline_descendant(
                     &descendant.element,
                     &descendant.style,
+                    descendant.box_source,
                     stylesheets,
                     frozen_child_boxes.as_deref(),
                     None,
@@ -944,6 +1091,12 @@ impl<'a> LayoutBuilder<'a> {
                     self.layout_positioned_inline_descendant(
                         element,
                         style,
+                        DeferredPositionedBoxSource::from_box_source(
+                            &child
+                                .element_core()
+                                .expect("an element-backed formatting box has a source")
+                                .source,
+                        ),
                         stylesheets,
                         Some(child_boxes),
                         table_fragment,
