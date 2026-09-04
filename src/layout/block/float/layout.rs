@@ -85,6 +85,11 @@ impl<'a> LayoutBuilder<'a> {
         run: &mut FloatRunState,
         pseudo_source: Option<box_tree::CounterEventSource>,
     ) -> bool {
+        debug_assert_ne!(
+            child_style.float.layout_role(),
+            FloatLayoutRole::Footnote,
+            "a detached GCPM footnote body must not enter CSS float placement"
+        );
         if child_style.float == Float::None
             || child_style.display.is_none()
             || matches!(child_style.position, Position::Absolute | Position::Fixed)

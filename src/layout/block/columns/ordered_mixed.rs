@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::block::flow::PendingAdjoiningMargin;
 
 /// Replay state for an ordered inline run before a fixed automatic-clamp child.
 ///
@@ -33,7 +34,7 @@ struct OrderedMixedFlowTraversalState {
     element_index: usize,
     inline_run_index: usize,
     inline_nodes: Vec<(usize, Node)>,
-    previous_flow_bottom_margin: Option<f32>,
+    previous_flow_bottom_margin: Option<PendingAdjoiningMargin>,
     seen_flow_child: bool,
     pending_end_margin_collapse: Option<BlockEndMarginCollapse>,
     float_run: FloatRunState,
@@ -190,6 +191,15 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 Some(style),
             ));
+            if child_style.float.layout_role() == FloatLayoutRole::Footnote {
+                // A GCPM footnote contributes its generated call to this
+                // inline source run. The detached body is installed in the
+                // page-level footnote map and must never enter CSS float
+                // placement or ordinary block dispatch.
+                // <https://www.w3.org/TR/css-gcpm-3/#footnotes>
+                state.inline_nodes.push((child_node_index, child.clone()));
+                continue;
+            }
             if traversal_state.is_exhausted()
                 && !traversal_state.admits_zero_height_automatic_child(&child_style)
                 && (style_is_in_normal_flow(&child_style) || child_style.float != Float::None)
@@ -200,7 +210,7 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://drafts.csswg.org/css-overflow-4/#continue>
                 continue;
             }
-            if child_style.float != Float::None {
+            if child_style.float.layout_role() == FloatLayoutRole::Exclusion {
                 let has_later_inline_or_block_source = element.children[child_node_index + 1..]
                     .iter()
                     .any(|node| matches!(&node.kind, NodeKind::Text(text) if !text.trim().is_empty()))
@@ -669,21 +679,96 @@ impl<'a> LayoutBuilder<'a> {
             }
 
             let collapsible_block_child = is_collapsible_block_child(child_element, &child_style);
+            let mut child_ancestors = self.ancestors.clone();
+            child_ancestors.push(child_signature.clone());
+            let margin_collapse_style = height_behaves_as_auto_for_margin_collapse(
+                &child_style,
+                self.block_percentage_context_stack
+                    .current_percentage_basis(),
+            )
+            .then(|| {
+                let mut style = child_style.clone();
+                style
+                    .box_values
+                    .height
+                    .replace_with_used(css::ComputedLengthPercentageOrAuto::Auto);
+                style
+            });
+            let margin_collapse_style = margin_collapse_style.as_ref().unwrap_or(&child_style);
+            let self_collapsing_child = collapsible_block_child
+                && !self.has_in_flow_marker_line(child_element, &child_style)
+                && is_self_collapsing_block_dom_with_font_metrics(
+                    child_element,
+                    margin_collapse_style,
+                    stylesheets,
+                    &child_ancestors,
+                    &mut self.font_system,
+                    self.document_canvas_overflow,
+                );
+            let descendant_start_margin = (collapsible_block_child
+                && can_collapse_block_start_margin(
+                    child_element,
+                    &child_style,
+                    UsedEdges::from_css_edges(used_border_widths(&child_style)),
+                    has_direct_inline_content_before_first_flow_child_dom_with_font_metrics(
+                        child_element,
+                        &child_style,
+                        stylesheets,
+                        &child_ancestors,
+                        &mut self.font_system,
+                    ),
+                    self.used_overflow_for_element(child_element, &child_style),
+                ))
+            .then(|| {
+                collapsible_first_child_start_margin_dom_with_font_metrics(
+                    child_element,
+                    &child_style,
+                    stylesheets,
+                    &child_ancestors,
+                    &mut self.font_system,
+                    self.document_canvas_overflow,
+                )
+            })
+            .flatten();
+            let self_collapsing_margin_set = self_collapsing_child.then(|| {
+                self_collapsing_block_margin_set_for_box(&child_style, descendant_start_margin)
+            });
+            if let Some(set) = self_collapsing_margin_set {
+                child_style.margin.top = set.collapsed().points();
+                child_style.margin.bottom = 0.0;
+            }
             let mut collapses_with_parent_end = false;
+            let mut continued_self_collapsing_margin = None;
             if collapsible_block_child {
                 if !state.seen_flow_child && can_collapse_start_margin {
-                    child_style.margin.top = collapsed_start_margin_delta(
-                        applied_start_margin,
-                        layout_pt(child_style.margin.top),
-                        starts_at_page_top,
-                    )
-                    .points();
+                    if let Some(set) = self_collapsing_margin_set {
+                        let (pending, delta) = PendingAdjoiningMargin::from_parent_start_set(
+                            applied_start_margin,
+                            set,
+                            starts_at_page_top,
+                        );
+                        child_style.margin.top = delta.points();
+                        continued_self_collapsing_margin = Some(pending);
+                    } else {
+                        child_style.margin.top = collapsed_start_margin_delta(
+                            applied_start_margin,
+                            layout_pt(child_style.margin.top),
+                            starts_at_page_top,
+                        )
+                        .points();
+                    }
                 } else if let Some(previous_margin) = state.previous_flow_bottom_margin {
-                    child_style.margin.top = collapsed_margin_delta(
-                        layout_pt(previous_margin),
-                        layout_pt(child_style.margin.top),
-                    )
-                    .points();
+                    child_style.margin.top = if let Some(set) = self_collapsing_margin_set {
+                        let mut pending = previous_margin;
+                        let delta = pending.merge_set(set);
+                        continued_self_collapsing_margin = Some(pending);
+                        delta.points()
+                    } else {
+                        let mut pending = previous_margin;
+                        pending
+                            .merge_margin(layout_pt(child_style.margin.top))
+                            .points()
+                    };
                 }
 
                 collapses_with_parent_end = can_collapse_end_margin
@@ -882,23 +967,46 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             let child_consumed_bottom_margin = if child_uses_block_layout {
-                self.last_block_layout_outcome
-                    .consumed_bottom_margin
-                    .points()
+                self.last_block_layout_outcome.consumed_bottom_margin
             } else {
-                child_style.margin.bottom
+                layout_pt(child_style.margin.bottom)
+            };
+            if self_collapsing_child && child_uses_block_layout {
+                // This traversal has already consumed the child's complete
+                // adjoining set at its start edge. A transparent descendant
+                // can report the same set as its block-end margin; keep that
+                // value for propagation, but remove its duplicate cursor
+                // contribution from the zero-height principal box.
+                // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+                self.cursor_y += child_consumed_bottom_margin.points();
+            }
+            let next_pending_margin = if self_collapsing_child {
+                Some(continued_self_collapsing_margin.unwrap_or_else(|| {
+                    PendingAdjoiningMargin::from_consumed_set(
+                        self_collapsing_margin_set
+                            .expect("a self-collapsing child has a complete adjoining set"),
+                    )
+                }))
+            } else {
+                collapsible_block_child.then(|| {
+                    PendingAdjoiningMargin::from_consumed_margin(child_consumed_bottom_margin)
+                })
             };
             if collapses_with_parent_end {
+                let collapsed_margin = next_pending_margin
+                    .map(|pending| pending.collapsed_with_margin(layout_pt(style.margin.bottom)))
+                    .unwrap_or_else(|| {
+                        collapse_margins(
+                            child_consumed_bottom_margin,
+                            layout_pt(style.margin.bottom),
+                        )
+                    });
                 state.pending_end_margin_collapse = Some(BlockEndMarginCollapse {
-                    child_consumed_margin: layout_pt(child_consumed_bottom_margin),
-                    collapsed_margin: collapse_margins(
-                        layout_pt(child_consumed_bottom_margin),
-                        layout_pt(style.margin.bottom),
-                    ),
+                    child_consumed_margin: child_consumed_bottom_margin,
+                    collapsed_margin,
                 });
             }
-            state.previous_flow_bottom_margin =
-                collapsible_block_child.then_some(child_consumed_bottom_margin);
+            state.previous_flow_bottom_margin = next_pending_margin;
             state.previous_child_page_end = Some(child_page_values.end);
         }
 

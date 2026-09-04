@@ -2,8 +2,8 @@ use super::super::{
     BlockAutoWidthRole, BlockContentWidthInputs, BlockSizeBasisSource, ComputedStyle,
     DescendantBlockPercentageContext, DisplayInner, Element, ElementSignature, Float, FloatContext,
     FloatId, FloatPlacementAxes, FloatShape, IntrinsicBlockBasis,
-    IntrinsicInlinePercentageBasisSource, LayoutBuilder, NodeKind, PageInlineSpan,
-    PageTopBlockPosition, PageTopRect, PercentageBasis, PhysicalContentHeight,
+    IntrinsicInlinePercentageBasisSource, LayoutBuilder, LogicalInlineContentSize, NodeKind,
+    PageInlineSpan, PageTopBlockPosition, PageTopRect, PercentageBasis, PhysicalContentHeight,
     PhysicalContentWidth, Position, ReplacedBoxSizingContext, SemanticLengthExt, Stylesheets,
     UsedFloatSide, WritingMode, apply_used_box_metrics, box_tree, constrain_content_height,
     constrain_content_width, constrain_height_with_intrinsic, constrain_width_with_intrinsic,
@@ -14,10 +14,11 @@ use super::super::{
     inline_text_from_formatting_boxes, intrinsic, is_replaced_element, layout_pt,
     margin_box_size_pt, needs_intrinsic_height_contribution, needs_intrinsic_width_contribution,
     own_inline_text_for_style, resolve_replaced_element, used_border_widths, used_box_metrics,
-    used_content_box_height_or_auto, used_content_box_size_with_basis,
-    used_content_box_width_or_auto, used_length_percentage, used_max_height, used_min_height,
-    used_property_containment,
+    used_content_box_height_or_auto, used_content_box_height_or_auto_with_basis,
+    used_content_box_size_with_basis, used_content_box_width_or_auto, used_length_percentage,
+    used_max_height, used_min_height, used_property_containment,
 };
+use super::IntrinsicBlockContributionRequest;
 use super::float::{freeze_float_replay_height, freeze_float_replay_width};
 
 impl<'a> LayoutBuilder<'a> {
@@ -64,7 +65,73 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
         } else {
-            if style.display.is_table() {
+            if style.display.is_flex() || style.display.is_grid() {
+                let mut used_style = self.style_with_current_used_lengths(style);
+                let box_metrics = apply_used_box_metrics(
+                    &mut used_style,
+                    PercentageBasis::definite(layout_pt(available_outer_width.max(0.0))),
+                );
+                let horizontal_non_content = box_metrics.horizontal_non_content_length();
+                let vertical_non_content = box_metrics.vertical_non_content_length();
+                let content_width = used_content_box_width_or_auto(
+                    &used_style,
+                    layout_pt(available_outer_width),
+                    horizontal_non_content,
+                )
+                .unwrap_or_else(|| {
+                    content_box_pt(
+                        (available_outer_width - horizontal_non_content.points()).max(0.0),
+                    )
+                });
+                let percentage_basis = self
+                    .block_percentage_context_stack
+                    .current_percentage_basis();
+                let intrinsic = self.intrinsic_block_contribution(
+                    element,
+                    &used_style,
+                    stylesheets,
+                    IntrinsicBlockContributionRequest {
+                        available_inline_size: LogicalInlineContentSize::new(content_width),
+                        descendant_percentage_basis: percentage_basis,
+                        child_boxes,
+                    },
+                );
+                let requested_content_height = used_content_box_height_or_auto_with_basis(
+                    &used_style,
+                    percentage_basis,
+                    vertical_non_content,
+                )
+                .unwrap_or(intrinsic.content_box_length());
+                let height_depends_on_intrinsic_content = needs_intrinsic_height_contribution(
+                    used_style.box_values.height.value().clone(),
+                ) || needs_intrinsic_height_contribution(
+                    used_style.box_values.min_height.clone(),
+                ) || needs_intrinsic_height_contribution(
+                    used_style.box_values.max_height.clone(),
+                );
+                let content_height = if height_depends_on_intrinsic_content {
+                    constrain_height_with_intrinsic(
+                        &used_style,
+                        requested_content_height,
+                        intrinsic.content_box_length(),
+                        intrinsic.content_box_length(),
+                        percentage_basis,
+                        vertical_non_content,
+                    )
+                } else {
+                    constrain_content_height(
+                        &used_style,
+                        requested_content_height,
+                        percentage_basis,
+                    )
+                };
+                Some(
+                    used_style.margin.top
+                        + vertical_non_content.points()
+                        + content_height.points()
+                        + used_style.margin.bottom,
+                )
+            } else if style.display.is_table() {
                 let built_child_boxes;
                 let table_children = if let Some(children) = child_boxes {
                     children

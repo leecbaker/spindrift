@@ -1452,6 +1452,8 @@ impl<'a> LayoutBuilder<'a> {
                 self.document_canvas_overflow,
             );
             return self_collapsing_block_margin_set_for_box(style, descendant_start_margin)
+                .collapsed()
+                .points()
                 .max(0.0);
         }
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
@@ -1902,6 +1904,8 @@ impl<'a> LayoutBuilder<'a> {
                 self.document_canvas_overflow,
             );
             return self_collapsing_block_margin_set_for_box(style, descendant_start_margin)
+                .collapsed()
+                .points()
                 .max(0.0);
         }
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
@@ -2274,8 +2278,5 @@ fn table_cell_self_collapsing_block_margin(
     }
     let descendant_start_margin =
         collapsible_first_child_start_margin_from_boxes(children, element, style, overflow_context);
-    Some(layout_pt(self_collapsing_block_margin_set_for_box(
-        style,
-        descendant_start_margin,
-    )))
+    Some(self_collapsing_block_margin_set_for_box(style, descendant_start_margin).collapsed())
 }

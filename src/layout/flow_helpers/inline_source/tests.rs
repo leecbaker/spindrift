@@ -248,4 +248,68 @@ mod source_classification_tests {
             &mut font_system,
         ));
     }
+
+    #[tokio::test]
+    async fn footnote_sources_are_inline_calls_not_css_exclusion_floats() {
+        let stylesheet = css::parse_stylesheet(&css::Css::from_string(
+            ".hidden { display: none } \
+             .flow { display: block } \
+             .float { float: left } \
+             .note { float: footnote }",
+        ));
+        let stylesheets = Stylesheets::for_document(
+            css::html5_user_agent_stylesheet(),
+            None,
+            std::slice::from_ref(&stylesheet),
+        );
+        let parent_style = test_parent_style();
+        let mut font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(&stylesheets)
+            .finish()
+            .await;
+
+        let hidden_then_block = dom::parse(
+            "<div><span class=\"hidden\">hidden</span><span class=\"flow\"></span></div>",
+        );
+        let parent =
+            first_element_by_tag(&hidden_then_block, "div").expect("expected hidden parent");
+        assert!(!has_ordered_mixed_flow_content_with_font_metrics(
+            parent,
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        ));
+
+        let directional = dom::parse("<div><span class=\"float\">float</span></div>");
+        let parent = first_element_by_tag(&directional, "div").expect("expected float parent");
+        assert!(has_direct_float_only_source_with_font_metrics(
+            parent,
+            &parent_style,
+            &stylesheets,
+            &mut font_system,
+        ));
+
+        for source in [
+            "<div><span class=\"note\">note</span></div>",
+            "<div><span class=\"note\">note</span><span class=\"flow\"></span></div>",
+            "<div><span class=\"flow\"></span><span class=\"note\">note</span></div>",
+        ] {
+            let document = dom::parse(source);
+            let parent = first_element_by_tag(&document, "div").expect("expected footnote parent");
+            assert!(has_ordered_mixed_flow_content_with_font_metrics(
+                parent,
+                &parent_style,
+                &stylesheets,
+                &[],
+                &mut font_system,
+            ));
+            assert!(!has_direct_float_only_source_with_font_metrics(
+                parent,
+                &parent_style,
+                &stylesheets,
+                &mut font_system,
+            ));
+        }
+    }
 }

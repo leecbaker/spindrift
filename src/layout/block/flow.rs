@@ -18,5 +18,6 @@ pub(in crate::layout) use self::children::state::{
 };
 pub(in crate::layout) use self::fragmentation::*;
 pub(in crate::layout) use self::geometry::*;
+pub(in crate::layout) use self::intrinsic::IntrinsicBlockContributionRequest;
 pub(in crate::layout) use self::margin_collapse::*;
 pub(in crate::layout) use self::phase::*;

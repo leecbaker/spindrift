@@ -800,6 +800,25 @@ impl FlowAxes {
         }
     }
 
+    /// Project physical content-box sizes onto the logical block axis.
+    ///
+    /// Formatting-context algorithms such as Flexbox expose physical results
+    /// at their backend boundary. Intrinsic sizing consumes a logical block
+    /// contribution, so the inverse Writing Modes projection belongs here
+    /// rather than at each caller.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+    pub(in crate::layout) fn logical_block_from_physical_content_sizes(
+        self,
+        width: PhysicalContentWidth,
+        height: PhysicalContentHeight,
+    ) -> LogicalBlockContentSize {
+        if self.axes.swaps_physical_axes() {
+            LogicalBlockContentSize::new(width.content_box_length())
+        } else {
+            LogicalBlockContentSize::new(height.content_box_length())
+        }
+    }
+
     pub(super) fn rect_from_logical(
         self,
         containing: ContainerRect,

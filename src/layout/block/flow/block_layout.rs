@@ -1769,6 +1769,15 @@ impl<'a> LayoutBuilder<'a> {
                 .iter()
                 .chain(style.after_style.iter())
                 .any(|pseudo| pseudo.content.is_generated());
+        let requires_suppressed_dom_source_collection = !has_generated_content
+            && child_boxes.is_none_or(has_non_inline_formatting_box)
+            && requires_suppressed_dom_source_collection_with_font_metrics(
+                element,
+                style,
+                stylesheets,
+                &self.ancestors,
+                &mut self.font_system,
+            );
         let ordered_mixed_flow_required = !has_generated_content
             // Root pseudos are tree-abiding children. The ordered DOM path
             // has no pseudo source entries, so it would drop a block-level
@@ -1786,6 +1795,7 @@ impl<'a> LayoutBuilder<'a> {
                     &self.ancestors,
                     &mut self.font_system,
                 ))
+                || requires_suppressed_dom_source_collection
                 // Formatting-tree normalization stores direct `<br>` nodes
                 // outside the block-child sequence. When a block also has
                 // normal-flow children, replaying all direct inline content

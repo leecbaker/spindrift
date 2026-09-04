@@ -478,10 +478,10 @@ mod block_end_margin_trim_tests {
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
 pub(in crate::layout) fn discard_consumed_adjoining_block_end_margin(
     layout: &mut LayoutBuilder<'_>,
-    previous_margin: Option<f32>,
+    previous_margin: Option<PendingAdjoiningMargin>,
 ) {
     if let Some(margin) = previous_margin.filter(|_| !layout.cursor_is_at_page_top()) {
-        layout.cursor_y += margin;
+        layout.cursor_y += margin.applied().points();
     }
 }
 

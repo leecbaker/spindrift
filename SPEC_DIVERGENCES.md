@@ -1119,8 +1119,9 @@ Primary references:
   explicit min/max block constraint are propagated through intrinsic replaced
   sizing.
   <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
-- Divergence: exact child-height estimates are incomplete for flex items with
-  column, complex multicolumn, or deeply nested descendants.
+- Divergence: exact child-height estimates remain incomplete for flex items
+  with complex multicolumn layout or deeply nested mixed-writing-mode and
+  fragmented descendants.
   <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
 - Divergence: flex intrinsic sizing may diverge from browser behavior if the
   CSS Flexbox draft's web-compatible intrinsic sizing algorithm differs from

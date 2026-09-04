@@ -255,14 +255,14 @@ pub(in crate::layout) fn has_direct_float_only_source_with_font_metrics(
                     Some(parent_style),
                     &[],
                 );
-                if style.float != Float::None {
-                    has_float = true;
-                } else if style.display.is_none()
+                if style.display.is_none()
                     || matches!(style.position, Position::Absolute | Position::Fixed)
                 {
                     continue;
-                } else {
-                    return false;
+                }
+                match style.float.layout_role() {
+                    FloatLayoutRole::Exclusion => has_float = true,
+                    FloatLayoutRole::None | FloatLayoutRole::Footnote => return false,
                 }
             }
         }
@@ -324,6 +324,49 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_font_metrics(
         ancestors,
         &mut resolver,
     )
+}
+
+/// Returns whether a direct suppressed subtree requires source-aware child
+/// collection even though it contributes neither inline nor block flow.
+///
+/// This is deliberately separate from mixed-flow classification: CSS Display
+/// removes `display: none` subtrees from box generation, but a traversal that
+/// falls back to flattened DOM text would resurrect their text. Keeping the
+/// traversal requirement distinct lets flow classification ignore the hidden
+/// content while still selecting a collector that observes its computed
+/// display.
+/// <https://www.w3.org/TR/css-display-3/#box-generation>
+pub(in crate::layout) fn requires_suppressed_dom_source_collection_with_font_metrics(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &Stylesheets<'_>,
+    ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let sibling_tags = element_sibling_signature_list(element);
+    let mut element_index = 0usize;
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+
+    element.children.iter().any(|child| {
+        let NodeKind::Element(child_element) = &child.kind else {
+            return false;
+        };
+        let signature = ElementSignature::with_sibling_list(
+            child_element.tag.clone(),
+            child_element.attrs.clone(),
+            element_index,
+            sibling_tags.clone(),
+        );
+        element_index += 1;
+        let child_style = resolver.style_for_element(
+            child_element,
+            signature,
+            stylesheets,
+            Some(parent_style),
+            ancestors,
+        );
+        child_style.display.is_none() && !inline_text(child_element).is_empty()
+    })
 }
 
 /// Returns whether direct-DOM block layout must materialize its child
@@ -721,6 +764,18 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                     Some(parent_style),
                     ancestors,
                 );
+                if child_style.display.is_none() {
+                    continue;
+                }
+                if child_style.float.layout_role() == FloatLayoutRole::Footnote {
+                    // A footnote contributes its generated inline call even
+                    // when it is the parent's only visible child. Route the
+                    // source through ordered inline collection so the call is
+                    // committed while the detached body stays out of the
+                    // principal block traversal.
+                    // <https://www.w3.org/TR/css-gcpm-3/#footnote-calls>
+                    return true;
+                }
                 if matches!(child_style.position, Position::Absolute | Position::Fixed) {
                     // Out-of-flow boxes retain source order only for static
                     // positioning. They do not contribute an in-flow
@@ -744,7 +799,7 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                 // inside an inline source run is collected as an inline
                 // marker by that run.
                 // <https://www.w3.org/TR/CSS22/visuren.html#floats>
-                let is_float_source = child_style.float != Float::None;
+                let is_float_source = child_style.float.layout_role() == FloatLayoutRole::Exclusion;
                 let is_normal_flow_child = is_normal_block_flow_child(child_element, &child_style)
                     // HTML table structure still needs source-order traversal
                     // around block siblings, but its computed outer display

@@ -1423,34 +1423,20 @@ fn layout_dom_with_font_system(
             builder.layout_page_box(page_box.as_ref(), stylesheets);
         } else {
             let initial_snapshot = builder.snapshot();
-            builder.install_footnotes(page_box.as_ref());
-            let initial_measurement =
-                builder.initial_single_footnote_measurement(page_box.as_ref());
-            builder.restore(initial_snapshot.clone());
-            // Obtain the first committed call assignment without painting.
-            // Each later render pass validates its own committed assignments,
-            // so a stable document takes one measure and one paint pass rather
-            // than a measure-only confirmation followed by a third full
-            // layout.  A changed assignment is rolled back and rendered again
-            // with its newly reserved page-local footnote area.
+            // First discover call ownership without reserving a footnote area.
+            // A call's page is a result of pagination and cannot be seeded on
+            // an arbitrary page: that reservation could itself change every
+            // later page assignment. Only measurements from committed lines
+            // in this unbiased traversal may initialize the fixed point.
             // <https://www.w3.org/TR/css-gcpm-3/#footnote-policy>
-            let (mut measurements, mut reservations) =
-                if let Some(measurement) = initial_measurement {
-                    let measurements = vec![measurement];
-                    let reservations =
-                        LayoutBuilder::footnote_reservations_from_measurements(&measurements);
-                    (measurements, reservations)
-                } else {
-                    builder.footnote_layout_mode = FootnoteLayoutMode::Measure;
-                    builder.footnote_reservations.clear();
-                    builder.footnote_measurements.clear();
-                    builder.layout_page_box(page_box.as_ref(), stylesheets);
-                    let measurements = std::mem::take(&mut builder.footnote_measurements);
-                    let reservations =
-                        LayoutBuilder::footnote_reservations_from_measurements(&measurements);
-                    builder.restore(initial_snapshot.clone());
-                    (measurements, reservations)
-                };
+            builder.footnote_layout_mode = FootnoteLayoutMode::Measure;
+            builder.footnote_reservations.clear();
+            builder.footnote_measurements.clear();
+            builder.layout_page_box(page_box.as_ref(), stylesheets);
+            let mut measurements = std::mem::take(&mut builder.footnote_measurements);
+            let mut reservations =
+                LayoutBuilder::footnote_reservations_from_measurements(&measurements);
+            builder.restore(initial_snapshot.clone());
 
             for attempt in 0..8 {
                 builder.footnote_layout_mode = FootnoteLayoutMode::Render;

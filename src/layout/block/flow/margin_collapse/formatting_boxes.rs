@@ -51,14 +51,14 @@ pub(in crate::layout) fn is_self_collapsing_block_box(
 
 pub(in crate::layout) fn self_collapsing_block_margin_set_for_box(
     style: &ComputedStyle,
-    descendant_start_margin: Option<f32>,
-) -> f32 {
-    let margins = [
-        Some(style.margin.top),
-        descendant_start_margin,
-        Some(style.margin.bottom),
-    ];
-    collapse_margin_set(margins.into_iter().flatten().map(layout_pt)).points()
+    descendant_start_margin: Option<AdjoiningMarginSet>,
+) -> AdjoiningMarginSet {
+    let mut set = AdjoiningMarginSet::from_margin(layout_pt(style.margin.top));
+    if let Some(descendant) = descendant_start_margin {
+        set.merge(descendant);
+    }
+    set.include(layout_pt(style.margin.bottom));
+    set
 }
 
 pub(in crate::layout) fn formatting_box_keeps_self_collapsing_parent(
@@ -102,7 +102,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_from_boxes(
     parent: &Element,
     parent_style: &ComputedStyle,
     overflow_context: DocumentCanvasResolution,
-) -> Option<f32> {
+) -> Option<AdjoiningMarginSet> {
     let mut has_preceding_css_float = false;
     for child_box in child_boxes {
         // An inline split context is transparent to the parent block's
@@ -163,7 +163,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_from_boxes(
             return None;
         }
         if parent_style.margin_trim.block_start {
-            return Some(0.0);
+            return Some(AdjoiningMarginSet::from_margin(layout_pt(0.0)));
         }
         return Some(collapsible_start_margin_for_box(
             child_element,
@@ -323,7 +323,7 @@ pub(in crate::layout) fn collapsible_start_margin_for_box(
     style: &ComputedStyle,
     child_boxes: &[box_tree::FormattingBox<'_>],
     overflow_context: DocumentCanvasResolution,
-) -> f32 {
+) -> AdjoiningMarginSet {
     if can_collapse_block_start_margin(
         element,
         style,
@@ -339,11 +339,11 @@ pub(in crate::layout) fn collapsible_start_margin_for_box(
         if is_self_collapsing_block_box(element, style, child_boxes, overflow_context) {
             return self_collapsing_block_margin_set_for_box(style, Some(descendant_margin));
         }
-        collapse_margins(layout_pt(style.margin.top), layout_pt(descendant_margin)).points()
+        AdjoiningMarginSet::from_margin(layout_pt(style.margin.top)).merged(descendant_margin)
     } else if is_self_collapsing_block_box(element, style, child_boxes, overflow_context) {
         self_collapsing_block_margin_set_for_box(style, None)
     } else {
-        style.margin.top
+        AdjoiningMarginSet::from_margin(layout_pt(style.margin.top))
     }
 }
 

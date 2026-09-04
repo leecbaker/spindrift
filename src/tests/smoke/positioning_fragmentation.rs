@@ -2670,6 +2670,63 @@ async fn sibling_after_transparent_wrapper_keeps_full_collapsed_start_margin() {
     assert_line_baseline_at_top(&document, line, 160.0);
 }
 
+/// CSS 2.2 §8.3.1 keeps every margin adjoining through a zero-height block in
+/// one set. Mixed-sign margins therefore contribute their extrema once, no
+/// matter how many empty siblings occur between line boxes.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[tokio::test]
+async fn empty_siblings_preserve_one_complete_mixed_sign_margin_set() {
+    let style = "<style>@page { size: 200pt 160pt; margin: 0 } body { margin: 0 } .group { font-size: 11px; line-height: 1.5 } p { margin: 8.25px 0 -5.5px; line-height: 1 }</style>";
+
+    for (case, normalization_trigger) in [
+        ("direct DOM flow", ""),
+        (
+            "frozen formatting-box flow",
+            "<span><div style=\"display:none\"></div></span>",
+        ),
+    ] {
+        let document = Html::from_string(format!(
+            "{style}<div class=group><p>Alpha</p><p></p><p>Beta</p><p></p><p></p><p>Gamma</p>{normalization_trigger}</div>"
+        ))
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+        let lines = document.pages[0].lines();
+        let alpha = lines.iter().find(|line| line.text == "Alpha").unwrap();
+        let beta = lines.iter().find(|line| line.text == "Beta").unwrap();
+        let gamma = lines.iter().find(|line| line.text == "Gamma").unwrap();
+
+        assert!(
+            (alpha.y() - beta.y() - 10.3125).abs() < 0.01,
+            "{case}: one empty block changed the collapsed baseline gap: {lines:?}"
+        );
+        assert!(
+            (beta.y() - gamma.y() - 10.3125).abs() < 0.01,
+            "{case}: multiple empty blocks accumulated collapsed spacing: {lines:?}"
+        );
+    }
+}
+
+/// An inline run followed by block children selects ordered mixed flow, the
+/// path used by the case-leader section in `request_ancestry.html`.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[tokio::test]
+async fn ordered_mixed_flow_preserves_empty_sibling_margin_extrema() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 160pt; margin: 0 } body { margin: 0 } .group { font-size: 11px; line-height: .5 } p { margin: 8.25px 0 -5.5px; line-height: 1 }</style><div class=group><strong>Heading</strong><p>Alpha</p><p></p><p>Beta</p><p></p><p></p><p>Gamma</p></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let lines = document.pages[0].lines();
+    let alpha = lines.iter().find(|line| line.text == "Alpha").unwrap();
+    let beta = lines.iter().find(|line| line.text == "Beta").unwrap();
+    let gamma = lines.iter().find(|line| line.text == "Gamma").unwrap();
+
+    assert!((alpha.y() - beta.y() - 10.3125).abs() < 0.01, "{lines:?}");
+    assert!((beta.y() - gamma.y() - 10.3125).abs() < 0.01, "{lines:?}");
+}
+
 #[tokio::test]
 async fn collapses_first_descendant_top_margin_through_transparent_wrappers() {
     let style = "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 } .previous { height: 1pt; margin-bottom: 6pt } .wrapper { margin: 0 } p { margin: 0; margin-top: 15pt; font-size: 10pt; line-height: 10pt }</style>";

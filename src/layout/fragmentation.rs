@@ -1851,6 +1851,42 @@ mod tests {
     }
 
     #[test]
+    fn page_transition_policy_distinguishes_coalesced_and_preserved_empty_sources() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+
+        builder.push_page();
+        assert_eq!(builder.pages.len(), 0, "ordinary empty pages coalesce");
+
+        builder.push_page_preserving_empty_fragmentainer();
+        assert_eq!(
+            builder.pages.len(),
+            1,
+            "a selected structural transition preserves its empty source"
+        );
+    }
+
+    #[test]
+    fn empty_avoid_run_retry_materializes_its_proven_larger_destination() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let retry_context = AvoidRunRetryContext {
+            current_fragmentainer: fragmentainer(100.0, 80.0),
+            empty_destination_fragmentainer: fragmentainer(120.0, 120.0),
+            source_occupancy: AvoidRunSourceFragmentainerOccupancy::Empty,
+        };
+
+        assert!(retry_context.can_advance());
+        builder.materialize_avoid_run_retry(FragmentainerKind::Page, retry_context);
+
+        assert_eq!(builder.pages.len(), 1);
+    }
+
+    #[test]
     fn fragmentainer_advance_leaves_nonmaterialized_cursor_unchanged() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();

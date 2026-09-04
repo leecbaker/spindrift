@@ -8,33 +8,14 @@ pub(in crate::layout) fn collapse_margins(
     first: LayoutLength,
     second: LayoutLength,
 ) -> LayoutLength {
-    let first = first.points();
-    let second = second.points();
-    layout_pt(if first >= 0.0 && second >= 0.0 {
-        first.max(second)
-    } else if first <= 0.0 && second <= 0.0 {
-        first.min(second)
+    let zero = layout_pt(0.0);
+    if first >= zero && second >= zero {
+        if first >= second { first } else { second }
+    } else if first <= zero && second <= zero {
+        if first <= second { first } else { second }
     } else {
         first + second
-    })
-}
-
-/// Collapses an adjoining set of vertical margins.
-///
-/// CSS 2.2 collapses an adjoining margin set to the maximum positive margin
-/// plus the minimum negative margin. This differs from pairwise collapsing
-/// when a set contains more than two mixed-sign margins.
-///
-/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
-/// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>
-pub(in crate::layout) fn collapse_margin_set(
-    margins: impl IntoIterator<Item = LayoutLength>,
-) -> LayoutLength {
-    let mut set = AdjoiningMarginSet::new();
-    for margin in margins {
-        set.include(margin);
     }
-    set.collapsed()
 }
 
 /// A complete adjoining set of CSS block-axis margins.
@@ -45,7 +26,7 @@ pub(in crate::layout) fn collapse_margin_set(
 /// transparent descendants and self-collapsing siblings contribute later
 /// margins to the same set.
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(in crate::layout) struct AdjoiningMarginSet {
     greatest_positive: LayoutLength,
     most_negative: LayoutLength,
@@ -82,13 +63,101 @@ impl AdjoiningMarginSet {
     pub(in crate::layout) fn collapsed(self) -> LayoutLength {
         self.greatest_positive + self.most_negative
     }
+
+    pub(in crate::layout) fn merged(mut self, other: Self) -> Self {
+        self.merge(other);
+        self
+    }
+
+    pub(in crate::layout) fn with_margin(mut self, margin: LayoutLength) -> Self {
+        self.include(margin);
+        self
+    }
+}
+
+/// A complete adjoining sibling-margin set and the part already applied to
+/// the block-flow cursor.
+///
+/// Block layout consumes margins eagerly, while CSS requires every margin
+/// adjoining through a self-collapsing block to be resolved as one set. Keep
+/// the extrema independently from the cursor contribution so a later margin
+/// can revise the collapsed result without losing mixed-sign provenance.
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::layout) struct PendingAdjoiningMargin {
+    set: AdjoiningMarginSet,
+    applied: LayoutLength,
+}
+
+impl PendingAdjoiningMargin {
+    pub(in crate::layout) fn from_consumed_margin(margin: LayoutLength) -> Self {
+        Self {
+            set: AdjoiningMarginSet::from_margin(margin),
+            applied: margin,
+        }
+    }
+
+    pub(in crate::layout) fn from_consumed_set(set: AdjoiningMarginSet) -> Self {
+        Self {
+            set,
+            applied: set.collapsed(),
+        }
+    }
+
+    /// Start a pending set at a transparent parent's block-start edge.
+    ///
+    /// The returned delta is local to the parent's content traversal, while
+    /// `applied` includes the margin already consumed when positioning the
+    /// parent itself. Keeping both views prevents an only self-collapsing
+    /// child from applying its start margin again at the parent's block-end.
+    /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+    pub(in crate::layout) fn from_parent_start_set(
+        parent_applied: LayoutLength,
+        child_set: AdjoiningMarginSet,
+        starts_at_page_top: bool,
+    ) -> (Self, LayoutLength) {
+        let set = child_set.with_margin(parent_applied);
+        let applied = page_start_margin(set.collapsed(), starts_at_page_top);
+        (Self { set, applied }, applied - parent_applied)
+    }
+
+    pub(in crate::layout) fn applied(self) -> LayoutLength {
+        self.applied
+    }
+
+    /// Add a margin that is already represented by the current cursor
+    /// position, as happens when a parent start margin joins a transparent
+    /// first-child chain.
+    pub(in crate::layout) fn with_consumed_margin(mut self, margin: LayoutLength) -> Self {
+        self.set.include(margin);
+        self.applied = self.set.collapsed();
+        self
+    }
+
+    /// Merge another adjoining set and return only the additional cursor
+    /// contribution required by the new complete collapsed result.
+    pub(in crate::layout) fn merge_set(&mut self, next: AdjoiningMarginSet) -> LayoutLength {
+        self.set.merge(next);
+        let collapsed = self.set.collapsed();
+        let delta = collapsed - self.applied;
+        self.applied = collapsed;
+        delta
+    }
+
+    pub(in crate::layout) fn merge_margin(&mut self, next: LayoutLength) -> LayoutLength {
+        self.merge_set(AdjoiningMarginSet::from_margin(next))
+    }
+
+    pub(in crate::layout) fn collapsed_with_margin(self, next: LayoutLength) -> LayoutLength {
+        self.set.with_margin(next).collapsed()
+    }
 }
 
 pub(in crate::layout) fn page_start_margin(
     margin: LayoutLength,
     starts_at_page_top: bool,
 ) -> LayoutLength {
-    if starts_at_page_top && margin.points() > 0.0 {
+    if starts_at_page_top && margin > layout_pt(0.0) {
         layout_pt(0.0)
     } else {
         margin
@@ -101,14 +170,7 @@ pub(in crate::layout) fn collapsed_start_margin_delta(
     starts_at_page_top: bool,
 ) -> LayoutLength {
     let collapsed = collapse_margins(previous_applied, next);
-    layout_pt(page_start_margin(collapsed, starts_at_page_top).points() - previous_applied.points())
-}
-
-pub(in crate::layout) fn collapsed_margin_delta(
-    previous_applied: LayoutLength,
-    next: LayoutLength,
-) -> LayoutLength {
-    layout_pt(collapse_margins(previous_applied, next).points() - previous_applied.points())
+    page_start_margin(collapsed, starts_at_page_top) - previous_applied
 }
 
 /// The collapsed block-start margin set owned by one in-flow child.
@@ -123,7 +185,7 @@ pub(in crate::layout) fn collapsed_margin_delta(
 /// <https://www.w3.org/TR/CSS22/visuren.html#block-formatting>
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::layout) struct AdjoiningBlockStartMargin {
-    collapsed: LayoutLength,
+    set: AdjoiningMarginSet,
     descendant_deferred_to_child: LayoutLength,
 }
 
@@ -222,13 +284,14 @@ impl AdjoiningBlockStartMargin {
     /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
     pub(in crate::layout) fn from_child_and_descendant(
         child_margin: LayoutLength,
-        descendant_margin: Option<LayoutLength>,
+        descendant_margin: Option<AdjoiningMarginSet>,
     ) -> Self {
-        let collapsed = descendant_margin
-            .map(|descendant| collapse_margins(child_margin, descendant))
-            .unwrap_or(child_margin);
+        let set = descendant_margin
+            .map(|descendant| AdjoiningMarginSet::from_margin(child_margin).merged(descendant))
+            .unwrap_or_else(|| AdjoiningMarginSet::from_margin(child_margin));
+        let collapsed = set.collapsed();
         Self {
-            collapsed,
+            set,
             // When the descendant is itself the collapsed result, leave that
             // contribution to the child's own start-margin pass. The sibling
             // delta must then cancel the preceding margin without consuming
@@ -236,17 +299,18 @@ impl AdjoiningBlockStartMargin {
             // this boundary because neither individual margin represents the
             // collapsed result.
             descendant_deferred_to_child: descendant_margin
+                .map(AdjoiningMarginSet::collapsed)
                 .filter(|descendant| *descendant == collapsed)
-                .unwrap_or_else(|| layout_pt(0.0)),
+                .unwrap_or_default(),
         }
     }
 
     /// Construct an already-collapsed set for a self-collapsing child.
     ///
     /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
-    pub(in crate::layout) fn from_collapsed(collapsed: LayoutLength) -> Self {
+    pub(in crate::layout) fn from_set(set: AdjoiningMarginSet) -> Self {
         Self {
-            collapsed,
+            set,
             descendant_deferred_to_child: layout_pt(0.0),
         }
     }
@@ -254,7 +318,7 @@ impl AdjoiningBlockStartMargin {
     /// Return the collapsed value for bookkeeping that continues the same
     /// adjoining margin set through later transparent boxes.
     pub(in crate::layout) fn value(self) -> LayoutLength {
-        self.collapsed
+        self.set.collapsed()
     }
 
     /// Return the child-local delta after the parent has consumed its
@@ -269,22 +333,15 @@ impl AdjoiningBlockStartMargin {
         parent_applied: LayoutLength,
         starts_at_page_top: bool,
     ) -> LayoutLength {
-        collapsed_start_margin_delta(parent_applied, self.collapsed, starts_at_page_top)
+        let collapsed = self.set.with_margin(parent_applied).collapsed();
+        page_start_margin(collapsed, starts_at_page_top) - parent_applied
     }
 
-    /// Return the child-local delta after a preceding sibling's adjoining
-    /// block-end margin. When a first descendant itself supplies the
-    /// collapsed value, defer that part to the child's own layout pass.
-    ///
-    /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
-    pub(in crate::layout) fn child_delta_after_sibling(
+    pub(in crate::layout) fn child_delta_after_pending_sibling(
         self,
-        previous_sibling_margin: LayoutLength,
+        mut previous: PendingAdjoiningMargin,
     ) -> LayoutLength {
-        layout_pt(
-            collapsed_margin_delta(previous_sibling_margin, self.collapsed).points()
-                - self.descendant_deferred_to_child.points(),
-        )
+        previous.merge_set(self.set) - self.descendant_deferred_to_child
     }
 }
 
@@ -302,17 +359,19 @@ pub(in crate::layout) fn trim_adjoining_block_start_margin(
     parent_style: &ComputedStyle,
     child_style: &mut ComputedStyle,
     is_first_flow_child: bool,
-    descendant_start_margin: Option<f32>,
+    descendant_start_margin: Option<AdjoiningMarginSet>,
 ) -> bool {
     if !parent_style.margin_trim.block_start || !is_first_flow_child {
         return false;
     }
     let adjoining_start_margin = descendant_start_margin
         .map(|descendant| {
-            collapse_margins(layout_pt(child_style.margin.top), layout_pt(descendant)).points()
+            AdjoiningMarginSet::from_margin(layout_pt(child_style.margin.top))
+                .merged(descendant)
+                .collapsed()
         })
-        .unwrap_or(child_style.margin.top);
-    child_style.margin.top -= adjoining_start_margin;
+        .unwrap_or_else(|| layout_pt(child_style.margin.top));
+    child_style.margin.top -= adjoining_start_margin.points();
     true
 }
 
@@ -328,6 +387,40 @@ mod tests {
         outer.merge(inner);
 
         assert_eq!(outer.collapsed(), layout_pt(10.0));
+    }
+
+    #[test]
+    fn pending_adjoining_margin_applies_only_changes_to_the_complete_set() {
+        let mut pending = PendingAdjoiningMargin::from_consumed_margin(layout_pt(-5.5));
+        let empty = AdjoiningMarginSet::from_margin(layout_pt(8.25)).with_margin(layout_pt(-5.5));
+
+        assert_eq!(pending.merge_set(empty), layout_pt(8.25));
+        assert_eq!(pending.applied(), layout_pt(2.75));
+        assert_eq!(pending.merge_set(empty), layout_pt(0.0));
+        assert_eq!(pending.merge_margin(layout_pt(8.25)), layout_pt(0.0));
+        assert_eq!(pending.applied(), layout_pt(2.75));
+
+        let mut positive = PendingAdjoiningMargin::from_consumed_margin(layout_pt(4.0));
+        assert_eq!(positive.merge_margin(layout_pt(8.0)), layout_pt(4.0));
+        assert_eq!(positive.applied(), layout_pt(8.0));
+
+        let mut negative = PendingAdjoiningMargin::from_consumed_margin(layout_pt(-3.0));
+        assert_eq!(negative.merge_margin(layout_pt(-9.0)), layout_pt(-6.0));
+        assert_eq!(negative.applied(), layout_pt(-9.0));
+
+        let mut zero = PendingAdjoiningMargin::from_consumed_margin(layout_pt(0.0));
+        assert_eq!(zero.merge_margin(layout_pt(0.0)), layout_pt(0.0));
+        assert_eq!(zero.applied(), layout_pt(0.0));
+
+        let parent_transparent_child =
+            AdjoiningMarginSet::from_margin(layout_pt(30.0)).with_margin(layout_pt(40.0));
+        let (pending, local_delta) = PendingAdjoiningMargin::from_parent_start_set(
+            layout_pt(40.0),
+            parent_transparent_child,
+            false,
+        );
+        assert_eq!(local_delta, layout_pt(0.0));
+        assert_eq!(pending.applied(), layout_pt(40.0));
     }
 
     fn inherited_margin() -> InheritedAdjoiningStartMargin {

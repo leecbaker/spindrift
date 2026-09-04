@@ -1,5 +1,20 @@
 use super::*;
 
+/// Whether a page transition may coalesce an empty source page into its
+/// destination.
+///
+/// Most fragmentation retries should reuse an empty page so an oversized box
+/// cannot manufacture an unbounded run of blank pages. A layout algorithm
+/// that has already proved its destination has strictly more usable capacity
+/// must instead preserve the empty source: coalescing would return it to the
+/// same smaller fragmentainer and repeat the selected break forever.
+/// <https://www.w3.org/TR/css-break-3/#breaking-rules>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyPageTransition {
+    Coalesce,
+    Preserve,
+}
+
 /// Continuation-local containing-block state, separate from the page selected
 /// for the destination fragmentainer.
 ///
@@ -22,7 +37,23 @@ pub(in crate::layout) struct FragmentContinuationContext {
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn push_page(&mut self) {
-        self.push_page_for_page_name(self.current_page_name.clone().as_deref());
+        self.push_page_for_page_name_with_empty_transition(
+            self.current_page_name.clone().as_deref(),
+            EmptyPageTransition::Coalesce,
+        );
+        self.record_current_fragmentainer_destination();
+    }
+
+    /// Materialize a selected page transition even when its source has no
+    /// content. Break authorization belongs to the fragmentation algorithm;
+    /// this method only prevents ordinary empty-page coalescing from undoing
+    /// that decision.
+    /// <https://www.w3.org/TR/css-break-3/#breaking-rules>
+    pub(in crate::layout) fn push_page_preserving_empty_fragmentainer(&mut self) {
+        self.push_page_for_page_name_with_empty_transition(
+            self.current_page_name.clone().as_deref(),
+            EmptyPageTransition::Preserve,
+        );
         self.record_current_fragmentainer_destination();
     }
 
@@ -39,6 +70,17 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn push_page_for_page_name(
         &mut self,
         destination_page_name: Option<&str>,
+    ) {
+        self.push_page_for_page_name_with_empty_transition(
+            destination_page_name,
+            EmptyPageTransition::Coalesce,
+        );
+    }
+
+    fn push_page_for_page_name_with_empty_transition(
+        &mut self,
+        destination_page_name: Option<&str>,
+        empty_transition: EmptyPageTransition,
     ) {
         if self.footnote_measurement_depth == 0 {
             self.flush_current_page_footnotes();
@@ -80,14 +122,21 @@ impl<'a> LayoutBuilder<'a> {
             });
             let context = next_override_context.unwrap_or_else(|| {
                 self.resolved_page_context_for_name(
-                    self.destination_document_page_number(self.pages.len() + 1),
+                    self.destination_document_page_number(
+                        self.pages.len()
+                            + match empty_transition {
+                                EmptyPageTransition::Coalesce => 1,
+                                EmptyPageTransition::Preserve => 2,
+                            },
+                    ),
                     false,
                     destination_page_name,
                 )
             });
             let advances_to_larger_fragmentainer = self.fragmentainer_override.is_some()
                 && context.area_height() > self.current_page_context.area_height() + 0.01;
-            if advances_to_larger_fragmentainer {
+            if empty_transition == EmptyPageTransition::Preserve || advances_to_larger_fragmentainer
+            {
                 let next_page = page_for_context(context);
                 let page = std::mem::replace(&mut self.current_page, next_page);
                 self.current_page_has_flow_content = false;

@@ -11,26 +11,6 @@ impl<'a> LayoutBuilder<'a> {
             .collect();
     }
 
-    /// Provides an initial fixed-point reservation for a document with one
-    /// detached body. The first page is only a seed: render validates the
-    /// committed call assignment and retries from the document boundary if it
-    /// belongs on a different page.
-    pub(in crate::layout) fn initial_single_footnote_measurement(
-        &mut self,
-        page_box: &box_tree::PageBox<'a>,
-    ) -> Option<FootnoteMeasurement> {
-        let [footnote] = page_box.footnotes.as_slice() else {
-            return None;
-        };
-        let area = self.footnote_area_geometry(0);
-        Some(FootnoteMeasurement {
-            element: footnote.element.id,
-            page_index: 0,
-            area_vertical_non_content: area.vertical_non_content,
-            height: self.measure_footnote_height(footnote, area.content_inline_span),
-        })
-    }
-
     /// Assign a footnote to the fragmentainer that committed its call line.
     ///
     /// CSS GCPM footnote calls participate in inline layout, so collection and

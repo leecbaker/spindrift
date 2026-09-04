@@ -279,7 +279,7 @@ impl FirstInFlowChildState {
 pub(in crate::layout) struct AvoidBreakRunCandidateMeta {
     pub(in crate::layout) index: usize,
     pub(in crate::layout) element_index: usize,
-    pub(in crate::layout) previous_flow_bottom_margin: Option<f32>,
+    pub(in crate::layout) previous_flow_bottom_margin: Option<PendingAdjoiningMargin>,
     pub(in crate::layout) seen_flow_child: FirstInFlowChildState,
     pub(in crate::layout) trim_block_start_adjoining_margins: bool,
     pub(in crate::layout) collapsed_end_margin: bool,
@@ -481,7 +481,7 @@ impl AvoidBreakRunCandidate {
 pub(in crate::layout) struct AdjoiningFloatReplayCandidateMeta {
     pub(in crate::layout) index: usize,
     pub(in crate::layout) element_index: usize,
-    pub(in crate::layout) previous_flow_bottom_margin: Option<f32>,
+    pub(in crate::layout) previous_flow_bottom_margin: Option<PendingAdjoiningMargin>,
     pub(in crate::layout) seen_flow_child: FirstInFlowChildState,
     pub(in crate::layout) trim_block_start_adjoining_margins: bool,
     pub(in crate::layout) collapsed_end_margin: bool,
@@ -607,6 +607,34 @@ pub(in crate::layout) fn should_move_avoid_break_run_to_next_fragmentainer(
 }
 
 impl LayoutBuilder<'_> {
+    /// Materialize an avoid-constrained sibling run's selected destination.
+    ///
+    /// [`AvoidRunRetryContext::can_advance`] is the authority for whether an
+    /// empty source may advance: it compares the actual fragmentainer
+    /// capacities, including a page-local footnote reservation. Once that
+    /// decision is made, page materialization must preserve the empty source
+    /// rather than folding the destination back into the smaller page.
+    /// <https://www.w3.org/TR/css-break-3/#break-between>
+    pub(in crate::layout) fn materialize_avoid_run_retry(
+        &mut self,
+        fragmentainer_kind: FragmentainerKind,
+        retry_context: AvoidRunRetryContext,
+    ) {
+        debug_assert!(retry_context.can_advance());
+        match retry_context.source_occupancy {
+            AvoidRunSourceFragmentainerOccupancy::Empty => match fragmentainer_kind {
+                FragmentainerKind::Page => self.push_page_preserving_empty_fragmentainer(),
+                FragmentainerKind::Column => self.materialize_column_continuation(),
+            },
+            AvoidRunSourceFragmentainerOccupancy::Occupied => {
+                let _ = self.materialize_fragmentainer_advance(
+                    fragmentainer_kind,
+                    FragmentainerAdvance::Unforced,
+                );
+            }
+        }
+    }
+
     /// Return the empty destination selected by the next unforced break.
     ///
     /// The initial anonymous multicolumn fragmentainer can be shorter than

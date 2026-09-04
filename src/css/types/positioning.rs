@@ -51,6 +51,33 @@ pub(crate) enum Float {
     Footnote,
 }
 
+/// The layout subsystem selected by a computed `float` value.
+///
+/// Directional floats create CSS 2.2 exclusions, while GCPM footnotes are
+/// extracted into a page footnote area and leave only their generated call in
+/// normal flow. Keeping that distinction explicit prevents generic float
+/// traversal from treating a rejected footnote placement as an ordinary box.
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>
+/// <https://www.w3.org/TR/css-gcpm-3/#footnotes>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FloatLayoutRole {
+    None,
+    Exclusion,
+    Footnote,
+}
+
+impl Float {
+    pub(crate) const fn layout_role(self) -> FloatLayoutRole {
+        match self {
+            Self::None => FloatLayoutRole::None,
+            Self::Left | Self::Right | Self::InlineStart | Self::InlineEnd => {
+                FloatLayoutRole::Exclusion
+            }
+            Self::Footnote => FloatLayoutRole::Footnote,
+        }
+    }
+}
+
 /// Computed `clear` value.
 ///
 /// CSS 2.2 defines clearance as moving a box below prior left and/or right

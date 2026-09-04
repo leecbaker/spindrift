@@ -13,6 +13,20 @@ pub(in crate::layout) struct BlockIntrinsicContentSizes {
     block_size_at_max_inline: LogicalBlockContentSize,
 }
 
+/// Inputs for a formatting context's intrinsic logical block contribution.
+///
+/// The inline measure and descendant percentage basis are layout constraints,
+/// while the frozen boxes are the normalized source used by final layout.
+/// Keeping the request at this boundary lets Flex, Grid, Table, replaced
+/// elements, and ordinary flow retain ownership of their layout semantics.
+/// <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution>
+/// <https://www.w3.org/TR/css-display-3/#formatting-context>
+pub(in crate::layout) struct IntrinsicBlockContributionRequest<'boxes, 'dom> {
+    pub(in crate::layout) available_inline_size: LogicalInlineContentSize,
+    pub(in crate::layout) descendant_percentage_basis: BlockSizePercentageBasis,
+    pub(in crate::layout) child_boxes: Option<&'boxes [box_tree::FormattingBox<'dom>]>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +310,165 @@ fn normal_flow_border_box_inline_span_in_containing_axes(
 }
 
 impl<'a> LayoutBuilder<'a> {
+    /// Return this box's intrinsic content-box contribution in its logical
+    /// block axis, dispatching through the box's formatting context.
+    ///
+    /// CSS Sizing asks the formatting context that owns the box to determine
+    /// its intrinsic contribution. A flex row therefore contributes its line
+    /// cross size, a grid contributes its block tracks, and a table contributes
+    /// its wrapper rather than being reinterpreted as an ordinary block stack.
+    /// Box-model edges remain outside this result and are added exactly once by
+    /// the containing formatting context.
+    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution>
+    /// <https://www.w3.org/TR/css-display-3/#formatting-context>
+    pub(in crate::layout) fn intrinsic_block_contribution(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        request: IntrinsicBlockContributionRequest<'_, '_>,
+    ) -> LogicalBlockContentSize {
+        if used_property_containment(element, style).size {
+            return LogicalBlockContentSize::new(content_box_pt(0.0));
+        }
+
+        let (available_physical_width, _) = FlowAxes::for_style(style).physical_size(
+            Some(request.available_inline_size.content_box_length()),
+            None,
+        );
+        let available_physical_width = PhysicalContentWidth::new(
+            available_physical_width.unwrap_or_else(|| content_box_pt(0.0)),
+        );
+
+        if style.display.is_flex() {
+            return self.estimate_flex_intrinsic_block_contribution(
+                element,
+                style,
+                stylesheets,
+                request.available_inline_size,
+                request.descendant_percentage_basis,
+                request.child_boxes,
+            );
+        }
+        if style.display.is_grid() {
+            let (_, block_size) = self.estimate_grid_intrinsic_block_sizes(
+                element,
+                style,
+                stylesheets,
+                available_physical_width.points(),
+                request.child_boxes,
+            );
+            return LogicalBlockContentSize::new(content_box_pt(block_size.max(0.0)));
+        }
+        if style.display.is_table() {
+            let built_child_boxes;
+            let child_boxes = if let Some(child_boxes) = request.child_boxes {
+                child_boxes
+            } else {
+                built_child_boxes = self.build_frozen_child_boxes_with_current_ancestors(
+                    element,
+                    stylesheets,
+                    style,
+                );
+                &built_child_boxes
+            };
+            let signature = self
+                .ancestors
+                .last()
+                .cloned()
+                .unwrap_or_else(|| element_signature(element));
+            let fragment =
+                box_tree::build_frozen_table_fragment(element, &signature, style, child_boxes);
+            return self
+                .table_wrapper_flex_sizing_from_fragment(
+                    element,
+                    style,
+                    stylesheets,
+                    &fragment,
+                    available_physical_width.points(),
+                )
+                .wrapper_intrinsic_block;
+        }
+        if let Some(replaced) = resolve_replaced_element(
+            element,
+            style,
+            ReplacedBoxSizingContext {
+                available_width: available_physical_width.content_box_length(),
+                inline_percentage_basis: PercentageBasis::definite_from(
+                    request.available_inline_size.content_box_length(),
+                    IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
+                ),
+                block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
+                    request.descendant_percentage_basis,
+                ),
+            },
+            self.base_url,
+            self.root_url,
+            self.resource_cache,
+        ) {
+            let content_size = replaced.geometry().content_size;
+            return FlowAxes::for_style(style).logical_block_from_physical_content_sizes(
+                PhysicalContentWidth::new(content_box_pt(content_size.width)),
+                PhysicalContentHeight::new(content_box_pt(content_size.height)),
+            );
+        }
+
+        if style.writing_mode.has_vertical_lines() {
+            return self.block_logical_block_size_at_inline_size(
+                element,
+                style,
+                stylesheets,
+                request.child_boxes,
+                request.available_inline_size,
+                // This legacy scalar is the containing box's percentage
+                // measure, not the box's physical width. In vertical writing
+                // it remains the logical inline size (physical height).
+                request.available_inline_size.points(),
+            );
+        }
+
+        let mut intrinsic_style = style.clone();
+        intrinsic_style.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(
+                request.available_inline_size.points().max(0.0),
+            ),
+        );
+        intrinsic_style.box_values.min_width = css::ComputedLengthPercentageOrAuto::Auto;
+        intrinsic_style.box_values.max_width = css::ComputedLengthPercentageOrAuto::Auto;
+        intrinsic_style
+            .box_values
+            .height
+            .replace_with_used(css::ComputedLengthPercentageOrAuto::Auto);
+        intrinsic_style.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
+        intrinsic_style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
+
+        let mut used_style = self.style_with_current_used_lengths(&intrinsic_style);
+        let box_metrics = apply_used_box_metrics_for_logical_inline_basis(
+            &mut used_style,
+            PercentageBasis::definite(request.available_inline_size),
+        );
+        self.block_percentage_context_stack
+            .push_percentage_basis(request.descendant_percentage_basis);
+        let outer_height = self.estimate_block_like_height(
+            element,
+            &intrinsic_style,
+            stylesheets,
+            request.available_inline_size.points(),
+            request.child_boxes,
+        );
+        self.block_percentage_context_stack.pop();
+        LogicalBlockContentSize::new(content_box_pt(
+            (outer_height
+                - used_style.margin.top
+                - box_metrics.border.top.points()
+                - used_style.padding.top
+                - used_style.padding.bottom
+                - box_metrics.border.bottom.points()
+                - used_style.margin.bottom)
+                .max(0.0),
+        ))
+    }
+
     pub(in crate::layout) fn translate_aligned_block_descendant_bookmarks(
         &mut self,
         descendant_bookmark_start: usize,
@@ -1233,13 +1406,21 @@ impl<'a> LayoutBuilder<'a> {
             else {
                 continue;
             };
+            let mut used_child_style = self.style_with_current_used_lengths(child_style);
+            let child_metrics = apply_used_box_metrics_for_logical_inline_basis(
+                &mut used_child_style,
+                PercentageBasis::definite(LogicalInlineContentSize::new(
+                    parent_logical_inline_measure
+                        .unwrap_or_else(|| content_box_pt(available_outer_width.max(0.0))),
+                )),
+            );
+            let child_style = &used_child_style;
             if !child_style.display.is_block_level()
                 || child_style.float != Float::None
                 || matches!(child_style.position, Position::Absolute | Position::Fixed)
             {
                 continue;
             }
-            let metrics = intrinsic_box_metrics(child_style);
             let physical_width_percentage_basis =
                 if writing_modes_are_orthogonal(style.writing_mode, child_style.writing_mode) {
                     self.current_child_available_space()
@@ -1272,7 +1453,7 @@ impl<'a> LayoutBuilder<'a> {
                 child_style.box_values.width.clone(),
                 child_style.box_sizing,
                 PercentageBasis::definite(content_box_pt(physical_width_percentage_basis)),
-                metrics.horizontal_non_content_length(),
+                child_metrics.horizontal_non_content_length(),
             )
             .map(SemanticLengthExt::points);
             let child_width = specified_width
@@ -1289,9 +1470,9 @@ impl<'a> LayoutBuilder<'a> {
                     .points()
                 });
             block_size += child_width
-                + metrics.horizontal_non_content_length().points()
-                + metrics.margin.left.points()
-                + metrics.margin.right.points();
+                + child_metrics.horizontal_non_content_length().points()
+                + child_metrics.margin.left.points()
+                + child_metrics.margin.right.points();
         }
         block_size
     }

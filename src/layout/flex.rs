@@ -122,6 +122,64 @@ impl<'a> LayoutBuilder<'a> {
         )
     }
 
+    /// Estimate a flex formatting context's intrinsic logical block
+    /// contribution at a selected logical inline measure.
+    ///
+    /// Flexbox owns the line formation, main/cross projection, wrapping,
+    /// alignment, and gap arithmetic. Exposing the resulting content-box size
+    /// through the shared intrinsic boundary prevents an ancestor from
+    /// reinterpreting flex items as an ordinary vertical block stack.
+    /// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+    pub(in crate::layout) fn estimate_flex_intrinsic_block_contribution(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &Stylesheets<'_>,
+        available_inline_size: LogicalInlineContentSize,
+        descendant_percentage_basis: BlockSizePercentageBasis,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+    ) -> LogicalBlockContentSize {
+        let built_child_boxes;
+        let child_boxes = if let Some(child_boxes) = child_boxes {
+            child_boxes
+        } else {
+            built_child_boxes =
+                self.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style);
+            &built_child_boxes
+        };
+        let container_signature = self.flex_container_signature(element);
+        let children = flex_children_from_boxes(element, &container_signature, style, child_boxes);
+        let axes = FlowAxes::for_style(style);
+        let (available_width, available_height) =
+            axes.physical_size(Some(available_inline_size.content_box_length()), None);
+        let available_width =
+            PhysicalContentWidth::new(available_width.unwrap_or_else(|| content_box_pt(0.0)));
+        let available_height = available_height.map(PhysicalContentHeight::new);
+        let intrinsic = self.estimate_intrinsic_flex_container_size(
+            &children,
+            style,
+            stylesheets,
+            FlexAvailableSpace {
+                width: available_width,
+                width_basis: flex_available_percentage_basis(
+                    (!style.writing_mode.has_vertical_lines())
+                        .then_some(available_width.content_box_length()),
+                    FlexAvailableSizeSource::IntrinsicContainerSize,
+                ),
+                height: available_height,
+                height_basis: flex_available_percentage_basis(
+                    descendant_percentage_basis.value(),
+                    FlexAvailableSizeSource::IntrinsicContainerSize,
+                ),
+            },
+        );
+        axes.logical_block_from_physical_content_sizes(
+            PhysicalContentWidth::new(intrinsic.metrics.content_width),
+            PhysicalContentHeight::new(intrinsic.metrics.content_height),
+        )
+    }
+
     /// Measure a floated flex container's used margin-box height after the
     /// float algorithm has resolved its used inline size.
     ///

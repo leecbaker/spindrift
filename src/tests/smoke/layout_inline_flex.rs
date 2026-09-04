@@ -7674,6 +7674,153 @@ async fn flex_min_content_block_size_uses_wrapped_graph_fragments() {
 }
 
 #[tokio::test]
+async fn nested_row_flex_intrinsic_block_contribution_uses_line_cross_size() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 160pt; margin: 10pt } body { margin: 0 }\
+         .outer { display:flex; flex-direction:column; width:120pt }\
+         .nested { display:flex; flex-direction:row; background:red }\
+         .a { width:30pt; height:20pt } .b { width:30pt; height:30pt }\
+         .marker { width:10pt; height:10pt; background:green }</style>\
+         <div class=\"outer\"><div class=\"nested\"><div class=\"a\"></div><div class=\"b\"></div></div><div class=\"marker\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let nested = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .unwrap();
+    assert!(
+        (nested.height() - 30.0).abs() < 0.01,
+        "a row flex contribution is its largest line cross-size, not the sum of its items: {nested:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_nested_row_flex_projects_intrinsic_block_to_physical_width() {
+    let document = Html::from_string(
+        "<style>@page { size:180pt 180pt; margin:10pt } body { margin:0 }\
+         .outer { writing-mode:vertical-rl; display:flex; flex-direction:column; height:120pt }\
+         .nested { display:flex; flex-direction:row; background:red }\
+         .a { width:20pt; height:30pt } .b { width:30pt; height:30pt }</style>\
+         <div class=\"outer\"><div class=\"nested\"><div class=\"a\"></div><div class=\"b\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let nested = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .unwrap();
+    assert!(
+        (nested.width() - 30.0).abs() < 0.01,
+        "vertical writing must project the flex line cross-size onto physical width: {nested:?}"
+    );
+}
+
+#[tokio::test]
+async fn nested_column_flex_intrinsic_block_contribution_sums_items_and_gap_once() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 180pt; margin: 10pt } body { margin: 0 }\
+         .outer { display:flex; flex-direction:column; width:120pt }\
+         .nested { display:flex; flex-direction:column; gap:5pt; background:red }\
+         .a { height:20pt } .b { height:30pt }</style>\
+         <div class=\"outer\"><div class=\"nested\"><div class=\"a\"></div><div class=\"b\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let nested = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .unwrap();
+    assert!(
+        (nested.height() - 55.0).abs() < 0.01,
+        "a column flex contribution should contain both items and one gap: {nested:?}"
+    );
+}
+
+#[tokio::test]
+async fn table_inside_flow_wrapper_is_not_counted_as_text_and_wrapper_height() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 160pt; margin: 10pt } body { margin:0; font-size:10pt; line-height:10pt }\
+         .outer { display:flex; flex-direction:column; width:120pt }\
+         .wrapper { background:red } table { border-spacing:0 } td { height:20pt; padding:0 }\
+         .marker { width:10pt; height:10pt; background:green }</style>\
+         <div class=\"outer\"><div class=\"wrapper\"><table><tr><td>cell</td></tr></table></div><div class=\"marker\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let wrapper = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .unwrap();
+    assert!(
+        wrapper.height() >= 20.0 && wrapper.height() < 31.0,
+        "ordinary flow should consume only the table wrapper contribution: {wrapper:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_inside_flex_intrinsic_block_contribution_uses_row_tracks() {
+    let document = Html::from_string(
+        "<style>@page { size:180pt 160pt; margin:10pt } body { margin:0 }\
+         .outer { display:flex; flex-direction:column; width:120pt }\
+         .grid { display:grid; grid-template-columns:1fr 1fr; background:red }\
+         .a { height:20pt } .b { height:30pt }</style>\
+         <div class=\"outer\"><div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let grid = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
+        .unwrap();
+    assert!(
+        (grid.height() - 30.0).abs() < 0.01,
+        "grid contribution should follow its single row track rather than stack its columns: {grid:?}"
+    );
+}
+
+#[tokio::test]
+async fn compact_request_sex_row_does_not_inflate_following_marker() {
+    let document = Html::from_string(
+        "<style>@page { size:240pt 240pt; margin:10pt } body { margin:0; font-size:10pt; line-height:12pt }\
+         .report { display:flex; flex-direction:column; width:200pt }\
+         .analysis { padding-bottom:4pt } .content { display:flex; flex-direction:row; gap:8pt }\
+         table { width:100pt; border-spacing:0 } td { padding:0; height:18pt }\
+         .diagrams { display:flex; flex-direction:column; gap:4pt; width:80pt }\
+         svg { width:80pt } .marker { width:10pt; height:10pt; background:green }</style>\
+         <div class=\"report\"><div class=\"analysis\"><div class=\"content\"><table><tr><td>Sample</td></tr><tr><td>Result</td></tr></table><div class=\"diagrams\"><svg viewBox=\"0 0 2 1\"></svg><svg viewBox=\"0 0 2 1\"></svg></div></div></div><div class=\"marker\"></div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let marker = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+        .unwrap();
+    assert!(
+        marker.y() > 125.0 && marker.y() < 140.0,
+        "the table and ratio-only diagram row should contribute its used flex height once: {marker:?}"
+    );
+}
+
+#[tokio::test]
 async fn direct_inline_replaced_row_height_uses_graph_atomic_metrics() {
     let document = Html::from_string(
         "<style>@page { size: 180pt 140pt; margin: 10pt } body { margin: 0; font-size: 10pt; line-height: 10pt }\

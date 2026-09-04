@@ -7,7 +7,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_font_metr
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
     overflow_context: DocumentCanvasResolution,
-) -> Option<f32> {
+) -> Option<AdjoiningMarginSet> {
     let mut resolver = DomStyleResolver::with_font_system(font_system);
     collapsible_first_child_start_margin_dom_with_resolver(
         element,
@@ -26,7 +26,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
     overflow_context: DocumentCanvasResolution,
-) -> Option<f32> {
+) -> Option<AdjoiningMarginSet> {
     let sibling_tags = element_sibling_signature_list(element);
     let mut element_index = 0usize;
     let mut has_preceding_css_float = false;
@@ -80,7 +80,7 @@ pub(in crate::layout) fn collapsible_first_child_start_margin_dom_with_resolver(
             return None;
         }
         if parent_style.margin_trim.block_start {
-            return Some(0.0);
+            return Some(AdjoiningMarginSet::from_margin(layout_pt(0.0)));
         }
         let mut child_ancestors = ancestors.to_vec();
         child_ancestors.push(signature);
@@ -238,7 +238,7 @@ pub(in crate::layout) fn collapsible_start_margin_dom_with_resolver(
     ancestors: &[ElementSignature],
     resolver: &mut DomStyleResolver<'_>,
     overflow_context: DocumentCanvasResolution,
-) -> f32 {
+) -> AdjoiningMarginSet {
     if can_collapse_block_start_margin(
         element,
         style,
@@ -269,7 +269,7 @@ pub(in crate::layout) fn collapsible_start_margin_dom_with_resolver(
         ) {
             return self_collapsing_block_margin_set_for_box(style, Some(descendant_margin));
         }
-        collapse_margins(layout_pt(style.margin.top), layout_pt(descendant_margin)).points()
+        AdjoiningMarginSet::from_margin(layout_pt(style.margin.top)).merged(descendant_margin)
     } else if is_self_collapsing_block_dom_with_resolver(
         element,
         style,
@@ -280,7 +280,7 @@ pub(in crate::layout) fn collapsible_start_margin_dom_with_resolver(
     ) {
         self_collapsing_block_margin_set_for_box(style, None)
     } else {
-        style.margin.top
+        AdjoiningMarginSet::from_margin(layout_pt(style.margin.top))
     }
 }
 
@@ -774,8 +774,10 @@ mod tests {
     fn margin_collapse_keeps_signed_layout_lengths_typed() {
         let mixed: LayoutLength = collapse_margins(layout_pt(12.0), layout_pt(-4.0));
         let negative: LayoutLength = collapse_margins(layout_pt(-3.0), layout_pt(-9.0));
-        let set: LayoutLength =
-            collapse_margin_set([layout_pt(8.0), layout_pt(-3.0), layout_pt(5.0)]);
+        let set: LayoutLength = AdjoiningMarginSet::from_margin(layout_pt(8.0))
+            .with_margin(layout_pt(-3.0))
+            .with_margin(layout_pt(5.0))
+            .collapsed();
 
         assert_eq!(mixed, layout_pt(8.0));
         assert_eq!(negative, layout_pt(-9.0));

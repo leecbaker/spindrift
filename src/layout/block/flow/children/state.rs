@@ -8,7 +8,8 @@ use crate::document::paint::geometry::{PaintPoint, PaintRect, PaintSize};
 use crate::layout::block::flow::fragmentation::FirstInFlowChildState;
 use crate::layout::{
     BlockEndMarginCollapse, BlockMarginCollapseBoundary, FirstFormattedLineState, FloatRunState,
-    LayoutLength, LayoutSnapshot, style_establishes_multicol_formatting_context,
+    LayoutLength, LayoutSnapshot, PendingAdjoiningMargin,
+    style_establishes_multicol_formatting_context,
 };
 use crate::units::{ContentBoxLength, SemanticLengthExt, content_box_pt, layout_pt};
 
@@ -21,7 +22,7 @@ use crate::units::{ContentBoxLength, SemanticLengthExt, content_box_pt, layout_p
 /// <https://drafts.csswg.org/css-overflow-4/#line-clamp-containers>
 pub(in crate::layout) struct AutomaticBlockSizeReplayState {
     pub(in crate::layout) snapshot: LayoutSnapshot,
-    pub(in crate::layout) previous_flow_bottom_margin: Option<f32>,
+    pub(in crate::layout) previous_flow_bottom_margin: Option<PendingAdjoiningMargin>,
     pub(in crate::layout) seen_flow_child: FirstInFlowChildState,
     pub(in crate::layout) trim_block_start_adjoining_margins: bool,
     pub(in crate::layout) collapsed_end_margin: bool,

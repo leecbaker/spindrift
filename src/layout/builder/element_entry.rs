@@ -95,6 +95,11 @@ impl<'a> LayoutBuilder<'a> {
         capture_principal_effect_context: bool,
         principal_box_paint_mode: PrincipalBoxPaintMode,
     ) {
+        debug_assert_ne!(
+            style.float.layout_role(),
+            FloatLayoutRole::Footnote,
+            "principal-flow dispatch must retain only a footnote call; detached bodies use a Float::None layout style"
+        );
         // Most formatting contexts dispatch principal children directly to
         // this common boundary instead of through `layout_element_box`.
         // Consume any non-painting GCPM source event at that same source-order

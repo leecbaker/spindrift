@@ -725,15 +725,15 @@ impl<'a> LayoutBuilder<'a> {
                 )
             });
             let adjoining_start_margin = self_collapsing_margin_set
-                .map(|collapsed| AdjoiningBlockStartMargin::from_collapsed(layout_pt(collapsed)))
+                .map(AdjoiningBlockStartMargin::from_set)
                 .unwrap_or_else(|| {
                     AdjoiningBlockStartMargin::from_child_and_descendant(
                         layout_pt(child_style.margin.top),
-                        collapsed_descendant_start_margin.map(layout_pt),
+                        collapsed_descendant_start_margin,
                     )
                 });
-            if let Some(collapsed_margin) = self_collapsing_margin_set {
-                child_style.margin.top = collapsed_margin;
+            if let Some(set) = self_collapsing_margin_set {
+                child_style.margin.top = set.collapsed().points();
                 child_style.margin.bottom = 0.0;
             }
             // A self-collapsing final child joins its start and end margins
@@ -764,6 +764,7 @@ impl<'a> LayoutBuilder<'a> {
             let mut collapses_with_parent_end = false;
             let mut adjoining_start_margin_paint_offset = None;
             let mut inherited_adjoining_start_margin = None;
+            let mut continued_self_collapsing_margin = None;
             if is_flow_child {
                 let collapses_with_parent = is_collapsible_block_child(child_element, &child_style);
                 let collapses_with_sibling =
@@ -820,7 +821,29 @@ impl<'a> LayoutBuilder<'a> {
                         ));
                 }
                 if adjoins_parent_start {
-                    if let Some(previous_margin) = previous_flow_bottom_margin {
+                    if self_collapsing_child {
+                        let (delta, pending) = if let Some(previous_margin) =
+                            previous_flow_bottom_margin
+                        {
+                            let mut pending =
+                                previous_margin.with_consumed_margin(applied_start_margin);
+                            let delta = pending
+                                .merge_set(self_collapsing_margin_set.expect(
+                                    "a self-collapsing child has a complete adjoining set",
+                                ));
+                            (delta, pending)
+                        } else {
+                            let (pending, delta) = PendingAdjoiningMargin::from_parent_start_set(
+                                applied_start_margin,
+                                self_collapsing_margin_set
+                                    .expect("a self-collapsing child has a complete adjoining set"),
+                                starts_at_page_top,
+                            );
+                            (delta, pending)
+                        };
+                        child_style.margin.top = delta.points();
+                        continued_self_collapsing_margin = Some(pending);
+                    } else if let Some(previous_margin) = previous_flow_bottom_margin {
                         // An earlier self-collapsing sibling has
                         // already contributed its adjoining margin at
                         // the parent start. Merge that contribution with the
@@ -829,10 +852,9 @@ impl<'a> LayoutBuilder<'a> {
                         // wrapper must not discard the ancestor margin in
                         // this same collapsed set.
                         child_style.margin.top = adjoining_start_margin
-                            .child_delta_after_sibling(collapse_margins(
-                                applied_start_margin,
-                                layout_pt(previous_margin),
-                            ))
+                            .child_delta_after_pending_sibling(
+                                previous_margin.with_consumed_margin(applied_start_margin),
+                            )
                             .points();
                     } else {
                         child_style.margin.top = adjoining_start_margin
@@ -846,9 +868,16 @@ impl<'a> LayoutBuilder<'a> {
                         .is_none()
                     && let Some(previous_margin) = previous_flow_bottom_margin
                 {
-                    child_style.margin.top = adjoining_start_margin
-                        .child_delta_after_sibling(layout_pt(previous_margin))
-                        .points();
+                    child_style.margin.top = if let Some(set) = self_collapsing_margin_set {
+                        let mut pending = previous_margin;
+                        let delta = pending.merge_set(set);
+                        continued_self_collapsing_margin = Some(pending);
+                        delta.points()
+                    } else {
+                        adjoining_start_margin
+                            .child_delta_after_pending_sibling(previous_margin)
+                            .points()
+                    };
                 }
                 // A first child's adjoining positive margin lies outside the
                 // parent's border box, unless actual clearance separates the
@@ -991,18 +1020,7 @@ impl<'a> LayoutBuilder<'a> {
                 child_box_index = index;
                 avoid_run_candidate = None;
                 previous_break_after = PageBreak::Auto;
-                // A retry from an empty source is permitted only when the
-                // destination fragmentainer is larger. Restoring that source
-                // also restores its empty temporary fragmentainer, so the ordinary
-                // conditional transition would be a no-op and re-run the
-                // exact same avoid boundary forever. Materialize the larger
-                // destination fragmentainer before replaying the run.
-                // <https://www.w3.org/TR/css-break-3/#breaking-rules>
-                if retry_context.source_occupancy == AvoidRunSourceFragmentainerOccupancy::Empty {
-                    self.push_page();
-                } else {
-                    self.push_page_if_nonempty();
-                }
+                self.materialize_avoid_run_retry(fragmentainer_kind, retry_context);
                 continue;
             }
             let closes_adjoining_float_replay = is_flow_child
@@ -1630,11 +1648,9 @@ impl<'a> LayoutBuilder<'a> {
                         BlockMarginCollapseBoundary::SeparatedByClearance;
                 }
                 let child_consumed_bottom_margin = if child_uses_block_layout {
-                    self.last_block_layout_outcome
-                        .consumed_bottom_margin
-                        .points()
+                    self.last_block_layout_outcome.consumed_bottom_margin
                 } else {
-                    child_style.margin.bottom
+                    layout_pt(child_style.margin.bottom)
                 };
                 previous_flow_bottom_margin = if orthogonal_block_placement.is_some() {
                     // This traversal cursor is physical top-to-bottom, but
@@ -1647,29 +1663,27 @@ impl<'a> LayoutBuilder<'a> {
                     // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
                     None
                 } else if trims_self_collapsing_end_margin_set {
-                    Some(0.0)
+                    Some(PendingAdjoiningMargin::from_consumed_margin(layout_pt(0.0)))
                 } else if self_collapsing_child {
                     Some(if trimmed_block_start_margin {
-                        0.0
+                        PendingAdjoiningMargin::from_consumed_margin(layout_pt(0.0))
                     } else if child_start_separated_by_clearance {
                         // CSS2 clearance separates the box's top margin from
                         // its own bottom margin and from its parent. Its
                         // bottom margin may still adjoin a following sibling.
-                        child_consumed_bottom_margin
+                        PendingAdjoiningMargin::from_consumed_margin(child_consumed_bottom_margin)
                     } else {
-                        previous_flow_bottom_margin
-                            .map(|previous| {
-                                collapse_margins(
-                                    layout_pt(previous),
-                                    adjoining_start_margin.value(),
-                                )
-                                .points()
-                            })
-                            .unwrap_or(adjoining_start_margin.value().points())
+                        continued_self_collapsing_margin.unwrap_or_else(|| {
+                            PendingAdjoiningMargin::from_consumed_set(
+                                self_collapsing_margin_set
+                                    .expect("a self-collapsing child has a complete adjoining set"),
+                            )
+                        })
                     })
                 } else {
-                    outer_margins_adjoin_block_siblings(child_element, child_style)
-                        .then_some(child_consumed_bottom_margin)
+                    outer_margins_adjoin_block_siblings(child_element, child_style).then(|| {
+                        PendingAdjoiningMargin::from_consumed_margin(child_consumed_bottom_margin)
+                    })
                 };
                 if collapses_with_parent_end && !child_start_separated_by_clearance {
                     // A self-collapsing normal-flow child can have already
@@ -1680,19 +1694,28 @@ impl<'a> LayoutBuilder<'a> {
                     // margins through the BFC.
                     // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
                     // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
-                    let adjoining_end_margin = if self_collapsing_child
+                    let collapsed_margin = if self_collapsing_child
                         && !child_style.display.establishes_block_formatting_context()
                     {
-                        previous_flow_bottom_margin.unwrap_or(child_consumed_bottom_margin)
+                        previous_flow_bottom_margin
+                            .map(|pending| {
+                                pending.collapsed_with_margin(layout_pt(style.margin.bottom))
+                            })
+                            .unwrap_or_else(|| {
+                                collapse_margins(
+                                    child_consumed_bottom_margin,
+                                    layout_pt(style.margin.bottom),
+                                )
+                            })
                     } else {
-                        child_consumed_bottom_margin
+                        collapse_margins(
+                            child_consumed_bottom_margin,
+                            layout_pt(style.margin.bottom),
+                        )
                     };
                     pending_end_margin_collapse = Some(BlockEndMarginCollapse {
-                        child_consumed_margin: layout_pt(child_consumed_bottom_margin),
-                        collapsed_margin: collapse_margins(
-                            layout_pt(adjoining_end_margin),
-                            layout_pt(style.margin.bottom),
-                        ),
+                        child_consumed_margin: child_consumed_bottom_margin,
+                        collapsed_margin,
                     });
                 }
                 if child_uses_block_layout && child_shares_clamp_context {

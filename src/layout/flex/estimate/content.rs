@@ -1,11 +1,7 @@
 use super::*;
 use crate::layout::assets::PositionedAutoBlockMeasurementSpace;
+use crate::layout::block::IntrinsicBlockContributionRequest;
 use crate::units::{IntoLayoutLength, layout_to_content_box_length};
-
-pub(in crate::layout::flex) struct FlexMinContentBlockContainingSpace {
-    pub(in crate::layout::flex) inline_size: LogicalInlineContentSize,
-    pub(in crate::layout::flex) height_percentage_basis: BlockSizePercentageBasis,
-}
 
 /// Signed inline-axis extras added to a flex item's intrinsic content
 /// contribution. Margins may be negative, so this is deliberately not a
@@ -40,10 +36,6 @@ pub(super) struct FlexBlockStackContribution(LayoutLength);
 impl FlexBlockStackContribution {
     pub(super) fn zero() -> Self {
         Self(layout_pt(0.0))
-    }
-
-    pub(super) fn from_content_size(value: LogicalBlockContentSize) -> Self {
-        Self(value.content_box_length().into_layout_length())
     }
 
     pub(super) fn from_outer_extent(value: LayoutLength) -> Self {
@@ -480,223 +472,22 @@ impl<'a> LayoutBuilder<'a> {
             let containing_height_basis = layout
                 .block_percentage_context_stack
                 .current_percentage_basis();
-            layout.estimate_element_children_min_content_block_size(
+            let contribution = layout.intrinsic_block_contribution(
                 element,
                 &child.style,
                 stylesheets,
-                child_boxes,
-                FlexMinContentBlockContainingSpace {
-                    inline_size: containing_inline_size,
-                    height_percentage_basis: containing_height_basis,
+                IntrinsicBlockContributionRequest {
+                    available_inline_size: containing_inline_size,
+                    descendant_percentage_basis: containing_height_basis,
+                    child_boxes,
                 },
-                inline_content_height,
-            )
+            );
+            if contribution.points() >= inline_content_height.points() {
+                contribution
+            } else {
+                inline_content_height
+            }
         })
-    }
-
-    /// Recursively estimates descendant min-content block-size contributions.
-    ///
-    /// CSS Sizing's block-axis min-content contribution for normal block flow
-    /// is the sum of in-flow block child outer sizes, with inline runs measured
-    /// by graph-selected line fragments:
-    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>,
-    /// <https://www.w3.org/TR/css-inline-3/#line-box>, and
-    /// <https://www.w3.org/TR/CSS22/visudet.html#normal-block>.
-    pub(in crate::layout::flex) fn estimate_element_children_min_content_block_size(
-        &mut self,
-        element: &Element,
-        parent_style: &ComputedStyle,
-        stylesheets: &Stylesheets<'_>,
-        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-        containing_space: FlexMinContentBlockContainingSpace,
-        inline_content_height: LogicalBlockContentSize,
-    ) -> LogicalBlockContentSize {
-        if used_property_containment(element, parent_style).size {
-            return LogicalBlockContentSize::new(content_box_pt(0.0));
-        }
-        let mut block_size = FlexBlockStackContribution::from_content_size(inline_content_height);
-
-        if let Some(child_boxes) = child_boxes {
-            for child_box in child_boxes {
-                let Some((child_element, signature, child_style, child_children)) =
-                    child_box.element_parts()
-                else {
-                    continue;
-                };
-                if !flex_min_content_block_child_participates(
-                    child_element,
-                    child_style,
-                    self.element_uses_document_canvas_flow(child_element),
-                ) {
-                    continue;
-                }
-                let child_contribution =
-                    self.with_ancestor_signature(signature.clone(), |layout| {
-                        layout.flex_child_outer_min_content_block_size(
-                            child_element,
-                            child_style,
-                            stylesheets,
-                            Some(child_children),
-                            containing_space.inline_size,
-                            containing_space.height_percentage_basis,
-                        )
-                    });
-                block_size = block_size.plus(child_contribution);
-            }
-            return block_size.as_content_size();
-        }
-
-        let sibling_tags = element_sibling_signature_list(element);
-        let mut element_index = 0usize;
-        for node in &element.children {
-            let NodeKind::Element(child_element) = &node.kind else {
-                continue;
-            };
-            let signature = ElementSignature::with_sibling_list(
-                child_element.tag.clone(),
-                child_element.attrs.clone(),
-                element_index,
-                sibling_tags.clone(),
-            );
-            element_index += 1;
-            let child_style = self.style_for_layout_element_with_parent_font_metrics(
-                child_element,
-                signature.clone(),
-                stylesheets,
-                Some(parent_style),
-            );
-            if !flex_min_content_block_child_participates(
-                child_element,
-                &child_style,
-                self.element_uses_document_canvas_flow(child_element),
-            ) {
-                continue;
-            }
-            let child_contribution = self.with_ancestor_signature(signature, |layout| {
-                layout.flex_child_outer_min_content_block_size(
-                    child_element,
-                    &child_style,
-                    stylesheets,
-                    None,
-                    containing_space.inline_size,
-                    containing_space.height_percentage_basis,
-                )
-            });
-            block_size = block_size.plus(child_contribution);
-        }
-        block_size.as_content_size()
-    }
-
-    fn flex_child_outer_min_content_block_size(
-        &mut self,
-        child_element: &Element,
-        child_style: &ComputedStyle,
-        stylesheets: &Stylesheets<'_>,
-        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-        containing_inline_size: LogicalInlineContentSize,
-        containing_height_basis: BlockSizePercentageBasis,
-    ) -> FlexBlockStackContribution {
-        // Flex intrinsic estimation can visit a nested block before its
-        // ordinary formatting-context replay. Resolve viewport units at this
-        // page-context boundary so an explicit `height: 350vh` contributes
-        // its used monolithic extent instead of falling through to a zero
-        // intrinsic size.
-        // <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
-        // <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>
-        let child_style = self.style_with_current_viewport_lengths(child_style);
-        let child_inline_size = used_content_box_width_or_auto(
-            &child_style,
-            layout_pt(containing_inline_size.points()),
-            intrinsic_horizontal_non_content(&child_style, containing_inline_size),
-        )
-        .map(LogicalInlineContentSize::new)
-        .unwrap_or(containing_inline_size);
-        if let Some(replaced) = resolve_replaced_element(
-            child_element,
-            &child_style,
-            ReplacedBoxSizingContext {
-                available_width: containing_inline_size.content_box_length(),
-                inline_percentage_basis: PercentageBasis::definite_from(
-                    containing_inline_size.content_box_length(),
-                    IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
-                ),
-                block_basis: IntrinsicBlockBasis::from_layout_percentage_basis(
-                    containing_height_basis,
-                ),
-            },
-            self.base_url,
-            self.root_url,
-            self.resource_cache,
-        ) {
-            let geometry = replaced.geometry();
-            return FlexBlockStackContribution::from_outer_extent(layout_pt(
-                child_style.margin.top
-                    + geometry.border_box_size.height
-                    + child_style.margin.bottom,
-            ));
-        }
-        let vertical_non_content = non_content_pt(
-            child_style.padding.top
-                + child_style.padding.bottom
-                + vertical_border_width(&child_style),
-        );
-        let content_size = used_content_box_height_or_auto_with_basis(
-            &child_style,
-            containing_height_basis,
-            vertical_non_content,
-        )
-        .unwrap_or_else(|| {
-            if used_property_containment(child_element, &child_style).size {
-                // Size containment makes only an automatic intrinsic content
-                // contribution empty. A specified block size still resolves
-                // above, and this common constraint path still applies the
-                // child's min/max size and box-model edges.
-                // <https://www.w3.org/TR/css-contain-2/#size-containment>
-                return content_box_pt(0.0);
-            }
-            let inline_width =
-                (child_inline_size.points() - child_style.padding.left - child_style.padding.right)
-                    .max(1.0);
-            let inline_measurement = self.intrinsic_inline_measurement_for_element(
-                child_element,
-                &child_style,
-                stylesheets,
-                child_boxes,
-                inline_width,
-            );
-            self.estimate_element_children_min_content_block_size(
-                child_element,
-                &child_style,
-                stylesheets,
-                child_boxes,
-                FlexMinContentBlockContainingSpace {
-                    inline_size: child_inline_size,
-                    height_percentage_basis: PercentageBasis::indefinite(),
-                },
-                LogicalBlockContentSize::new(content_box_pt(
-                    inline_measurement.logical_block_span(&child_style),
-                )),
-            )
-            .content_box_length()
-        });
-        let constrained_content_size = constrain_flex_item_estimated_height(
-            &child_style,
-            content_size,
-            content_size,
-            content_size,
-            containing_height_basis,
-            vertical_non_content,
-        );
-        let border_widths = used_border_widths(&child_style);
-        FlexBlockStackContribution::from_outer_extent(layout_pt(
-            child_style.margin.top
-                + child_style.padding.top
-                + border_widths.top
-                + constrained_content_size.points()
-                + child_style.padding.bottom
-                + border_widths.bottom
-                + child_style.margin.bottom,
-        ))
     }
 
     /// Measure an auto-height flex item as block layout when its final
@@ -911,22 +702,6 @@ pub(in crate::layout::flex) fn intrinsic_horizontal_outer_edges(
             + metrics.margin.left.points()
             + metrics.margin.right.points(),
     ))
-}
-
-pub(in crate::layout::flex) fn flex_min_content_block_child_participates(
-    _element: &Element,
-    style: &ComputedStyle,
-    is_document_canvas_flow_element: bool,
-) -> bool {
-    !style.display.is_none()
-        && !matches!(style.position, Position::Absolute | Position::Fixed)
-        // Inline-level replaced elements (including `<br>`) already
-        // participate in the graph-selected inline line stack passed as
-        // `inline_content_height`. Adding them again here treats each inline
-        // line as a block child and double-counts its logical block advance,
-        // particularly in vertical writing modes.
-        // <https://www.w3.org/TR/css-display-3/#inlinify>
-        && (style.display.is_block_level() || is_document_canvas_flow_element)
 }
 
 pub(in crate::layout::flex) fn flex_item_child_boxes_include_float(

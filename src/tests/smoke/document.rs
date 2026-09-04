@@ -225,6 +225,214 @@ async fn gcpm_multiple_footnotes_keep_source_order_in_one_page_area() {
 }
 
 #[tokio::test]
+async fn late_single_footnote_does_not_reserve_space_on_the_first_page() {
+    let document = Html::from_string(
+        r#"<style>
+              @page { size: 200pt 200pt; margin: 20pt }
+              body { margin: 0; font: 10pt/10pt sans-serif }
+              .lead { height: 35pt }
+              .references { break-before: page; height: 30pt }
+              .note { float: footnote; height: 50pt }
+              .note::footnote-call, .note::footnote-marker {
+                content: "\a0"; font-size: 0; line-height: 0
+              }
+            </style>
+            <div class="lead">Lead 1</div>
+            <div class="lead">Lead 2</div>
+            <div class="lead">Lead 3</div>
+            <div class="lead">Lead 4</div>
+            <div class="references">References</div>
+            <div class="note">Disclaimer</div>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 2);
+    let page_text = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>();
+    assert!(!page_text[0].contains("References"), "pages={page_text:?}");
+    assert!(!page_text[0].contains("Disclaimer"), "pages={page_text:?}");
+    assert_eq!(page_text[1].matches("References").count(), 1);
+    assert_eq!(page_text[1].matches("Disclaimer").count(), 1);
+}
+
+async fn render_block_footnote_after_lead(lead_height: f32) -> crate::Document {
+    Html::from_string(format!(
+        r#"<!doctype html>
+            <html lang="en">
+              <head>
+                <style>
+                  @page {{
+                    size: 300pt 400pt;
+                    margin: 20pt;
+                    @footnote {{ margin: 0; background: #d8f5d0 }}
+                  }}
+                  html {{ font-family: sans-serif }}
+                  body {{ margin: 0; font-size: 10pt; line-height: 12pt }}
+                  .lead {{ height: {lead_height}pt; background: #e8eef8 }}
+                  .note {{
+                    float: footnote;
+                    display: block;
+                    width: 100%;
+                    margin: 0 0 10pt;
+                    background: #ffd6d6;
+                  }}
+                  .note::footnote-call, .note::footnote-marker {{
+                    content: "\a0";
+                    color: transparent;
+                    font-size: 0;
+                    line-height: 0;
+                  }}
+                </style>
+              </head>
+              <body>
+                <main class="lead">Preceding content</main>
+                <aside class="note">Disclaimer</aside>
+              </body>
+            </html>"#,
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn block_footnote_position_is_independent_of_its_source_cursor() {
+    let short = render_block_footnote_after_lead(40.0).await;
+    let long = render_block_footnote_after_lead(180.0).await;
+    let pink = CssColor::new(255, 214, 214);
+    let green = CssColor::new(216, 245, 208);
+
+    for document in [&short, &long] {
+        assert_eq!(document.pages.len(), 1);
+        let page = &document.pages[0];
+        let text = page
+            .lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            text.matches("Preceding content").count(),
+            1,
+            "lines={text:?}"
+        );
+        assert_eq!(text.matches("Disclaimer").count(), 1, "lines={text:?}");
+
+        let bodies = page
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(pink))
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 1, "rects={:?}", page.rects());
+        let body = bodies[0];
+        assert!((body.x() - 20.0).abs() < 0.01, "body={body:?}");
+        assert!((body.y() - 30.0).abs() < 0.01, "body={body:?}");
+        assert!((body.width() - 260.0).abs() < 0.01, "body={body:?}");
+        assert!((body.height() - 12.0).abs() < 0.01, "body={body:?}");
+
+        let areas = page
+            .rects()
+            .iter()
+            .filter(|rect| rect.fill == Some(green))
+            .collect::<Vec<_>>();
+        assert_eq!(areas.len(), 1, "rects={:?}", page.rects());
+        let area = areas[0];
+        assert!((area.x() - 20.0).abs() < 0.01, "area={area:?}");
+        assert!((area.y() - 20.0).abs() < 0.01, "area={area:?}");
+        assert!((area.width() - 260.0).abs() < 0.01, "area={area:?}");
+        assert!((area.height() - 22.0).abs() < 0.01, "area={area:?}");
+    }
+
+    let short_body = short.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(pink))
+        .expect("short footnote body");
+    let long_body = long.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(pink))
+        .expect("long footnote body");
+    assert_eq!(short_body.paint_rect(), long_body.paint_rect());
+}
+
+async fn render_footnote_after_empty_avoid_retry(
+    wrapper_rule: &str,
+    footnote_markup: &str,
+) -> crate::Document {
+    Html::from_string(format!(
+        r#"<style>
+              @page {{ size: 200pt 200pt; margin: 20pt }}
+              body {{ margin: 0; font: 10pt/10pt sans-serif }}
+              h2 {{ font: 10pt/10pt sans-serif; break-after: avoid }}
+              .report {{ height: 120pt }}
+              .note {{ float: footnote }}
+              .note::footnote-call, .note::footnote-marker {{
+                content: "\a0"; font-size: 0; line-height: 0
+              }}
+              {wrapper_rule}
+            </style>
+            <div class="wrapper">
+              <h2>Report title</h2>
+              <div class="report">Report body</div>
+              {footnote_markup}
+            </div>"#,
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap()
+}
+
+fn assert_footnote_after_empty_avoid_retry(document: &crate::Document) {
+    assert!(
+        (2..=3).contains(&document.pages.len()),
+        "pagination must converge without manufacturing pages: {}",
+        document.pages.len()
+    );
+    let text = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(text.matches("Report title").count(), 1, "lines={text:?}");
+    assert_eq!(text.matches("Report body").count(), 1, "lines={text:?}");
+    assert_eq!(text.matches("Footnote body").count(), 1, "lines={text:?}");
+}
+
+#[tokio::test]
+async fn footnote_reservation_does_not_loop_an_empty_dom_avoid_run_retry() {
+    let document = render_footnote_after_empty_avoid_retry(
+        "",
+        "<div class=\"note\">Footnote body<br>line 2<br>line 3<br>line 4<br>line 5<br>line 6</div>",
+    )
+    .await;
+    assert_footnote_after_empty_avoid_retry(&document);
+}
+
+#[tokio::test]
+async fn footnote_reservation_does_not_loop_an_empty_frozen_box_avoid_run_retry() {
+    let document = render_footnote_after_empty_avoid_retry(
+        ".wrapper::before { content: \"\"; display: block }",
+        "<p>Call<span class=\"note\">Footnote body<br>line 2<br>line 3<br>line 4<br>line 5<br>line 6</span></p>",
+    )
+    .await;
+    assert_footnote_after_empty_avoid_retry(&document);
+}
+
+#[tokio::test]
 async fn gcpm_footnote_area_margins_anchor_its_border_box_and_body_content() {
     let document = Html::from_string(
         r#"<style>

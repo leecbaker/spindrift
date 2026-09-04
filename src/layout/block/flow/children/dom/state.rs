@@ -8,7 +8,7 @@ pub(in crate::layout) struct DomFlowTraversalState {
     pub(in crate::layout) pending_end_margin_collapse: Option<BlockEndMarginCollapse>,
     pub(in crate::layout) collapsed_start_margin_offset: LayoutLength,
     pub(in crate::layout) adjoining_margin_set_boundary: BlockMarginCollapseBoundary,
-    pub(in crate::layout) previous_flow_bottom_margin: Option<f32>,
+    pub(in crate::layout) previous_flow_bottom_margin: Option<PendingAdjoiningMargin>,
     pub(in crate::layout) seen_flow_child: FirstInFlowChildState,
     pub(in crate::layout) trim_block_start_adjoining_margins: bool,
     pub(in crate::layout) first_formatted_line: FirstFormattedLineState,
